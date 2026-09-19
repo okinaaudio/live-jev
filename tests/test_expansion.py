@@ -1058,3 +1058,36 @@ class DbDirectionFromWordsTests(unittest.TestCase):
         self.assertIs(step_from_words(Step.DOWN_SMALL, "Bassの音量を-6dBにして"), Step.SET)
         self.assertIs(step_from_words(Step.UP_SMALL, "set Bass volume to -6 dB"), Step.SET)
         self.assertEqual(relative_db_target(3.0, step_from_words(Step.NONE, "3db下げて"), "-0.015 dB"), -3.015)
+
+
+class PluginFormatPreferenceTests(unittest.TestCase):
+    def test_vst3_is_preferred_over_au_and_vst2(self) -> None:
+        from daemon import preferred_plugin_uris
+        items = [
+            {"name": "Omnisphere", "uri": "query:Plugins#AUv2:Spectrasonics:Omnisphere"},
+            {"name": "Omnisphere", "uri": "query:Plugins#VST:Local:Omnisphere"},
+            {"name": "Omnisphere", "uri": "query:Plugins#VST3:Spectrasonics:Omnisphere"},
+            {"name": "OnlyAU", "uri": "query:Plugins#AUv2:Vendor:OnlyAU"},
+            {"name": "Operator", "uri": "query:Synths#Operator"},
+        ]
+        uris = preferred_plugin_uris(items)
+        self.assertEqual(uris["Omnisphere"], "query:Plugins#VST3:Spectrasonics:Omnisphere")
+        self.assertEqual(uris["OnlyAU"], "query:Plugins#AUv2:Vendor:OnlyAU")
+        self.assertEqual(uris["Operator"], "query:Synths#Operator")
+
+    def test_new_track_loads_the_preferred_uri(self) -> None:
+        from unittest import mock
+        import daemon as D
+        calls: list[tuple] = []
+        service = LiveJevService(bridge=RecordingBridge(), snapshot=_snapshot_with_song(), key="x",
+                                 requester=lambda *_: (_ for _ in ()).throw(AssertionError("Jev")), llm_key=None,
+                                 rewriter=lambda *_: (_ for _ in ()).throw(AssertionError("LLM")))
+        service.reader = type("R", (), {"read": staticmethod(lambda: (_snapshot_with_song(), 1))})()
+        items = [{"name": "Omnisphere", "uri": "query:Plugins#AUv2:Spectrasonics:Omnisphere"}, {"name": "Omnisphere", "uri": "query:Plugins#VST3:Spectrasonics:Omnisphere"}]
+        with mock.patch.object(D.plugin_script, "ping", return_value=True), \
+             mock.patch.object(D.plugin_script, "list_plugins", return_value=items), \
+             mock.patch.object(D.plugin_script, "add_track", side_effect=lambda kind, name=None, device=None: calls.append(("add", kind, name, device)) or {"ok": True, "track_index": 3, "devices_after": []}), \
+             mock.patch.object(D.plugin_script, "load", side_effect=lambda name, track, uri="": calls.append(("load", name, track, uri)) or {"ok": True, "track_index": track, "devices_after": ["Omnisphere"]}):
+            answer = service.process({"id": "1", "text": "新規トラックでomnisphere開いて"})
+        self.assertEqual(answer["kind"], "result", answer)
+        self.assertEqual(calls, [("add", "midi", None, None), ("load", "Omnisphere", 3, "query:Plugins#VST3:Spectrasonics:Omnisphere")])

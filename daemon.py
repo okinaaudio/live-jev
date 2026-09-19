@@ -427,6 +427,40 @@ def relative_db_target(value: float, step: Step, current_display: str | None) ->
     return value
 
 
+PLUGIN_FORMAT_ORDER = tuple(
+    part.strip().lower() for part in os.environ.get("LIVE_JEV_PLUGIN_FORMATS", "vst3,au,vst").split(",") if part.strip()
+)
+
+
+def _plugin_format(uri: str) -> str:
+    lowered = uri.lower()
+    if "#vst3:" in lowered:
+        return "vst3"
+    if "#auv2:" in lowered or "#au:" in lowered:
+        return "au"
+    if "#vst:" in lowered:
+        return "vst"
+    return ""
+
+
+def preferred_plugin_uris(items: list[dict[str, str]]) -> dict[str, str]:
+    """Pick one browser entry per plug-in name when the same plug-in is installed in several formats.
+
+    Live lists Omnisphere four times (AU, VST3 and two VST2 entries). Taking the first match loaded the AU,
+    whose editor window does not open on insert; the VST3 one does (measured). Default order: VST3, AU, VST2.
+    """
+    rank = {name: index for index, name in enumerate(PLUGIN_FORMAT_ORDER)}
+    best: dict[str, tuple[int, str]] = {}
+    for item in items:
+        name, uri = str(item.get("name") or ""), str(item.get("uri") or "")
+        if not name or not uri:
+            continue
+        score = rank.get(_plugin_format(uri), len(rank))
+        if name not in best or score < best[name][0]:
+            best[name] = (score, uri)
+    return {name: uri for name, (_, uri) in best.items()}
+
+
 class StaleSnapshot(Exception):
     """The snapshot's track count, names, or device counts differ from the current song. Refresh it and retry."""
 
@@ -1072,6 +1106,7 @@ class LiveJevService:
         return self._execute_now(intent, message_id, jev_ms, llm_ms, started, utterance, rewritten)
 
     _plugin_names_cache: tuple[str, ...] | None = None
+    _plugin_uris: dict[str, str] = {}
     _plugin_script_ok: bool | None = None
 
     def _plugin_names(self) -> tuple[str, ...]:
@@ -1081,7 +1116,9 @@ class LiveJevService:
         self._plugin_script_ok = plugin_script.ping()
         if self._plugin_script_ok:
             try:
-                names = tuple(sorted({str(item.get("name")) for item in plugin_script.list_plugins() if item.get("name")}))
+                items = plugin_script.list_plugins()
+                names = tuple(sorted({str(item.get("name")) for item in items if item.get("name")}))
+                self._plugin_uris = preferred_plugin_uris(items)
             except plugin_script.ScriptError:
                 names = ()
         if not names:
@@ -1805,13 +1842,20 @@ class LiveJevService:
         If the component returns a device name, treat the operation as successful immediately."""
         started = time.perf_counter()
         plugin = str(intent.plugin)
+        uri = getattr(self, "_plugin_uris", {}).get(plugin, "")
         try:
             if ACTIONS[intent.action].kind == "plugin_track":
                 audio = intent.text == "audio"
                 name = None if audio else (intent.text or None)
-                answer = plugin_script.add_track("audio" if audio else "midi", name, plugin)
+                if uri:
+                    # Add the track first, then load by browser URI so the preferred format is used.
+                    added = plugin_script.add_track("audio" if audio else "midi", name, None)
+                    answer = dict(plugin_script.load(plugin, int(added["track_index"]), uri))
+                    answer.setdefault("track_index", added["track_index"])
+                else:
+                    answer = plugin_script.add_track("audio" if audio else "midi", name, plugin)
             else:
-                answer = plugin_script.load(plugin, int(intent.track))
+                answer = plugin_script.load(plugin, int(intent.track), uri)
         except plugin_script.ScriptError as error:
             if "main_thread_timeout" not in str(error):
                 raise ValueError(self.SCRIPT_LOAD_ERRORS.get(str(error), str(error))) from error
