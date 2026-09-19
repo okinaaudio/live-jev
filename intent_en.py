@@ -28,6 +28,20 @@ ENGLISH_PHRASES: dict[str, tuple[str, ...]] = {
     "insert": (
         "insert", "add", "load", "open", "put", "drop", "throw", "place",
         "bring up", "fire up", "launch", "pull up", "use", "apply", "stick", "slap",
+        "put in", "put on", "drop in", "drop on", "throw on", "throw in", "slap on", "stick on", "stick in",
+        "pop in", "pop on", "chuck", "chuck in", "chuck on", "whack on", "toss on", "toss in",
+        "set up", "spin up", "call up", "load up", "open up", "boot up", "start up", "bring in", "plug in", "hook up",
+        "summon", "instantiate", "mount", "attach", "try", "try out",
+        "give me", "get me", "i need", "i want", "i'd like", "i would like", "can i get", "can i have",
+        "let me have", "let's use", "let's try", "let's have", "how about", "we need",
+    ),
+    "request_prefix": (
+        "give me", "get me", "i need", "i want", "i'd like", "i would like", "can i get", "can i have",
+        "let me have", "let's have", "we need", "how about",
+    ),
+    "mixer_words": (
+        "volume", "pan", "mute", "solo", "send", "tempo", "loop", "metronome", "click", "record", "recording",
+        "monitor", "arm", "level", "gain", "pitch", "warp",
     ),
     "insert_preposition": ("on", "onto", "in", "into", "to"),
     "new_track": ("new", "another", "a fresh", "fresh"),
@@ -155,14 +169,15 @@ def _clean_object(value: str) -> str:
 
 def _new_track_request(text: str, snapshot: Snapshot) -> tuple[str, str | None, str | None] | None:
     working, track_name = _named_track(text)
+    working = re.sub(rf"^(?:{_alternation('request_prefix')})\s+", "", working, flags=re.IGNORECASE)
     kind_match = re.search(r"\b(audio|midi|instrument)\s+track\b", working, re.IGNORECASE)
     kind = "audio" if kind_match and kind_match.group(1).casefold() == "audio" else None
     insert = _alternation("insert")
     patterns = (
-        rf"^(?:create|make|add)\s+(?:a\s+)?(?:(?:new|another|fresh)\s+)?(?:(?:midi|audio|instrument)\s+)?track\s+(?:with|and\s+(?:{insert}))\s+(?P<object>.+)$",
-        rf"^(?:a\s+)?(?:new|another|fresh)\s+(?:(?:midi|audio|instrument)\s+)?track\s+(?:with|and\s+(?:{insert})|(?:{insert}))\s+(?P<object>.+)$",
-        rf"^(?P<object>.+?)\s+(?:on|in|into|to)\s+(?:a\s+)?(?:new|another|fresh)\s+(?:(?:midi|audio|instrument)\s+)?track$",
-        rf"^(?:{insert})\s+(?P<object>.+?)\s+(?:on|in|into|to)\s+(?:a\s+)?(?:new|another|fresh)\s+(?:(?:midi|audio|instrument)\s+)?track$",
+        rf"^(?:create|make|add|set up|spin up|start|open)\s+(?:an?\s+)?(?:(?:new|another|fresh)\s+)?(?:(?:midi|audio|instrument)\s+)?track\s+(?:with|for|and\s+(?:{insert}))\s+(?P<object>.+)$",
+        rf"^(?:an?\s+)?(?:new|another|fresh)\s+(?:(?:midi|audio|instrument)\s+)?track\s+(?:with|for|and\s+(?:{insert})|(?:{insert}))\s+(?P<object>.+)$",
+        rf"^(?P<object>.+?)\s+(?:on|in|into|to|onto)\s+(?:(?:an?\s+)?(?:new|another|fresh|separate)|its own)\s+(?:(?:midi|audio|instrument)\s+)?track$",
+        rf"^(?:{insert})\s+(?P<object>.+?)\s+(?:on|in|into|to|onto)\s+(?:(?:an?\s+)?(?:new|another|fresh|separate)|its own)\s+(?:(?:midi|audio|instrument)\s+)?track$",
         r"^track\s+with\s+(?P<object>.+)$",
         r"^(?P<object>.+?)\s+track$",
     )
@@ -213,7 +228,7 @@ def extract_plugin_request_en(utterance: str, snapshot: Snapshot) -> PluginReque
         target_text = match.groupdict().get("target")
         if not raw or re.search(r"\b(?:track|clip|scene)\b", raw):
             continue
-        if index == 2 and not re.search(rf"\b(?:{insert})\b", text):
+        if index == 2 and not re.search(rf"\b(?:{insert})\b", text) and re.search(rf"\b(?:{_alternation('mixer_words')})\b", raw, re.IGNORECASE):
             continue
         track = _track_en(snapshot, target_text) if target_text else None
         if target_text is None or track is not None:
@@ -251,7 +266,8 @@ def parse_local_en(utterance: str, snapshot: Snapshot) -> Intent | None:
         (r"(?:loop off|turn loop off|disable loop)", Action.LOOP_OFF),
         (r"(?:(?:metronome|click)(?: on)?|turn (?:the )?(?:metronome|click) on)", Action.METRONOME_ON),
         (r"(?:(?:metronome|click) off|turn (?:the )?(?:metronome|click) off)", Action.METRONOME_OFF),
-        (r"undo", Action.UNDO), (r"redo", Action.REDO),
+        (r"(?:undo|revert|take (?:that|it) back|put (?:that|it) back|go back|scratch that|never ?mind)(?: (?:that|it|this|the last (?:one|thing|change)))?", Action.UNDO),
+        (r"redo(?: (?:that|it))?", Action.REDO),
         (r"capture midi", Action.CAPTURE_MIDI), (r"tap tempo", Action.TAP_TEMPO),
         (r"stop all clips", Action.STOP_ALL_CLIPS),
     )

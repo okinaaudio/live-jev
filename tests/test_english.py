@@ -305,3 +305,39 @@ for _index, (_phrase, _expected) in enumerate(LOCAL_CASES.items(), start=1):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class EnglishInsertVocabularyTests(unittest.TestCase):
+    def test_many_verbs_and_request_forms_mean_insert(self) -> None:
+        from intent import Action, extract_plugin_request
+        from tests.support import sample_snapshot
+        snapshot = sample_snapshot()
+        verbs = ["insert", "add", "load", "open", "put in", "put", "drop in", "drop", "throw on", "throw in", "place", "bring up", "fire up",
+                 "launch", "pull up", "use", "apply", "stick", "slap on", "give me", "i need", "i want", "get me", "can i get", "let's use",
+                 "let me have", "pop in", "chuck in", "whack on", "set up", "spin up", "call up", "summon", "instantiate", "mount", "attach",
+                 "plug in", "hook up", "bring in", "try", "load up", "open up"]
+        for verb in verbs:
+            request = extract_plugin_request(f"{verb} Serum 2", snapshot)
+            self.assertIsNotNone(request, verb)
+            self.assertEqual((request.action, request.raw_name.casefold()), (Action.INSERT_PLUGIN, "serum 2"), verb)
+        for text in ("Could you open up Serum 2 for me?", "Serum 2 on this track", "chuck Serum 2 on the Bass", "put Serum 2 on Bass, please"):
+            request = extract_plugin_request(text, snapshot)
+            self.assertIsNotNone(request, text)
+            self.assertEqual(request.raw_name.casefold(), "serum 2", text)
+
+    def test_new_track_forms(self) -> None:
+        from intent import Action, extract_plugin_request
+        from tests.support import sample_snapshot
+        snapshot = sample_snapshot()
+        for text in ("give me a new track with Serum 2", "I'd like Serum 2 on a fresh track", "create an audio track with Serum 2",
+                     "put Serum 2 on its own track", "another track with Serum 2 please", "make a new track and load Serum 2", "Serum 2 on a separate track"):
+            request = extract_plugin_request(text, snapshot)
+            self.assertIsNotNone(request, text)
+            self.assertEqual((request.action, request.raw_name.casefold()), (Action.ADD_TRACK_WITH_PLUGIN, "serum 2"), text)
+
+    def test_other_commands_are_not_plugin_requests(self) -> None:
+        from intent import extract_plugin_request
+        from tests.support import sample_snapshot
+        snapshot = sample_snapshot()
+        for text in ("volume on Bass", "mute on Bass", "set tempo to 120", "start recording", "launch scene 2", "turn Bass up a bit", "don't add Serum 2"):
+            self.assertIsNone(extract_plugin_request(text, snapshot), text)

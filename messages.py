@@ -111,6 +111,7 @@ MESSAGES: dict[str, dict[Language, str]] = {
     "option.cancel": {"ja": "やめる", "en": "Cancel"},
     "info.one_at_a_time": {"ja": "1つずつお願いします（例: パッド下げて → ベース上げて）", "en": "Please ask for one action at a time, for example: lower Pad, then raise Bass."},
     "info.freeform": {"ja": "これは決まった操作では表せない依頼です（作曲や自由な編集には対応していません）", "en": "That is beyond the fixed actions Live Jev supports (no composing or free-form editing)."},
+    "info.plugin_name_needed": {"ja": "どのプラグインか分かりませんでした。名前で言ってください（例: Serum 2 を挿して）", "en": "I could not tell which plug-in you mean. Say its name, for example: insert Serum 2."},
     "info.negated": {"ja": "何も変えていません（「〜しないで」と受け取りました）", "en": "Nothing changed (I took that as “don’t”)."},
     "info.no_undo": {"ja": "戻せる操作がありません", "en": "There is no action to undo."},
     "info.no_repeat": {"ja": "繰り返せる操作がありません", "en": "There is no action to repeat."},
