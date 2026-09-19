@@ -1045,3 +1045,16 @@ class AmbiguousInsertVerbTests(unittest.TestCase):
             answer = service.process({"id": "1", "text": "セラムをつけて"})
         self.assertEqual(answer["kind"], "result", answer)
         self.assertEqual(seen, [("Serum 2", 1)])
+
+
+class DbDirectionFromWordsTests(unittest.TestCase):
+    def test_words_beat_the_model_for_direction(self) -> None:
+        from daemon import relative_db_target, step_from_words
+        from intent import Step
+        self.assertIs(step_from_words(Step.NONE, "Bassを3dB下げて"), Step.DOWN_SMALL)
+        self.assertIs(step_from_words(Step.SET, "Bassを3dB下げて"), Step.DOWN_SMALL)
+        self.assertIs(step_from_words(Step.NONE, "turn Bass down by 3 dB"), Step.DOWN_SMALL)
+        self.assertIs(step_from_words(Step.NONE, "boost Bass 2 dB"), Step.UP_SMALL)
+        self.assertIs(step_from_words(Step.DOWN_SMALL, "Bassの音量を-6dBにして"), Step.SET)
+        self.assertIs(step_from_words(Step.UP_SMALL, "set Bass volume to -6 dB"), Step.SET)
+        self.assertEqual(relative_db_target(3.0, step_from_words(Step.NONE, "3db下げて"), "-0.015 dB"), -3.015)

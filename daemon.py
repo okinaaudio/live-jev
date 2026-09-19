@@ -393,6 +393,23 @@ def _is_change_batch(arguments: list[str]) -> bool:
     return arguments[call_at + 2] != "str_for_value"
 
 
+_DB_ABSOLUTE = re.compile(r"(?:dB|デシベル)\s*(?:に|へ|まで)|\bto\s+(?:-|−|minus\s+)?\d", re.IGNORECASE)
+_DB_DOWN = re.compile(r"下げ|さげ|落と|絞|小さく|抑え|\b(?:down|lower|reduce|decrease|quieter|cut|drop|pull)\b", re.IGNORECASE)
+_DB_UP = re.compile(r"上げ|あげ|大きく|持ち上げ|\b(?:up|raise|boost|increase|louder|push|bump)\b", re.IGNORECASE)
+
+
+def step_from_words(step: Step, utterance: str) -> Step:
+    """dB の上げ下げの向きは、Jev の答えより一言の中の言葉を優先する。
+    Jev が「3dB下げて」に step を返さなかった回があり、3 を絶対値として +3dB に書いてしまった（実測）。"""
+    if _DB_ABSOLUTE.search(utterance):
+        return Step.SET
+    if _DB_DOWN.search(utterance):
+        return step if step in {Step.DOWN_SMALL, Step.DOWN_BIG} else Step.DOWN_SMALL
+    if _DB_UP.search(utterance):
+        return step if step in {Step.UP_SMALL, Step.UP_BIG} else Step.UP_SMALL
+    return step
+
+
 def relative_db_target(value: float, step: Step, current_display: str | None) -> float:
     """「3dB下げて」は今の値から −3、「3dB上げて」は +3、「−3dBに」は指定値そのもの。
     上げ下げなのに今の値が読めない（-inf dB など）ときは実行しない。数字を絶対値として書くと無音から大音量になるため。"""
@@ -605,6 +622,13 @@ class LiveJevService:
         result = self._resolve_previous(result, text)
         result = self._apply_selected_track(self._resolve_release_target(result))
         decision = self._decision(result, message_id)
+        if ACTIONS[result.intent.action].kind in {"plugin", "plugin_track"} and not result.intent.plugin:
+            if deferred_plugin is not None:
+                return self._process_plugin_request(deferred_plugin, text, message_id, started, jev_ms)
+            found = self._plugin_fallback(text, message_id, started, jev_ms)
+            if found is not None:
+                return found
+            return {"id": message_id, "kind": "info", "line": self._m("info.plugin_name_needed"), "ms": self._ms(started, jev_ms, 0, 0)}
         undecided = decision is not None and decision.get("kind") in {"ask", "info"}
         if undecided and deferred_plugin is not None and (
             result.intent.action is Action.NONE or result.intent.action_conf < 0.6 or ACTIONS[result.intent.action].kind == "structure_device"
@@ -813,7 +837,7 @@ class LiveJevService:
             return result
         if intent.track is not None and intent.track != previous.track:
             return result
-        restoring = bool(re.search(r"戻|もど|元|取り消", text))
+        restoring = bool(re.search(r"戻|もど|元|取り消|\b(?:undo|revert|restore|back to (?:how|what|where) it was|(?:take|put|bring) (?:that|it) back|go back)\b", text, re.IGNORECASE))
         if not restoring and (not previous.confirmed or previous.step not in {Step.UP_SMALL, Step.UP_BIG, Step.DOWN_SMALL, Step.DOWN_BIG}):
             return result
         param = previous.param
@@ -1153,8 +1177,12 @@ class LiveJevService:
     def _bare_plugin_request(self, text: str, message_id: Any, started: float, jev_ms: int) -> dict[str, Any] | None:
         """「Serum 2をお願い」「セラムちょうだい」のように動詞が無い頼み方。何をするか決められなかったときだけ、
         残りの言葉が一覧のプラグイン名（別名・完全一致・部分一致）に当たるかを Jev なしで確かめ、当たれば選択トラックへ挿す。"""
-        from intent import normalize_phrase
-        name = re.sub(r"(?:を|が|も)$", "", normalize_phrase(text)).strip()
+        from intent import detect_language, normalize_phrase
+        if detect_language(text) == "en":
+            from intent_en import normalize_english_phrase
+            name = re.sub(r"^(?:the|a|an|some)\s+", "", normalize_english_phrase(text)).strip()
+        else:
+            name = re.sub(r"(?:を|が|も)$", "", normalize_phrase(text)).strip()
         if not name or len(name) > 40 or name.casefold() in {word.casefold() for word in GENERIC_DEVICE_WORDS}:
             return None
         catalog = self._plugin_names()
@@ -1305,7 +1333,7 @@ class LiveJevService:
                 confirmed = True
                 self._undo_target_tracks = len(before.tracks)
             elif intent.action is Action.VOLUME and intent.number and intent.number.unit == "db":
-                self.snapshot, write_ms, write_unknown = self._set_volume_db(intent)
+                self.snapshot, write_ms, write_unknown = self._set_volume_db(replace(intent, step=step_from_words(intent.step, utterance)))
                 bridge_ms += write_ms
                 confirmed = not write_unknown
             else:
@@ -1352,6 +1380,13 @@ class LiveJevService:
                         and self._has_readback(intent, combined)
                         and self._same_value(self._value_before(self.snapshot, intent), expected_after)
                     )
+            if intent.action in {Action.UNDO, Action.REDO}:
+                # Live の取り消し/やり直しは何が変わったか分からない。写しを取り直さないと、次の「少し上げて」が古い値から計算される（実測）。
+                try:
+                    self.snapshot, read_ms = self.reader.read()
+                    bridge_ms += read_ms
+                except Exception:
+                    pass
             line = self._short_line(ACTIONS[intent.action].readback(self.snapshot, intent))
             if not confirmed and not write_unknown and ACTIONS[intent.action].kind in {"clip_prop", "song_bool", "track_bool", "track_int"}:
                 line += self._m("info.unchanged")
