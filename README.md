@@ -62,6 +62,7 @@ The menu bar icon lets you switch the language (Automatic / Japanese / English) 
 - **There is nothing to import.** Live Jev reads the plug-in list from your own Live browser (Plug-ins, Instruments, Audio Effects, MIDI Effects) the first time you ask for a plug-in, in under a second, and remembers it. Only what you own becomes a candidate.
 - The plug-in has to show up in Live’s browser (VST3/AU enabled and scanned in Live’s plug-in settings).
 - Full names (`Serum 2`), partial names (`serum`) and nicknames all work. To pin a nickname, add it to `plugin_aliases.json`, for example `{"valhalla": "ValhallaVintageVerb"}`.
+- When a plug-in is installed in several formats, Live Jev loads **VST3 first, then AU, then VST2**. Change the order with `LIVE_JEV_PLUGIN_FORMATS`, for example `au,vst3,vst`.
 - Generic words such as “reverb”, “compressor” or “EQ” never insert anything; Live Jev suggests names instead.
 - After installing a new plug-in, restart Live and reopen Live Jev.
 - The author’s plug-in list is not in this repository. Product names in the tests are examples.
