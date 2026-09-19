@@ -254,7 +254,7 @@ class EnglishOutputTests(unittest.TestCase):
                 self.assertFalse(contains_japanese(line), line)
 
     def test_daemon_language_command_and_visible_errors(self) -> None:
-        service = LiveJevService(snapshot=self.snapshot, key=None)
+        service = LiveJevService(bridge=RecordingBridge(), snapshot=self.snapshot, key=None)
         status = service.process({"id": "1", "cmd": "lang", "value": "en"})
         self.assertEqual(status["line"], "Live 3 tracks / 120 BPM")
         empty = service.process({"id": "2", "text": ""})

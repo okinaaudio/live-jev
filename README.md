@@ -73,7 +73,9 @@ The menu bar icon lets you switch the language (Automatic / Japanese / English) 
 
 ## Safety
 - Only an allow-list of operations can be sent to Live. Deleting tracks or clips and free-form note writing are not possible.
-- “Don’t …” is never executed. If you name a track that does not exist, nothing is written.
+- “Don’t …” is never executed. If you name a track that does not exist, nothing is written — it never falls back to another track. If you name no track, the selected track is used.
+- Two requests in one sentence (“mute Pad and solo Bass”) are declined rather than half-executed. Send them one at a time.
+- A question from Live Jev (“Which track?”) expires after about 20 seconds, so an old question can never swallow your next command.
 - Your API key is read from the environment (or your shell profile) at run time and is never written to a file.
 
 ## Development

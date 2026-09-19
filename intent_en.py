@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from dataclasses import replace
 from typing import Literal
 
 from bridge_client import NATIVE_DEVICES
@@ -14,8 +15,11 @@ from intent import (
     Number,
     PluginRequest,
     Step,
+    TargetOrigin,
+    TRACK_STATED_MIN,
     _local_intent,
     resolve_native_device,
+    parse_number,
 )
 
 
@@ -45,7 +49,7 @@ ENGLISH_PHRASES: dict[str, tuple[str, ...]] = {
     ),
     "insert_preposition": ("on", "onto", "in", "into", "to"),
     "new_track": ("new", "another", "a fresh", "fresh"),
-    "selected_track": ("selected track", "this track", "current track", "the track i'm on"),
+    "selected_track": ("selected track", "the selected track", "this track", "the track", "current track", "the track i'm on", "it", "this", "that", "selected"),
     "up": ("up", "raise", "increase", "boost", "louder", "turn up"),
     "down": ("down", "lower", "decrease", "reduce", "quieter", "turn down", "pull down"),
     "small": ("a bit", "a little", "slightly", "a touch", "a hair"),
@@ -99,16 +103,18 @@ def _track_target_pattern(snapshot: Snapshot, include_master: bool = True) -> st
         r"(?:\d+)(?:st|nd|rd|th)\s+track",
     ]
     if include_master:
-        fixed += [r"master(?:\s+track)?", r"main(?:\s+track)?"]
+        fixed += [r"master(?:\s+track)?", r"main(?:\s+(?:track|out))?", r"whole\s+mix", r"the\s+mix", r"everything"]
     return "(?:" + "|".join(fixed + names) + ")"
 
 
 def _track_en(snapshot: Snapshot, value: str) -> int | None | Literal["master", "selected"]:
     text = value.strip().casefold()
-    text = re.sub(r"^the\s+", "", text)
     if text in {item.casefold() for item in ENGLISH_PHRASES["selected_track"]}:
         return "selected"
-    if text in {"master", "master track", "main", "main track"}:
+    text = re.sub(r"^the\s+", "", text)
+    if text == "track":
+        return "selected"
+    if text in {"master", "master track", "main", "main track", "main out", "whole mix", "mix", "everything"}:
         return "master"
     numbered = re.fullmatch(r"(?:track\s*(\d+)|(\d+)(?:st|nd|rd|th)\s+track)", text)
     if numbered:
@@ -146,10 +152,11 @@ def _step(text: str, direction: str | None = None) -> Step:
 
 
 def _number(text: str, unit: str) -> Number | None:
-    match = re.search(r"(?<![\w.])(-?\d+(?:\.\d+)?)\s*(?:db|bpm|%|percent|st|semitones?|half steps?)?\b", text, re.IGNORECASE)
-    if not match:
-        return None
-    return Number(float(match.group(1)), unit)  # type: ignore[arg-type]
+    stripped = re.sub(r"\b(?:track|clip|slot|scene|bar)\s*\d+(?:st|nd|rd|th)?\b", " ", text, flags=re.IGNORECASE)
+    stripped = re.sub(r"\b\d+(?:st|nd|rd|th)\s+track\b", " ", stripped, flags=re.IGNORECASE)
+    stripped = re.sub(r"\bsend\s+(?:[a-z]|\d+)\b", " ", stripped, flags=re.IGNORECASE)
+    action = {"percent": Action.SEND, "db": Action.VOLUME, "bpm": Action.TEMPO, "pan": Action.PAN, "raw": Action.CLIP_PITCH}[unit]
+    return parse_number(stripped, action)
 
 
 def _named_track(text: str) -> tuple[str, str | None]:
@@ -194,6 +201,7 @@ def _new_track_request(text: str, snapshot: Snapshot) -> tuple[str, str | None, 
         if index == len(patterns) - 1 and (
             re.match(rf"^(?:{insert})\b", working, re.IGNORECASE)
             or re.search(r"\b(?:selected|current|this)\b", raw)
+            or re.search(rf"\b(?:{_alternation('mixer_words')})\b", raw, re.IGNORECASE)
         ):
             continue
         return raw, kind, track_name
@@ -213,12 +221,11 @@ def extract_plugin_request_en(utterance: str, snapshot: Snapshot) -> PluginReque
 
     insert = _alternation("insert")
     prep = _alternation("insert_preposition")
-    target_pattern = _track_target_pattern(snapshot, include_master=False)
     patterns = (
-        rf"^(?:{insert})\s+(?P<object>.+?)\s+(?:{prep})\s+(?:the\s+)?(?P<target>{target_pattern})$",
+        rf"^(?:{insert})\s+(?P<object>.+?)\s+(?:{prep})\s+(?:the\s+)?(?P<target>.+?)(?:\s+track)?$",
         rf"^(?:{insert})\s+(?P<object>.+)$",
-        rf"^(?P<object>.+?)\s+(?:{prep})\s+(?:the\s+)?(?P<target>{target_pattern})\s*(?:please)?$",
-        rf"^(?:the\s+)?(?P<target>{target_pattern})\s+(?:with|gets?)\s+(?P<object>.+)$",
+        rf"^(?P<object>.+?)\s+(?:{prep})\s+(?:the\s+)?(?P<target>.+?)(?:\s+track)?\s*(?:please)?$",
+        rf"^(?:the\s+)?(?P<target>.+?)(?:\s+track)?\s+(?:with|gets?)\s+(?P<object>.+)$",
     )
     for index, pattern in enumerate(patterns):
         match = re.fullmatch(pattern, text, re.IGNORECASE)
@@ -231,8 +238,10 @@ def extract_plugin_request_en(utterance: str, snapshot: Snapshot) -> PluginReque
         if index == 2 and not re.search(rf"\b(?:{insert})\b", text) and re.search(rf"\b(?:{_alternation('mixer_words')})\b", raw, re.IGNORECASE):
             continue
         track = _track_en(snapshot, target_text) if target_text else None
-        if target_text is None or track is not None:
-            return PluginRequest(Action.INSERT_PLUGIN, raw, track, None)
+        return PluginRequest(
+            Action.INSERT_PLUGIN, raw, track, None,
+            target_text=target_text, target_missing=target_text is not None and track is None,
+        )
     return None
 
 
@@ -249,10 +258,13 @@ def _device_in(snapshot: Snapshot, text: str):
     return None, None
 
 
-def parse_local_en(utterance: str, snapshot: Snapshot) -> Intent | None:
+def _parse_local_en(utterance: str, snapshot: Snapshot) -> Intent | None:
     if is_negated_en(utterance):
         return None
     text = normalize_english_phrase(utterance)
+    _unused, original_track_name = _named_track(utterance.strip())
+    if text in {"more", "a bit more", "a little more", "a touch more", "do it again"}:
+        return _local_intent(Action.NONE, refers_previous=1.0)
 
     exact: tuple[tuple[str, Action], ...] = (
         (r"(?:play|start|start playback)", Action.PLAY),
@@ -296,18 +308,33 @@ def parse_local_en(utterance: str, snapshot: Snapshot) -> Intent | None:
         raw, kind, track_name = new_request
         device = resolve_native_device(raw)
         if device is not None:
-            return _local_intent(Action.ADD_TRACK_WITH_DEVICE, text=track_name or kind, native_device=device)
+            return _local_intent(Action.ADD_TRACK_WITH_DEVICE, text=original_track_name or track_name, track_kind=kind or "midi", native_device=device)
     plain_track = re.fullmatch(r"(?:create|make|add)\s+(?:(?:a|an)\s+)?(?:(?:new|another|fresh)\s+)?(?:(midi|audio|instrument)\s+)?track(?:\s+(?:named|called)\s+(.+))?", text)
     if plain_track:
         action = Action.ADD_AUDIO_TRACK if plain_track.group(1) == "audio" else Action.ADD_MIDI_TRACK
-        return _local_intent(action, text=_clean_object(plain_track.group(2) or "") or None)
+        original_plain = re.fullmatch(r"(?:create|make|add)\s+(?:(?:a|an)\s+)?(?:(?:new|another|fresh)\s+)?(?:(midi|audio|instrument)\s+)?track(?:\s+(?:named|called)\s+(.+))?", utterance.strip(), re.IGNORECASE)
+        name = _clean_object(original_plain.group(2) or "") if original_plain else _clean_object(plain_track.group(2) or "")
+        return _local_intent(action, text=name or None, track_kind="audio" if action is Action.ADD_AUDIO_TRACK else "midi")
 
     target_pattern = _track_target_pattern(snapshot)
+    selected_rename = re.fullmatch(r"(?:rename\s+(?:this\s+track|it)\s+to|call\s+this)\s+(?P<name>.+)", text, re.IGNORECASE)
+    if selected_rename:
+        name = _clean_object(selected_rename.group("name"))
+        spoken = utterance.strip().rstrip(".!?").strip("\"'")
+        if name and spoken.casefold().endswith(name.casefold()):
+            name = spoken[len(spoken) - len(name):]
+        if name:
+            return _local_intent(Action.RENAME, track="selected", text=name, track_stated=0.0)
     rename = re.fullmatch(rf"(?:rename|call)\s+(?:the\s+)?(?P<target>{target_pattern})\s+(?:to\s+)?(?P<name>.+)|(?P<target2>{target_pattern})\s+(?:rename|name)\s+(?:to\s+)?(?P<name2>.+)", text, re.IGNORECASE)
     if rename:
         target_text = rename.group("target") or rename.group("target2")
         name = _clean_object(rename.group("name") or rename.group("name2"))
         track = _track_en(snapshot, target_text)
+        # Normalization lowercases the phrase; take the new name from the utterance so "Low End" keeps its case.
+        spoken = utterance.strip().rstrip(".!?").strip("\"'")
+        spoken = re.sub(rf"[\s,]*\b(?:{_alternation('polite_suffix')})$", "", spoken, flags=re.IGNORECASE).strip()
+        if name and spoken.casefold().endswith(name.casefold()):
+            name = spoken[len(spoken) - len(name):]
         if isinstance(track, int) and name:
             return _local_intent(Action.RENAME, track=track, text=name)
 
@@ -341,12 +368,14 @@ def parse_local_en(utterance: str, snapshot: Snapshot) -> Intent | None:
     device_track, device = _device_in(snapshot, text)
     if device is not None and re.search(r"\b(?:turn|switch|enable|disable|bypass)\b|\b(?:on|off)\b", text):
         off = re.search(r"\b(?:off|disable|bypass)\b", text) is not None
-        intent = _local_intent(Action.DEVICE_OFF if off else Action.DEVICE_ON, track=device_track)
-        parameter = next((item for item in device.params if item.index == 0), None)
-        return Intent(**{**intent.__dict__, "device": device, "device_conf": 1.0, "param": parameter, "param_conf": 1.0 if parameter else 0.0})
+        named_track, span = _find_target(snapshot, text)
+        stated = span is not None
+        return _local_intent(Action.DEVICE_OFF if off else Action.DEVICE_ON, track=named_track, track_stated=1.0 if stated else 0.0, device_name=device.name)
 
     track, target_span = _find_target(snapshot, text)
     rest = text if target_span is None else (text[:target_span[0]] + " " + text[target_span[1]:]).strip()
+    rest = re.sub(r"\bthe\b", " ", rest)
+    rest = re.sub(r"\s+", " ", rest)
     monitor = re.search(r"\bmonitor(?:ing)?\s+(?:the\s+)?(?:[\w .'-]+\s+)?(in|auto|off)\b", text)
     if monitor:
         state = monitor.group(1)
@@ -365,7 +394,9 @@ def parse_local_en(utterance: str, snapshot: Snapshot) -> Intent | None:
     )
     for pattern, action in toggle_patterns:
         if re.search(pattern, rest):
-            return _local_intent(action, track=track)
+            unknown = target_span is None and re.search(rf"(?:{pattern})\s+(.+)$", text, re.IGNORECASE)
+            stated = target_span is not None or unknown is not None
+            return _local_intent(action, track=track, track_stated=1.0 if stated else 0.0)
 
     if re.search(r"\bstop\s+(?:the\s+)?(?:track(?:'s)?\s+)?clips\b", text) or re.fullmatch(r"stop\s+(?:the\s+)?clips", rest):
         return _local_intent(Action.TRACK_STOP_CLIPS, track=track)
@@ -382,12 +413,29 @@ def parse_local_en(utterance: str, snapshot: Snapshot) -> Intent | None:
     if re.search(r"\bpan\b|\bcenter\b", text):
         if re.search(r"\bcenter\b", text):
             number = Number(0.0, "pan")
+        elif re.search(rf"\b(?:{_alternation('small')}|more)\b", text) and re.search(r"\b(?:left|right)\b", text):
+            return _local_intent(
+                Action.PAN,
+                track=track,
+                step=Step.DOWN_SMALL if re.search(r"\bleft\b", text) else Step.UP_SMALL,
+            )
+        elif re.search(r"\bhard\s+left\b", text):
+            number = Number(-50.0, "pan")
+        elif re.search(r"\bhard\s+right\b", text):
+            number = Number(50.0, "pan")
+        elif re.search(r"\b(?:left|right)\b", text) and not re.search(r"\d", text):
+            return _local_intent(
+                Action.PAN,
+                track=track,
+                step=Step.DOWN_SMALL if re.search(r"\bleft\b", text) else Step.UP_SMALL,
+            )
         else:
             pan = re.search(r"(?:left\s*(\d+(?:\.\d+)?)|(\d+(?:\.\d+)?)\s*left|right\s*(\d+(?:\.\d+)?)|(\d+(?:\.\d+)?)\s*right)", text)
             if pan:
                 groups = pan.groups()
                 value = float(next(item for item in groups if item is not None))
-                number = Number(-value if groups[0] or groups[1] else value, "pan")
+                percent = "%" in text or re.search(r"\bpercent\b", text) is not None
+                number = Number(-value if groups[0] or groups[1] else value, "percent" if percent else "pan")
             else:
                 number = None
         if number is not None:
@@ -404,26 +452,97 @@ def parse_local_en(utterance: str, snapshot: Snapshot) -> Intent | None:
     return None
 
 
-def _note_target(snapshot: Snapshot, text: str) -> tuple[int | None, int | None]:
-    pattern = _track_target_pattern(snapshot, include_master=False)
-    match = re.search(rf"(?P<target>{pattern})\s+(?:clip|slot)\s+(?P<slot>\d+)", text, re.IGNORECASE)
+_TRACK_DEFAULT_ACTIONS = {
+    Action.MUTE, Action.UNMUTE, Action.SOLO, Action.UNSOLO, Action.ARM, Action.DISARM,
+    Action.FOLD, Action.UNFOLD, Action.MONITOR_IN, Action.MONITOR_AUTO, Action.MONITOR_OFF,
+    Action.TRACK_STOP_CLIPS, Action.SEND, Action.PAN, Action.VOLUME, Action.DEVICE_ON, Action.DEVICE_OFF,
+}
+
+
+def _has_unresolved_target_words(text: str, intent: Intent, snapshot: Snapshot) -> bool:
+    # Identifiers go first: once "send" is removed as a word, the "b" of "send B" would read as a leftover name.
+    residual = re.sub(r"(?:[-+]\s*\d+(?:\.\d+)?|\d+(?:\.\d+)?\s*(?:%|db|bpm|st|semitones?)|\b(?:to|by|at|of)\s+\d+(?:\.\d+)?)", " ", text, flags=re.IGNORECASE)
+    residual = re.sub(r"\bsend\s+(?:[a-z]|\d+)\b", " ", residual, flags=re.IGNORECASE)
+    residual = re.sub(r"\b(?:master(?:\s+track)?|main(?:\s+(?:track|out))?|whole\s+mix|the\s+mix|everything)\b", " ", residual, flags=re.IGNORECASE)
+    for phrase in sorted(
+        {phrase for phrases in ENGLISH_PHRASES.values() for phrase in phrases}, key=len, reverse=True
+    ):
+        residual = re.sub(rf"(?<!\w){re.escape(phrase)}(?!\w)", " ", residual, flags=re.IGNORECASE)
+    for track in sorted(snapshot.tracks, key=lambda item: len(item.name), reverse=True):
+        if track.name:
+            residual = re.sub(rf"(?<!\w){re.escape(track.name)}(?!\w)", " ", residual, count=1, flags=re.IGNORECASE)
+    if intent.device_name:
+        residual = re.sub(rf"(?<!\w){re.escape(intent.device_name)}(?!\w)", " ", residual, flags=re.IGNORECASE)
+    residual = re.sub(
+        r"\b(?:make|bring|put|take|pull|push|raise|lower|increase|decrease|reduce|boost|cut|drop|bump|get|give|"
+        r"louder|quieter|softer|bit|little|touch|slightly|tad|lot|much|way|all|fully|max|maximum|min|minimum|half|"
+        r"percent|db|decibels?|can|could|would|will|you|just|its|thanks?)\b",
+        " ", residual, flags=re.IGNORECASE,
+    )
+    residual = re.sub(
+        r"\b(?:set|turn|switch|enable|disable|bypass|off|unmute|mute|unsolo|solo|disarm|arm|unfold|expand|fold|collapse|"
+        r"monitor|monitoring|auto|send|pan|center|centre|left|right|hard|volume|level|clips?|stop|quantize|quantise|"
+        r"velocity|transpose|shift|move|pitch|recording|record|up|down|octaves?|semitones?|half steps?)\b",
+        " ", residual, flags=re.IGNORECASE,
+    )
+    residual = re.sub(r"\b(?:track|clip|slot|scene|bar)\s*\d+\b", " ", residual, flags=re.IGNORECASE)
+    residual = re.sub(r"\bsend\s+(?:[a-z]|\d+)\b", " ", residual, flags=re.IGNORECASE)
+    residual = re.sub(r"(?:(?<!\w)[-+]\s*\d+(?:\.\d+)?|\d+(?:\.\d+)?\s*(?:%|db|bpm|st|semitones?)|\b(?:to|by|at|of)\s+\d+(?:\.\d+)?)", " ", residual, flags=re.IGNORECASE)
+    residual = re.sub(r"\b(?:the|a|an|by|to|on|in|of|for|my|channel|it|this|that|selected|current|and|now|please|more)\b", " ", residual, flags=re.IGNORECASE)
+    words = re.findall(r"[a-z][a-z'-]*", residual.casefold())
+    return bool(words or re.search(r"\d", residual))
+
+
+def parse_local_en(utterance: str, snapshot: Snapshot) -> Intent | None:
+    intent = _parse_local_en(utterance, snapshot)
+    if intent is None or intent.action not in _TRACK_DEFAULT_ACTIONS:
+        return intent
+    if _has_unresolved_target_words(normalize_english_phrase(utterance), intent, snapshot):
+        return replace(intent, track=None, track_conf=0.0, track_stated=1.0, named_evidence=1.0, target_origin=TargetOrigin.NONE)
+    if intent.track is None and intent.track_stated >= TRACK_STATED_MIN:
+        numbered = re.search(r"\b(?:track\s*\d+|\d+(?:st|nd|rd|th)\s+track)\b", utterance, re.IGNORECASE)
+        if numbered and _track_en(snapshot, numbered.group(0)) is None:
+            return intent
+        return replace(intent, track_stated=0.0, named_evidence=0.0)
+    return intent
+
+
+def _note_target(snapshot: Snapshot, text: str) -> tuple[int | None, int | None, bool, bool]:
+    match = re.search(r"^(?:(?:quantize|quantise|legato|transpose|shift|move|pitch)\s+)?(?P<target>.+?)\s+(?:clip|slot)\s+(?P<slot>\d+)\b", text, re.IGNORECASE)
     if not match:
-        match = re.search(rf"(?:clip|slot)\s+(?P<slot>\d+)\s+(?:on|in)\s+(?P<target>{pattern})", text, re.IGNORECASE)
+        match = re.search(r"(?:clip|slot)\s+(?P<slot>\d+)\s+(?:on|in)\s+(?:the\s+)?(?P<target>.+?)(?:\s+track)?$", text, re.IGNORECASE)
     if not match:
-        return None, None
+        known, _ = _find_target(snapshot, text, include_master=False)
+        if isinstance(known, int):
+            return known, None, True, False
+        residual = text
+        for phrase in sorted(
+            ENGLISH_PHRASES["quantize"] + ENGLISH_PHRASES["legato"] + ENGLISH_PHRASES["duplicate_loop"],
+            key=len, reverse=True,
+        ):
+            residual = re.sub(rf"(?<!\w){re.escape(phrase)}(?!\w)", " ", residual, flags=re.IGNORECASE)
+        residual = re.sub(
+            r"\b(?:set|make|connect|fill|velocity|transpose|shift|move|pitch|up|down|to|on|in|by|an?|the|"
+            r"selected|this|it|notes?|clips?|loop|gaps?|octaves?|semitones?|half steps?|lightly|loosely|slightly|more)\b",
+            " ", residual, flags=re.IGNORECASE,
+        )
+        residual = re.sub(r"\b(?:a bit|a little|a touch)\b|\b\d+(?:/\d+)?\s*%?\b|[^a-z'-]+", " ", residual, flags=re.IGNORECASE).strip()
+        return None, None, bool(residual), bool(residual)
     track = _track_en(snapshot, match.group("target"))
-    return (track if isinstance(track, int) else None), int(match.group("slot")) - 1
+    return (track if isinstance(track, int) else None), int(match.group("slot")) - 1, True, not isinstance(track, int)
 
 
 def parse_clip_notes_phrase_en(utterance: str, snapshot: Snapshot) -> ClipNotesRequest | None:
     if is_negated_en(utterance):
         return None
     text = normalize_english_phrase(utterance)
-    track, slot = _note_target(snapshot, text)
+    track, slot, target_stated, target_missing = _note_target(snapshot, text)
+    def request(op: str, **values) -> ClipNotesRequest:
+        return ClipNotesRequest(op, track, slot, target_stated=target_stated, target_missing=target_missing, **values)
     if slot is not None and slot < 0:
         return None
     if re.search(r"\b(?:double the loop|duplicate loop|twice as long)\b", text):
-        return ClipNotesRequest("duplicate_loop", track, slot)
+        return request("duplicate_loop")
     if re.search(r"\b(?:quantize|quantise)\b", text):
         grid = "1/16"
         grids = (
@@ -440,19 +559,19 @@ def parse_clip_notes_phrase_en(utterance: str, snapshot: Snapshot) -> ClipNotesR
             grid += "t"
         percent = re.search(r"(\d+)\s*%", text)
         amount = max(0.0, min(1.0, int(percent.group(1)) / 100.0)) if percent else 0.5 if re.search(r"\b(?:lightly|loosely|a bit|a little)\b", text) else 1.0
-        return ClipNotesRequest("quantize", track, slot, grid=grid, amount=amount)
+        return request("quantize", grid=grid, amount=amount)
     if re.search(r"\b(?:legato|make it legato|connect the notes|fill the gaps)\b", text):
-        return ClipNotesRequest("legato", track, slot)
+        return request("legato")
     velocity = re.search(r"\bvelocity\b|\b(?:louder|softer|harder)\s+notes?\b|\bnotes?\s+(?:louder|softer|harder)\b", text)
     if velocity:
         fixed = re.search(r"\bvelocity\s+(?:to|at)\s+(\d+)", text)
         if fixed:
-            return ClipNotesRequest("velocity", track, slot, value=float(max(1, min(127, int(fixed.group(1))))))
+            return request("velocity", value=float(max(1, min(127, int(fixed.group(1))))))
         small = re.search(r"\b(?:a bit|a little|slightly|a touch|a hair)\b", text) is not None
         if re.search(r"\b(?:up|louder|harder|increase|raise|boost)\b", text):
-            return ClipNotesRequest("velocity", track, slot, factor=1.1 if small else 1.25)
+            return request("velocity", factor=1.1 if small else 1.25)
         if re.search(r"\b(?:down|softer|decrease|lower|reduce)\b", text):
-            return ClipNotesRequest("velocity", track, slot, factor=0.9 if small else 0.8)
+            return request("velocity", factor=0.9 if small else 0.8)
         return None
     transpose = re.search(r"\b(?:transpose|shift|move|pitch)\b", text)
     amount = re.search(r"\b(\d+|an?|one|two|three|four)\s*(octaves?|semitones?|half steps?|st)\b", text)
@@ -465,5 +584,5 @@ def parse_clip_notes_phrase_en(utterance: str, snapshot: Snapshot) -> ClipNotesR
             count = -count
         elif not re.search(r"\bup\b", text):
             return None
-        return ClipNotesRequest("transpose", track, slot, semitones=count)
+        return request("transpose", semitones=count)
     return None

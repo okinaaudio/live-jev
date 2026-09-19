@@ -7,7 +7,7 @@ import unittest
 import unittest.mock
 
 from actions import ACTIONS, bar_to_beats
-from bridge_client import Ack, BridgeResult, validate_arguments
+from bridge_client import Ack, BridgeError, BridgeResult, validate_arguments
 from daemon import LiveJevService
 from intent import Action, Number, Step, parse_local, parse_number
 from snapshot import song_fields
@@ -27,7 +27,8 @@ class RecordingBridge:
             return BridgeResult((), 1, 0, False)
         at = arguments.index("--api-get")
         path, prop, request_id = arguments[at + 1], arguments[at + 2], arguments[at + 3]
-        names = {"live_set tracks 0": "Pad", "live_set tracks 1": "Bass", "live_set tracks 2": "Drums"}
+        names = {"live_set tracks 0": "Pad", "live_set tracks 1": "Bass", "live_set tracks 2": "Drums",
+                 "live_set tracks 0 devices 0": "Reverb", "live_set tracks 1 devices 0": "Reverb"}
         if prop == "name":
             payload = names[path]
         elif prop == "current_song_time":
@@ -141,7 +142,7 @@ class ConfirmGateTests(unittest.TestCase):
         self._confirm_patch.start()
         self.addCleanup(self._confirm_patch.stop)
 
-    def _service(self, bridge):
+    def _service(self, bridge, **kwargs):
         return LiveJevService(
             bridge=bridge,
             snapshot=_snapshot_with_song(),
@@ -149,6 +150,7 @@ class ConfirmGateTests(unittest.TestCase):
             requester=lambda _payload, _key: (_ for _ in ()).throw(AssertionError("Jev を呼んだ")),
             llm_key=None,
             rewriter=lambda *_args: (_ for _ in ()).throw(AssertionError("LLM を呼んだ")),
+            **kwargs,
         )
 
     def test_record_on_waits_for_confirmation(self) -> None:
@@ -170,6 +172,34 @@ class ConfirmGateTests(unittest.TestCase):
         self.assertEqual(answer["kind"], "result")
         self.assertTrue(any("--api-set" in call and "session_record" in call for call in bridge.calls))
         self.assertTrue(service.snapshot.song.get("session_record"))
+
+    def test_expired_confirmation_does_not_execute(self) -> None:
+        now = [100.0]
+        bridge = RecordingBridge()
+        service = self._service(bridge, clock=lambda: now[0])
+        self.assertEqual(service.process({"id": "1", "text": "録音開始"})["kind"], "confirm")
+        now[0] += 31
+        answer = service.process({"id": "2", "confirm": True})
+        self.assertEqual(answer, {"id": "2", "kind": "info", "line": "時間が経ったので取り消しました。"})
+        self.assertEqual(bridge.calls, [])
+        self.assertFalse(service.snapshot.song.get("session_record"))
+
+    def test_cancel_pending_clears_ask_and_confirm_without_write(self) -> None:
+        from daemon import Pending
+        from intent import IntentResult
+        bridge = RecordingBridge()
+        service = self._service(bridge)
+        intent = parse_local("録音開始", service.snapshot)
+        result = IntentResult(intent, (), (), ())
+        service.pending = Pending(result, "track")
+        service.pending_confirm = (intent, 0, 0, "録音開始", None)
+        service.pending_confirm_created = service._clock()
+        answer = service.process({"id": "2", "cmd": "cancel_pending"})
+        self.assertEqual(answer["kind"], "status")
+        self.assertIsNone(service.pending)
+        self.assertIsNone(service.pending_confirm)
+        self.assertIsNone(service.pending_confirm_created)
+        self.assertEqual(bridge.calls, [])
 
     def test_loop_on_runs_without_confirmation(self) -> None:
         bridge = RecordingBridge()
@@ -337,7 +367,7 @@ class SendRenameAddTests(unittest.TestCase):
         first = service.process({"id": "1", "text": "Bassの名前をLow Endにして"})
         self.assertEqual(first["kind"], "confirm")
         self.assertIn("Low End", first["line"])
-        done = service.process({"id": "2", "confirm": True})
+        done = service.process({"id": "1", "confirm": True})
         self.assertEqual(done["kind"], "result")
         self.assertEqual(service.snapshot.tracks[1].name, "Low End")
 
@@ -416,7 +446,7 @@ class AddTrackWithDeviceTests(unittest.TestCase):
         named = parse_local("Leadという名前でウェーブテーブル入りのトラック作って", snapshot)
         self.assertEqual((named.native_device, named.text), ("Wavetable", "Lead"))
         audio = parse_local("Reverb付きのオーディオトラック追加", snapshot)
-        self.assertEqual((audio.native_device, audio.text), ("Reverb", "audio"))
+        self.assertEqual((audio.native_device, audio.track_kind, audio.text), ("Reverb", "audio", None))
         self.assertIsNone(parse_local("Serum入りのMIDIトラック作って", snapshot))
         self.assertIsNone(resolve_native_device("eq"))
         self.assertEqual(resolve_native_device("EQ Eight"), "EQ Eight")
@@ -451,7 +481,7 @@ class AddTrackWithDeviceTests(unittest.TestCase):
         self.assertEqual(first["kind"], "confirm")
         self.assertIn("Operator", first["line"])
         self.assertEqual(calls, [])
-        done = service.process({"id": "2", "confirm": True})
+        done = service.process({"id": "1", "confirm": True})
         self.assertEqual(done["kind"], "result", done)
         self.assertEqual(calls[0], ["--write", "--add-midi-tracks", "1", "--midi-name", "Lead"])
         self.assertEqual(calls[1][:4], ["--write", "--api-insert-device", "live_set tracks 3", "Operator"])
@@ -550,7 +580,7 @@ class PluginFlowTests(unittest.TestCase):
             first = service.process({"id": "1", "text": "BassにSerum 2を挿して"})
             self.assertEqual(first["kind"], "confirm")
             self.assertEqual(loads, [])
-            done = service.process({"id": "2", "confirm": True})
+            done = service.process({"id": "1", "confirm": True})
         self.assertEqual(done["kind"], "result", done)
         self.assertEqual(loads, [("Serum 2", 1)])
         self.assertIn("Serum 2", done["line"])
@@ -600,22 +630,41 @@ class SelectedTrackTests(unittest.TestCase):
     """Explicit selected-track targets and the selected-track default when no track is given."""
 
     class SelectedBridge(RecordingBridge):
+        def __init__(self):
+            super().__init__()
+            self.selected_index = 1
+            self.selection_fails = False
+
         def run(self, arguments):
             arguments = list(arguments)
             if "--api-session-context" in arguments:
                 self.calls.append(arguments)
-                payload = {"song": {}, "selected": {"track": {"path": "live_set tracks 1", "name": "Bass"}}}
+                if self.selection_fails:
+                    raise BridgeError("selection unavailable")
+                names = {0: "Pad", 1: "Bass", 2: "Drums"}
+                payload = {"song": {}, "selected": {"track": {"path": f"live_set tracks {self.selected_index}", "name": names[self.selected_index]}}}
                 return BridgeResult((Ack("api_session_context", arguments[-1], payload),), 1, 0, False)
+            if "--api-mixer-status" in arguments:
+                self.calls.append(arguments)
+                target, request = arguments[-2], arguments[-1]
+                payload = {"parameters": {"volume": {"path": f"live_set tracks {target} mixer_device volume", "value": 0.55, "display": "-8.0 dB"}, "panning": {"path": f"live_set tracks {target} mixer_device panning", "value": 0.0, "display": "C"}}}
+                return BridgeResult((Ack("api_mixer_status", request, payload),), 1, 0, False)
             if "--api-get" not in arguments:
                 self.calls.append(arguments)
                 return BridgeResult((), 1, 0, False)
             return super().run(arguments)
 
-    def _service(self, requester):
+    def _service(self, requester, snapshot=None, **kwargs):
         bridge = self.SelectedBridge()
-        service = LiveJevService(bridge=bridge, snapshot=_snapshot_with_song(), key="x", requester=requester, llm_key=None,
-                                 rewriter=lambda *_: (_ for _ in ()).throw(AssertionError("LLM")))
+        service = LiveJevService(bridge=bridge, snapshot=snapshot or _snapshot_with_song(), key="x", requester=requester, llm_key=None,
+                                 rewriter=lambda *_: (_ for _ in ()).throw(AssertionError("LLM")), **kwargs)
         return bridge, service
+
+    @staticmethod
+    def _send_snapshot():
+        base = _snapshot_with_song()
+        tracks = tuple(replace(track, sends=(0.2, 0.0)) for track in base.tracks)
+        return replace(base, tracks=tracks, returns=("Reverb", "Delay"))
 
     def test_unspecified_track_defaults_to_selected(self) -> None:
         from tests.support import response
@@ -642,13 +691,159 @@ class SelectedTrackTests(unittest.TestCase):
         self.assertEqual(answer["kind"], "result")
         self.assertEqual(answer["decision"]["track"], "Bass")
 
-    def test_named_but_missing_track_asks_instead_of_selected(self) -> None:
+    @staticmethod
+    def _stated(answers, named: float):
+        from tests.support import choice
+        rest = 1.0 - named
+        answers["answers"]["track_stated"] = choice("named" if named >= 0.5 else "absent", max(named, rest), named=named, absent=rest)
+        return answers
+
+    @staticmethod
+    def _send_snapshot():
+        base = _snapshot_with_song()
+        return replace(base, tracks=tuple(replace(track, sends=(0.2, 0.0)) for track in base.tracks), returns=("Reverb", "Delay"))
+
+    def test_rename_without_target_renames_selected_track(self) -> None:
+        bridge, service = self._service(lambda *_: (_ for _ in ()).throw(AssertionError("Jev")))
+        for text in ("名前をLeadにして", "このトラックの名前をLeadに変えて", "トラック名をLeadにして"):
+            bridge.calls.clear()
+            service.process({"id": "1", "text": text})
+            rename = next(call for call in bridge.calls if "--rename-track-index" in call)
+            self.assertEqual((rename[rename.index("--rename-track-index") + 1], rename[rename.index("--rename-track-name") + 1]), ("1", "Lead"), text)
+
+    def test_opposite_direction_is_not_a_continuation_of_the_previous_move(self) -> None:
+        from tests.support import choice, response
+        right = self._stated(response("pan", "none", "up_small"), 0.0)
+        left = self._stated(response("pan", "none", "none", refers_previous=0.9), 0.0)
+        left["answers"]["step"] = choice("set", 0.3)
+        replies = iter([right, left])
+        bridge, service = self._service(lambda *_: next(replies))
+        service.process({"id": "1", "text": "右に振って"})
+        bridge.calls.clear()
+        service.process({"id": "2", "text": "少し左"})
+        written = [float(call[3]) for call in bridge.calls if "--api-parameter-set" in call and "panning" in call[2]]
+        self.assertTrue(written and written[-1] < 0.05, bridge.calls)
+
+    def test_english_amount_and_politeness_words_are_not_target_names(self) -> None:
+        for text in ("make it a bit louder please", "set the send A level to 100 percent", "send B up a bit", "could you turn it down a touch"):
+            bridge, service = self._service(lambda *_: (_ for _ in ()).throw(AssertionError("Jev")), snapshot=self._send_snapshot())
+            try:
+                answer = service.process({"id": "1", "text": text})
+            except AssertionError:
+                continue
+            self.assertNotEqual(answer.get("line"), "指定したトラックが見つかりません", text)
+        for text in ("make Ghost a bit louder please", "set strings send A to 100 percent"):
+            bridge, service = self._service(lambda *_: (_ for _ in ()).throw(AssertionError("Jev")), snapshot=self._send_snapshot())
+            answer = service.process({"id": "1", "text": text})
+            self.assertEqual(answer["kind"], "error", text)
+            self.assertFalse(any("--write" in call for call in bridge.calls), text)
+
+    def test_uncertain_band_keeps_confident_pick_and_asks_on_half_confident_pick(self) -> None:
+        from tests.support import response
+        for action, step in (("mute", "none"), ("volume", "up_small")):
+            bridge, service = self._service(lambda *_: self._stated(response(action, "t2", step, track_conf=0.85), 0.35))
+            kept = service.process({"id": "1", "text": "キック上げて"})
+            self.assertEqual((kept["kind"], kept["decision"]["track"]), ("result", "Drums"), kept)
+            bridge, service = self._service(lambda *_: self._stated(response(action, "t2", step, track_conf=0.6), 0.35))
+            asked = service.process({"id": "1", "text": "キックっぽいの上げて"})
+            self.assertEqual(asked["kind"], "ask", asked)
+            self.assertFalse(any("--write" in call or "--api-set" in call for call in bridge.calls))
+        bridge, service = self._service(lambda *_: self._stated(response("arm", "none", track_conf=0.5), 0.3))
+        selected = service.process({"id": "1", "text": "アームして"})
+        self.assertEqual((selected["kind"], selected["decision"]["track"]), ("result", "Bass"), selected)
+        bridge, service = self._service(lambda *_: self._stated(response("volume", "none", "down_small", track_conf=0.38), 0.4))
+        unknown = service.process({"id": "1", "text": "ベル下げて"})
+        self.assertEqual(unknown["kind"], "ask", unknown)
+        self.assertFalse(any("--write" in call for call in bridge.calls))
+        bridge, service = self._service(lambda *_: self._stated(response("mute", "t2", track_conf=0.9), 0.1))
+        unnamed = service.process({"id": "1", "text": "ミュート"})
+        self.assertEqual((unnamed["kind"], unnamed["decision"]["track"]), ("result", "Bass"), unnamed)
+
+    def test_numeric_track_name_is_not_treated_as_a_value(self) -> None:
+        from intent import lower_setting_only_track_stated
+        self.assertEqual(lower_setting_only_track_stated("808を下げて", 0.99, ("Kick", "808")), 0.99)
+        self.assertEqual(lower_setting_only_track_stated("音量を-6dBにして", 0.83, ("Kick", "808")), 0.0)
+
+    def test_device_spelled_out_in_text_is_matched_when_jev_is_unsure(self) -> None:
+        from tests.support import choice, response
+        answers = self._stated(response("device_off", "none", track_conf=0.54), 0.0)
+        answers["answers"]["device_t0"] = choice("d0", 0.38)
+        bridge, service = self._service(lambda *_: answers)
+        answer = service.process({"id": "1", "text": "Reverbをオフ"})
+        self.assertEqual((answer["kind"], answer["decision"]["track"]), ("result", "Pad"), answer)
+        ghost = self._stated(response("device_off", "none", track_conf=0.8), 0.9)
+        ghost["answers"]["device_t0"] = choice("d0", 0.95)
+        bridge, service = self._service(lambda *_: ghost)
+        refused = service.process({"id": "1", "text": "GhostのReverbをオフ"})
+        self.assertEqual(refused["kind"], "error", refused)
+        self.assertFalse(any("--write" in call for call in bridge.calls))
+
+    def test_selection_references_pass_the_target_gate(self) -> None:
+        for text in ("solo this", "arm it", "mute it", "mute this track", "このトラックをミュート", "選択トラックをミュート"):
+            bridge, service = self._service(lambda *_: (_ for _ in ()).throw(AssertionError("Jev")))
+            answer = service.process({"id": "1", "text": text})
+            self.assertEqual((answer["kind"], answer["decision"]["track"]), ("result", "Bass"), text)
+
+    def test_missing_name_from_jev_never_defaults_to_selected(self) -> None:
+        from tests.support import response
+        answers = self._stated(response("mute", "none", track_conf=0.83), 0.77)
+        bridge, service = self._service(lambda *_: answers)
+        answer = service.process({"id": "1", "text": "Ghostをミュート"})
+        self.assertIn(answer["kind"], {"ask", "error"})
+        self.assertFalse(any("--api-set" in call or "--write" in call for call in bridge.calls))
+
+    def test_named_track_requires_positive_resolution_before_write(self) -> None:
+        from tests.support import response
+        low = self._stated(response("mute", "t0", track_conf=0.70), 0.67)
+        bridge, service = self._service(lambda *_: low)
+        answer = service.process({"id": "low", "text": "Ghostをミュート"})
+        self.assertEqual(answer["kind"], "ask", answer)
+        self.assertFalse(any("--api-set" in call or "--write" in call for call in bridge.calls))
+
+        resolved = self._stated(response("mute", "t0", track_conf=0.93), 0.67)
+        bridge, service = self._service(lambda *_: resolved)
+        answer = service.process({"id": "resolved", "text": "Padをミュート"})
+        self.assertEqual((answer["kind"], answer["decision"]["track"]), ("result", "Pad"), answer)
+
+    def test_unnamed_guess_at_high_confidence_still_defaults_to_selected(self) -> None:
+        from tests.support import choice, response
+        answers = self._stated(response("send", "t0", "up_small", track_conf=0.90), 0.09)
+        answers["answers"]["send"] = choice("send1")
+        bridge, service = self._service(lambda *_: answers, snapshot=self._send_snapshot())
+        answer = service.process({"id": "1", "text": "センドBを少し上げて"})
+        self.assertEqual((answer["kind"], answer["decision"]["track"]), ("result", "Bass"), answer)
+
+    def test_direction_is_read_from_words_when_jev_is_unsure(self) -> None:
+        from daemon import direction_from_words
+        from intent import Action, Step, interpret_response
+        self.assertIs(direction_from_words(Action.PAN, "右に振って"), Step.UP_SMALL)
+        self.assertIs(direction_from_words(Action.PAN, "少し左"), Step.DOWN_SMALL)
+        self.assertIs(direction_from_words(Action.PAN, "pan hard left"), Step.DOWN_BIG)
+        self.assertIs(direction_from_words(Action.SEND, "センドAを上げて"), Step.UP_SMALL)
+        self.assertIs(direction_from_words(Action.SEND, "リバーブ送りをかなり減らして"), Step.DOWN_BIG)
+        self.assertIsNone(direction_from_words(Action.VOLUME, "右のほう"))
+        self.assertIsNone(direction_from_words(Action.VOLUME, "上げて下げて"))
+        for text in ("仕上げて", "見上げて", "打ち上げて", "get the balance right", "right is correct", "pan right to center", "右から真ん中に"):
+            self.assertIsNone(direction_from_words(Action.PAN, text), text)
+        from tests.support import choice, response
+        answers = self._stated(response("pan", "none", "none"), 0.0)
+        answers["answers"]["step"] = choice("none", 0.42)
+        bridge, service = self._service(lambda *_: answers)
+        answer = service.process({"id": "1", "text": "右に振って"})
+        self.assertEqual((answer["kind"], answer["decision"]["track"]), ("result", "Bass"), answer)
+
+        confident_set = self._stated(response("pan", "none", "set"), 0.0)
+        confident_set["answers"]["step"] = choice("set", 0.8)
+        result = service._step_from_utterance(interpret_response(service.snapshot, "pan right", confident_set), "pan right")
+        self.assertIs(result.intent.step, Step.SET)
+
+    def test_named_but_missing_track_errors_instead_of_selected(self) -> None:
         from tests.support import response
         answers = response("volume", "none", "down_small", track_conf=0.5)
         answers["answers"]["track_stated"] = {"type": "noul", "noul": 0.85}
         bridge, service = self._service(lambda *_: answers)
         answer = service.process({"id": "1", "text": "パッドを少し下げて"})
-        self.assertEqual(answer["kind"], "ask")
+        self.assertEqual(answer["kind"], "error")
         self.assertFalse(any("--write" in call for call in bridge.calls))
 
     def test_named_but_uncertain_track_still_asks(self) -> None:
@@ -657,6 +852,341 @@ class SelectedTrackTests(unittest.TestCase):
         answer = service.process({"id": "1", "text": "パッドっぽいのミュート"})
         self.assertEqual(answer["kind"], "ask")
         self.assertFalse(any("--api-set" in call for call in bridge.calls))
+
+    def test_send_without_named_track_defaults_to_selected(self) -> None:
+        from tests.support import choice, response
+        answer_data = response("send")
+        answer_data["answers"]["send"] = choice("send0")
+        answer_data["answers"]["step"] = choice("set")
+        bridge, service = self._service(lambda *_: answer_data, snapshot=self._send_snapshot())
+        answer = service.process({"id": "1", "text": "SendAを100%にして"})
+        self.assertEqual(answer["kind"], "result")
+        self.assertEqual(answer["decision"]["track"], "Bass")
+        write = next(call for call in bridge.calls if "--api-parameter-set" in call)
+        self.assertEqual(write[:3], ["--write", "--api-parameter-set", "live_set tracks 1 mixer_device sends 0"])
+        self.assertEqual(float(write[3]), 1.0)
+
+    def test_send_with_named_track_keeps_named_track(self) -> None:
+        from tests.support import choice, response
+        answer_data = response("send", "t2", "up_small", track_conf=0.95)
+        answer_data["answers"]["send"] = choice("send0")
+        bridge, service = self._service(lambda *_: answer_data, snapshot=self._send_snapshot())
+        answer = service.process({"id": "1", "text": "ドラムのセンドAを上げて"})
+        self.assertEqual(answer["kind"], "result")
+        self.assertEqual(answer["decision"]["track"], "Drums")
+        self.assertTrue(any("live_set tracks 2 mixer_device sends 0" in call for call in bridge.calls))
+
+    def test_english_local_send_without_track_defaults_to_selected(self) -> None:
+        bridge, service = self._service(
+            lambda *_: (_ for _ in ()).throw(AssertionError("Jev")),
+            snapshot=self._send_snapshot(),
+        )
+        answer = service.process({"id": "1", "text": "set send A to 100%"})
+        self.assertEqual(answer["kind"], "result")
+        self.assertEqual(answer["decision"]["track"], "Bass")
+        self.assertTrue(any("live_set tracks 1 mixer_device sends 0" in call for call in bridge.calls))
+
+    def test_expired_ask_processes_answer_as_fresh_text(self) -> None:
+        from tests.support import response
+        now = [100.0]
+        replies = [response("volume", "none", "down_small", track_conf=0.5), response("mute", "t1")]
+        replies[0]["answers"]["track_stated"] = {"type": "noul", "noul": 0.85}
+        bridge, service = self._service(lambda *_: replies.pop(0), clock=lambda: now[0])
+        self.assertEqual(service.process({"id": "1", "text": "パッドを下げて"})["kind"], "error")
+        now[0] += 31
+        answer = service.process({"id": "2", "text": "Bass"})
+        self.assertEqual(answer["kind"], "result")
+        self.assertEqual(answer["decision"]["action"], "mute")
+        self.assertTrue(any("--api-set" in call and "mute" in call for call in bridge.calls))
+
+    def test_explicit_missing_tracks_never_default_to_selected(self) -> None:
+        for text in ("mute Ghost", "mute track 99", "トラック99をミュート"):
+            with self.subTest(text=text):
+                bridge, service = self._service(lambda *_: (_ for _ in ()).throw(AssertionError("Jev")))
+                answer = service.process({"id": "missing", "text": text})
+                self.assertEqual(answer["kind"], "error")
+                self.assertFalse(any("--write" in call for call in bridge.calls))
+
+    def test_identifier_numbers_are_not_values(self) -> None:
+        snapshot = self._send_snapshot()
+        send = parse_local("track 3 send A to 50 percent", snapshot)
+        gain = parse_local("Bass clip 2 gain to 50 percent", snapshot)
+        pan = parse_local("pan Bass left 20%", snapshot)
+        self.assertEqual(send.number, Number(50.0, "percent"))
+        self.assertEqual(gain.number, Number(50.0, "percent"))
+        self.assertEqual(pan.number, Number(-20.0, "percent"))
+
+    def test_local_compounds_do_nothing_but_and_in_name_is_safe(self) -> None:
+        for text in ("mute Pad and solo Bass", "PadをミュートしてBassをソロ"):
+            bridge, service = self._service(lambda *_: (_ for _ in ()).throw(AssertionError("Jev")))
+            answer = service.process({"id": "compound", "text": text})
+            self.assertEqual(answer["kind"], "info")
+            self.assertFalse(any("--write" in call for call in bridge.calls))
+
+    def test_device_toggle_resolves_after_selected_track(self) -> None:
+        from snapshot import Device, Param
+        base = _snapshot_with_song()
+        power = Param(0, "Device On", 1.0, 0.0, 1.0, "On", "live_set tracks 1 devices 0 parameters 0")
+        bass_reverb = Device(0, "Reverb", (power,), "live_set tracks 1 devices 0")
+        snapshot = replace(base, tracks=(base.tracks[0], replace(base.tracks[1], devices=(bass_reverb,)), base.tracks[2]))
+        bridge, service = self._service(lambda *_: (_ for _ in ()).throw(AssertionError("Jev")), snapshot=snapshot)
+        answer = service.process({"id": "device", "text": "turn Reverb off on Bass"})
+        self.assertEqual(answer["kind"], "result", answer)
+        self.assertTrue(any("live_set tracks 1 devices 0 parameters 0" in call for call in bridge.calls))
+
+    def test_device_without_track_uses_the_only_owner_when_selected_track_lacks_it(self) -> None:
+        bridge, service = self._service(lambda *_: (_ for _ in ()).throw(AssertionError("Jev")))
+        answer = service.process({"id": "device", "text": "turn Reverb off"})
+        self.assertEqual(answer["kind"], "result", answer)
+        self.assertTrue(any("live_set tracks 0 devices 0 parameters 0" in call for call in bridge.calls))
+        bridge, service = self._service(lambda *_: (_ for _ in ()).throw(AssertionError("Jev")))
+        named = service.process({"id": "device", "text": "turn Reverb off on Bass"})
+        self.assertEqual(named["kind"], "error", named)
+        self.assertFalse(any("--write" in call for call in bridge.calls))
+
+    def test_round_five_target_authorization_regressions(self) -> None:
+        from tests.support import choice, response
+
+        f1 = self._stated(response("param", "t0", "down_small", track_conf=0.67, param="d0p0"), 0.90)
+        bridge, service = self._service(lambda *_: f1)
+        asked = service.process({"id": "f1", "text": "Ghostのつまみを下げて"})
+        self.assertEqual(asked["kind"], "ask")
+        refused = service.process({"id": "f1-answer", "text": "Bass", "answering": "f1"})
+        self.assertEqual(refused["kind"], "error")
+        self.assertFalse(any("--write" in call for call in bridge.calls))
+
+        f2 = self._stated(response("device_off", "none", track_conf=0.2), 0.40)
+        f2["answers"]["device_t0"] = choice("d0", 0.95)
+        bridge, service = self._service(lambda *_: f2)
+        refused = service.process({"id": "f2", "text": "ベルのReverbを切って"})
+        self.assertIn(refused["kind"], {"ask", "error"})
+        self.assertFalse(any("--write" in call for call in bridge.calls))
+
+        replies = iter([self._stated(response("volume", "none", "down_small", refers_previous=0.95), 0.90)])
+        bridge, service = self._service(lambda *_: next(replies))
+        self.assertEqual(service.process({"id": "first", "text": "lower Bass"})["kind"], "result")
+        bridge.calls.clear()
+        refused = service.process({"id": "f3", "text": "Ghostも同じくらい下げて"})
+        self.assertIn(refused["kind"], {"ask", "error"})
+        self.assertFalse(any("--write" in call for call in bridge.calls))
+
+    def test_round_five_continuation_tracks_current_selection_or_named_target(self) -> None:
+        bridge, service = self._service(lambda *_: (_ for _ in ()).throw(AssertionError("Jev")))
+        self.assertEqual(service.process({"id": "selected", "text": "lower it"})["kind"], "result")
+        bridge.selected_index = 2
+        bridge.calls.clear()
+        self.assertEqual(service.process({"id": "more", "text": "a bit more"})["decision"]["track"], "Drums")
+        self.assertTrue(any("live_set tracks 2" in call for call in bridge.calls))
+
+        bridge, service = self._service(lambda *_: (_ for _ in ()).throw(AssertionError("Jev")))
+        self.assertEqual(service.process({"id": "named", "text": "lower Bass"})["kind"], "result")
+        bridge.selected_index = 2
+        bridge.calls.clear()
+        self.assertEqual(service.process({"id": "more", "text": "a bit more"})["decision"]["track"], "Bass")
+
+    def test_round_five_low_evidence_candidates_and_selection_failure_do_not_write(self) -> None:
+        from snapshot import Clip
+        from tests.support import choice, response
+        master = self._stated(response("volume", "master", "down_small"), 0.10)
+        bridge, service = self._service(lambda *_: master)
+        answer = service.process({"id": "master", "text": "ちょい下げて"})
+        self.assertEqual(answer["decision"]["track"], "Bass")
+        self.assertFalse(any("master" in item for call in bridge.calls for item in call))
+
+        base = _snapshot_with_song()
+        pad_clip = Clip(0, "Pad Clip", "live_set tracks 0 clip_slots 0 clip", {"looping": True})
+        bass_clip = Clip(0, "Bass Clip", "live_set tracks 1 clip_slots 0 clip", {"looping": True})
+        clip_snapshot = replace(base, tracks=(replace(base.tracks[0], clips=(pad_clip,)), replace(base.tracks[1], clips=(bass_clip,)), base.tracks[2]))
+        clip_pick = self._stated(response("clip_loop_off", "t0", track_conf=0.96), 0.10)
+        clip_pick["answers"]["clip_t0"] = choice("c0", 0.96)
+        bridge, service = self._service(lambda *_: clip_pick, snapshot=clip_snapshot)
+        answer = service.process({"id": "clip", "text": "クリップのループを解除して"})
+        self.assertEqual(answer["decision"]["track"], "Bass")
+        self.assertTrue(any("live_set tracks 1 clip_slots 0 clip" in call for call in bridge.calls))
+
+        guessed = self._stated(response("mute", "t0", track_conf=0.96), 0.10)
+        bridge, service = self._service(lambda *_: guessed)
+        bridge.selection_fails = True
+        answer = service.process({"id": "failed", "text": "ミュートして"})
+        self.assertIn(answer["kind"], {"ask", "error"})
+        self.assertFalse(any("--write" in call for call in bridge.calls))
+
+    def test_round_five_hiragana_and_bare_number_are_name_like(self) -> None:
+        from intent import lower_setting_only_track_stated
+        self.assertEqual(lower_setting_only_track_stated("べるを下げて", 0.90), 0.90)
+        bridge, service = self._service(lambda *_: (_ for _ in ()).throw(AssertionError("Jev")))
+        answer = service.process({"id": "909", "text": "mute 909"})
+        self.assertEqual(answer["kind"], "error")
+        self.assertFalse(any("--write" in call for call in bridge.calls))
+
+    def test_round_five_stale_answer_id_never_becomes_a_plugin_request(self) -> None:
+        from unittest import mock
+        import daemon as D
+        from tests.support import response
+        answers = self._stated(response("mute", "none", track_conf=0.2), 0.40)
+        bridge, service = self._service(lambda *_: answers)
+        asked = service.process({"id": "ask-id", "text": "ベルをミュート"})
+        self.assertEqual(asked["kind"], "ask")
+        service.pending = None
+        with mock.patch.object(service, "_plugin_names", return_value=("iZOzone12BassControl",)), \
+             mock.patch.object(D.plugin_script, "load") as load:
+            expired = service.process({"id": "answer", "text": "Bass", "answering": "ask-id"})
+        self.assertEqual(expired["line"], service._m("info.expired"))
+        load.assert_not_called()
+
+    def test_value_phrases_are_never_a_rename(self) -> None:
+        snapshot = _snapshot_with_song()
+        for text in ("Bassをソロにして", "Bassをミュートにして", "Bassを-6dBにして", "Bassを右にして", "Bassをオフにして", "Bassを100%にして", "BassをLow Endにして"):
+            parsed = parse_local(text, snapshot)
+            self.assertFalse(parsed is not None and parsed.action is Action.RENAME, text)
+        for text in ("Bassの名前をLow Endにして", "BassをLow Endに改名", "BassをLow Endにリネームして", "BassをLow Endという名前にして"):
+            parsed = parse_local(text, snapshot)
+            self.assertIs(parsed.action, Action.RENAME, text)
+            self.assertEqual((parsed.track, parsed.text), (1, "Low End"), text)
+
+    def test_english_rename_keeps_case(self) -> None:
+        for text in ("rename Bass to Low End", "call Bass Low End", "Rename Bass to \"Low End\".", "rename Bass to Low End please"):
+            parsed = parse_local(text, _snapshot_with_song())
+            self.assertEqual((parsed.action, parsed.track, parsed.text), (Action.RENAME, 1, "Low End"), text)
+
+    def test_note_transform_explicit_target_never_falls_back(self) -> None:
+        from intent import parse_clip_notes_phrase
+        for text in ("quantize Ghost clip 1", "quantize track 99 clip 1", "Ghostのクリップ1をクオンタイズ", "Ghostのクリップをクオンタイズ", "Ghostをクオンタイズ", "Ghost quantize", "double the loop on Ghost"):
+            request = parse_clip_notes_phrase(text, _snapshot_with_song())
+            self.assertTrue(request.target_missing, text)
+        bass = parse_clip_notes_phrase("quantize Bass", _snapshot_with_song())
+        self.assertEqual((bass.track, bass.slot, bass.target_missing), (1, None, False))
+
+    def test_unresolved_clip_note_target_never_calls_the_script(self) -> None:
+        from unittest import mock
+        import daemon as D
+        service = LiveJevService(
+            bridge=RecordingBridge(), snapshot=_snapshot_with_song(), key="x",
+            requester=lambda *_: (_ for _ in ()).throw(AssertionError("Jev")),
+        )
+        with mock.patch.object(D.plugin_script, "ping", return_value=True), \
+             mock.patch.object(D.plugin_script, "clip_notes") as clip_notes:
+            for index, text in enumerate(("Ghostのクリップをクオンタイズ", "Ghostをクオンタイズ", "Ghost quantize", "double the loop on Ghost")):
+                answer = service.process({"id": str(index), "text": text})
+                self.assertEqual(answer["kind"], "error", text)
+            clip_notes.assert_not_called()
+
+    def test_named_audio_track_keeps_kind_and_case(self) -> None:
+        en = parse_local("create an audio track named FX with Utility", _snapshot_with_song())
+        ja = parse_local("FXという名前のオーディオトラックを作って", _snapshot_with_song())
+        self.assertEqual((en.text, en.track_kind), ("FX", "audio"))
+        self.assertEqual((ja.text, ja.action), ("FX", Action.ADD_AUDIO_TRACK))
+        self.assertEqual(ACTIONS[en.action].apply(_snapshot_with_song(), en)[0][:5], ["--write", "--add-audio-tracks", "1", "--audio-prefix", "FX"])
+
+    def test_mixed_case_ja_toggle_never_raises(self) -> None:
+        intent = parse_local("BassをMUTEして", _snapshot_with_song())
+        self.assertIs(intent.action, Action.MUTE)
+
+    def test_round_six_missing_plugin_track_never_uses_selection(self) -> None:
+        from unittest import mock
+        import daemon as D
+
+        for index, text in enumerate(("Ghostに Diva を入れて", "GhostにDivaを挿して", "insert Diva on Ghost", "put Diva on the Ghost track", "load Serum 2 onto Ghost")):
+            bridge, service = self._service(lambda *_: (_ for _ in ()).throw(AssertionError("Jev")))
+            with mock.patch.object(service, "_plugin_names", return_value=("Diva", "Serum 2")), \
+                 mock.patch.object(D.plugin_script, "load") as load:
+                answer = service.process({"id": str(index), "text": text})
+            self.assertEqual(answer["kind"], "error", text)
+            load.assert_not_called()
+            self.assertFalse(any("--write" in call for call in bridge.calls), text)
+
+    def test_round_six_plugin_target_and_selection_are_preserved(self) -> None:
+        from unittest import mock
+        import daemon as D
+        from snapshot import Device
+
+        cases = (("Divaを入れて", 1), ("insert Diva", 1), ("BassにDivaを入れて", 1), ("insert Diva on Bass", 1))
+        for index, (text, expected_track) in enumerate(cases):
+            base = _snapshot_with_song()
+            loaded = replace(base, tracks=tuple(
+                replace(track, devices=(Device(0, "Diva", (), f"live_set tracks {expected_track} devices 0"),))
+                if track.index == expected_track else track for track in base.tracks
+            ))
+            bridge, service = self._service(lambda *_: (_ for _ in ()).throw(AssertionError("Jev")), snapshot=base)
+            service.reader = type("R", (), {"read": staticmethod(lambda snapshot=loaded: (snapshot, 1))})()
+            with mock.patch.object(service, "_plugin_names", return_value=("Diva",)), \
+                 mock.patch.object(D.plugin_script, "load", return_value={"track_index": expected_track, "devices_after": ["Diva"]}) as load:
+                answer = service.process({"id": str(index), "text": text})
+            self.assertEqual(answer["kind"], "result", text)
+            load.assert_called_once_with("Diva", expected_track, "")
+
+        base = _snapshot_with_song()
+        whole_name = "Diva on Ghost"
+        loaded = replace(base, tracks=tuple(
+            replace(track, devices=(Device(0, whole_name, (), "live_set tracks 1 devices 0"),))
+            if track.index == 1 else track for track in base.tracks
+        ))
+        _bridge, service = self._service(lambda *_: (_ for _ in ()).throw(AssertionError("Jev")), snapshot=base)
+        service.reader = type("R", (), {"read": staticmethod(lambda: (loaded, 1))})()
+        with mock.patch.object(service, "_plugin_names", return_value=(whole_name,)), \
+             mock.patch.object(D.plugin_script, "load", return_value={"track_index": 1, "devices_after": [whole_name]}) as load:
+            answer = service.process({"id": "whole-name", "text": "insert Diva on Ghost"})
+        self.assertEqual(answer["kind"], "result")
+        load.assert_called_once_with(whole_name, 1, "")
+
+    def test_round_six_literal_track_conflict_refuses_wrong_jev_pick(self) -> None:
+        from tests.support import response
+
+        answers = self._stated(response("mute", "t0", track_conf=0.96), 0.95)
+        bridge, service = self._service(lambda *_: answers)
+        refused = service.process({"id": "conflict", "text": "silence Bass"})
+        self.assertEqual(refused["kind"], "error")
+        self.assertFalse(any("--write" in call or "--api-set" in call for call in bridge.calls))
+
+        for index, text in enumerate(("mute Padding", "mute SubBass", "SubBassをミュート")):
+            bridge, service = self._service(lambda *_: answers)
+            substring = service.process({"id": f"substring-{index}", "text": text})
+            self.assertEqual(substring["kind"], "error", text)
+            self.assertFalse(any("--write" in call or "--api-set" in call for call in bridge.calls), text)
+
+    def test_round_six_clip_note_targets_require_exact_names(self) -> None:
+        from unittest import mock
+        import daemon as D
+
+        bridge, service = self._service(lambda *_: (_ for _ in ()).throw(AssertionError("Jev")))
+        with mock.patch.object(D.plugin_script, "ping", return_value=True), \
+             mock.patch.object(D.plugin_script, "clip_notes") as clip_notes:
+            for index, text in enumerate(("SubBassのクリップ1をクオンタイズ", "quantize SubBass clip 1", "quantize clip 1 on Bassline")):
+                answer = service.process({"id": str(index), "text": text})
+                self.assertEqual(answer["kind"], "error", text)
+            clip_notes.assert_not_called()
+
+    def test_round_six_english_selection_rename_keeps_case(self) -> None:
+        for index, text in enumerate(("rename this track to Lead", "rename it to Lead", "call this Lead")):
+            bridge, service = self._service(lambda *_: (_ for _ in ()).throw(AssertionError("Jev")))
+            answer = service.process({"id": str(index), "text": text})
+            self.assertEqual(answer["kind"], "result", text)
+            rename = next(call for call in bridge.calls if "--rename-track-index" in call)
+            self.assertEqual((rename[rename.index("--rename-track-index") + 1], rename[rename.index("--rename-track-name") + 1]), ("1", "Lead"))
+
+    def test_round_six_master_aliases_and_followups_keep_master(self) -> None:
+        from unittest import mock
+
+        for index, text in enumerate(("lower the master", "lower the whole mix by 3 dB", "turn the master down a bit", "master volume down 2 dB")):
+            _bridge, service = self._service(lambda *_: (_ for _ in ()).throw(AssertionError("Jev")))
+            with mock.patch.object(service, "_set_volume_db", return_value=(service.snapshot, 1, False)):
+                answer = service.process({"id": str(index), "text": text})
+            self.assertEqual((answer["kind"], answer["decision"]["track"]), ("result", "マスター"), text)
+
+        _bridge, service = self._service(lambda *_: (_ for _ in ()).throw(AssertionError("Jev")))
+        with mock.patch.object(service, "_set_volume_db", return_value=(service.snapshot, 1, False)):
+            self.assertEqual(service.process({"id": "master", "text": "マスターを下げて"})["kind"], "result")
+            for index, text in enumerate(("もう少し", "do it again", "元に戻して")):
+                answer = service.process({"id": f"follow-{index}", "text": text})
+                self.assertEqual((answer["kind"], answer["decision"]["track"]), ("result", "マスター"), text)
+
+    def test_round_six_named_track_threshold_accepts_measured_valid_pick(self) -> None:
+        from tests.support import response
+
+        answers = self._stated(response("volume", "t2", "up_small", track_conf=0.79), 0.80)
+        _bridge, service = self._service(lambda *_: answers)
+        answer = service.process({"id": "threshold", "text": "キック上げて"})
+        self.assertEqual((answer["kind"], answer["decision"]["track"]), ("result", "Drums"))
 
 
 class NewTrackOpenPhraseTests(unittest.TestCase):
@@ -841,6 +1371,104 @@ class StaleSnapshotTests(unittest.TestCase):
         self.assertEqual(answer["kind"], "result", answer)
         self.assertEqual(answer["decision"]["track"], "Vox")
         self.assertEqual(len(service.snapshot.tracks), 4)
+
+    def test_device_reorder_is_stale(self) -> None:
+        import time as _time
+        from snapshot import Device
+        base = _snapshot_with_song()
+        devices = (base.tracks[0].devices[0], Device(1, "Utility", (), "live_set tracks 0 devices 1"))
+        snapshot = replace(base, tracks=(replace(base.tracks[0], devices=devices),) + base.tracks[1:], taken_at=_time.time() - 60)
+
+        class ReorderedBridge(RecordingBridge):
+            def run(self, arguments):
+                if "--api-device-list" in arguments:
+                    tracks = [{"track": {"name": track.name}, "devices": [{"name": device.name} for device in reversed(track.devices)]} for track in snapshot.tracks]
+                    return BridgeResult((Ack("api_device_list", arguments[-1], {"tracks": tracks}),), 1, 0, False)
+                return super().run(arguments)
+
+        service = LiveJevService(bridge=ReorderedBridge(), snapshot=snapshot, key="x")
+        self.assertTrue(service._snapshot_is_stale())
+
+    def test_structure_refresh_clears_previous_and_undo_marker(self) -> None:
+        base = _snapshot_with_song()
+        changed = replace(base, tracks=(replace(base.tracks[0], name="Renamed"),) + base.tracks[1:])
+        service = LiveJevService(bridge=RecordingBridge(), snapshot=base, key="x")
+        service.previous = object()
+        service._undo_target_tracks = (3, 4)
+        service.reader = type("R", (), {"read": staticmethod(lambda: (changed, 1))})()
+        service.refresh()
+        self.assertIsNone(service.previous)
+        self.assertIsNone(service._undo_target_tracks)
+
+
+class ConnectionAndCacheRegressionTests(unittest.TestCase):
+    def test_exact_native_device_precedes_generic_notice(self) -> None:
+        import daemon as D
+        bridge = RecordingBridge()
+        service = LiveJevService(bridge=bridge, snapshot=_snapshot_with_song(), key="x", requester=lambda *_: (_ for _ in ()).throw(AssertionError("Jev")))
+        with unittest.mock.patch.object(D, "REQUIRE_CONFIRM", True):
+            exact = service.process({"id": "eq8", "text": "EQ Eight入りのトラック作って"})
+        self.assertEqual(exact["kind"], "confirm")
+        generic = service.process({"id": "eq", "text": "EQ入りのトラック作って"})
+        self.assertEqual(generic["kind"], "info")
+
+    def test_native_device_clarification_resolves_operator(self) -> None:
+        import daemon as D
+        from daemon import Pending
+        from intent import IntentResult, _local_intent
+        intent = _local_intent(Action.ADD_TRACK_WITH_DEVICE)
+        service = LiveJevService(bridge=RecordingBridge(), snapshot=_snapshot_with_song(), key="x")
+        service.pending = Pending(IntentResult(intent, (), (), ()), "native_device")
+        with unittest.mock.patch.object(D, "REQUIRE_CONFIRM", True):
+            answer = service.process({"id": "native", "text": "Operator"})
+        self.assertEqual(answer["kind"], "confirm")
+        self.assertEqual(service.pending_confirm[0].native_device, "Operator")
+
+    def test_disconnected_status_and_command_reprobe(self) -> None:
+        base = _snapshot_with_song()
+        service = LiveJevService(bridge=SelectedTrackTests.SelectedBridge(), snapshot=None, key="x", requester=lambda *_: (_ for _ in ()).throw(AssertionError("Jev")))
+        service.reader = type("R", (), {"read": staticmethod(lambda: (base, 1))})()
+        status = service.process({"id": "s", "cmd": "status"})
+        self.assertTrue(status["live"])
+        answer = service.process({"id": "m", "text": "mute Bass"})
+        self.assertEqual(answer["kind"], "result")
+
+    def test_failed_script_ping_is_not_cached(self) -> None:
+        import daemon as D
+        service = LiveJevService(bridge=RecordingBridge(), snapshot=_snapshot_with_song(), key="x")
+        with unittest.mock.patch.object(D.plugin_script, "ping", side_effect=[False, True]):
+            self.assertFalse(service._script_available())
+            self.assertTrue(service._script_available())
+
+    def test_relative_change_refreshes_before_calculation(self) -> None:
+        base = _snapshot_with_song()
+        fresh = replace(base, tracks=(replace(base.tracks[0], volume_display="-20.0 dB"),) + base.tracks[1:])
+        bridge, service = SelectedTrackTests()._service(lambda *_: (_ for _ in ()).throw(AssertionError("Jev")), snapshot=base)
+        seen = []
+        service._refresh_target = lambda intent: (fresh, 1)
+        service._set_volume_db = lambda intent: (seen.append(service.snapshot.tracks[0].volume_display) or service.snapshot, 1, False)
+        answer = service.process({"id": "relative", "text": "lower Pad by 3 dB"})
+        self.assertEqual(answer["kind"], "result")
+        self.assertEqual(seen, ["-20.0 dB"])
+
+    def test_swift_wire_and_hidden_request_regressions_are_encoded(self) -> None:
+        root = __import__("pathlib").Path(__file__).parents[1]
+        messages = (root / "LiveJev/Sources/LiveJev/Messages.swift").read_text()
+        view_model = (root / "LiveJev/Sources/LiveJev/ViewModel.swift").read_text()
+        panel = (root / "LiveJev/Sources/LiveJev/Panel.swift").read_text()
+        self.assertIn("case status, result, ask, confirm, info, error, unknown", messages)
+        self.assertIn("case .unknown:", messages)
+        self.assertIn("let requestID: String?", view_model)
+        self.assertIn("canUndoLastSuccess", view_model)
+        self.assertIn("outstandingHiddenRequestIDs", panel)
+        self.assertNotIn("awaitingHiddenResult", panel)
+
+    def test_publish_sync_excludes_git(self) -> None:
+        root = __import__("pathlib").Path(__file__).parents[1]
+        path = root / "scripts/publish_sync.sh"
+        if not path.exists():
+            self.skipTest("the publishing script is not part of the public copy")
+        self.assertIn('".git" "__pycache__"', path.read_text())
 
     def test_unchanged_structure_is_not_reread(self) -> None:
         import time as _time
@@ -1091,3 +1719,177 @@ class PluginFormatPreferenceTests(unittest.TestCase):
             answer = service.process({"id": "1", "text": "新規トラックでomnisphere開いて"})
         self.assertEqual(answer["kind"], "result", answer)
         self.assertEqual(calls, [("add", "midi", None, None), ("load", "Omnisphere", 3, "query:Plugins#VST3:Spectrasonics:Omnisphere")])
+
+
+class RoundThreeRegressionTests(unittest.TestCase):
+    def test_relative_db_fetches_missing_display_before_write_and_read_failure_is_plain_error(self) -> None:
+        import json
+
+        class Bridge:
+            def __init__(self, fail_display=False):
+                self.calls = []
+                self.value = 52 / 60
+                self.fail_display = fail_display
+
+            def run(self, arguments):
+                arguments = list(arguments)
+                self.calls.append(arguments)
+                if "--api-get" in arguments:
+                    at = arguments.index("--api-get")
+                    return BridgeResult((Ack("api_get", arguments[at + 3], "Pad", arguments[at + 1], "name"),), 1, 0, False)
+                if "--api-parameter-set" in arguments:
+                    self.value = float(arguments[arguments.index("--api-parameter-set") + 2])
+                    return BridgeResult((), 1, 0, False)
+                if "--api-call" in arguments:
+                    if self.fail_display:
+                        return BridgeResult((), 1, 0, False)
+                    at = arguments.index("--api-call")
+                    value = json.loads(arguments[at + 3])[0]
+                    return BridgeResult((Ack("api_call", arguments[at + 4], f"{-60 + value * 60:.1f} dB", arguments[at + 1], "str_for_value"),), 1, 0, False)
+                at = arguments.index("--api-mixer-status")
+                payload = {"parameters": {"volume": {"path": "live_set tracks 0 mixer_device volume", "value": self.value}}}
+                return BridgeResult((Ack("api_mixer_status", arguments[at + 2], payload),), 1, 0, False)
+
+        bridge = Bridge()
+        service = LiveJevService(bridge=bridge, snapshot=_snapshot_with_song(), key="x", requester=lambda *_: (_ for _ in ()).throw(AssertionError("Jev")))
+        self.assertEqual(service.process({"id": "db", "text": "lower Pad by 3 dB"})["kind"], "result")
+        first_write = next(index for index, call in enumerate(bridge.calls) if "--api-parameter-set" in call)
+        self.assertTrue(any("--api-call" in call for call in bridge.calls[:first_write]))
+        from intent import Step
+        self.assertIs(service.previous.step, Step.DOWN_SMALL, "a dB move must remember its direction so that 'a bit more' can repeat it")
+
+        failed = Bridge(fail_display=True)
+        service = LiveJevService(bridge=failed, snapshot=_snapshot_with_song(), key="x", requester=lambda *_: (_ for _ in ()).throw(AssertionError("Jev")))
+        answer = service.process({"id": "db", "text": "lower Pad by 3 dB"})
+        self.assertEqual(answer["kind"], "error")
+        self.assertIn("現在値", answer["line"])
+        self.assertFalse(any("--api-parameter-set" in call for call in failed.calls))
+
+    def test_relative_parameter_rebinds_to_live_value_by_path_and_name(self) -> None:
+        from intent import _local_intent
+        snapshot = _snapshot_with_song()
+        stale = snapshot.tracks[0].devices[0].params[0]
+        fresh = replace(stale, value=0.80)
+        fresh_device = replace(snapshot.tracks[0].devices[0], params=(fresh,))
+        live = replace(snapshot, tracks=(replace(snapshot.tracks[0], devices=(fresh_device,)),) + snapshot.tracks[1:])
+        service = LiveJevService(bridge=RecordingBridge(), snapshot=snapshot, key="x")
+        rebound = service._rebind_refreshed_intent(live, replace(_local_intent(Action.PARAM, track=0, step=Step.UP_SMALL), param=stale))
+        self.assertEqual(rebound.param.value, 0.80)
+        missing = replace(live, tracks=(replace(live.tracks[0], devices=()),) + live.tracks[1:])
+        with self.assertRaisesRegex(ValueError, "現在値"):
+            service._rebind_refreshed_intent(missing, replace(_local_intent(Action.PARAM, track=0, step=Step.UP_SMALL), param=stale))
+
+    def test_device_layout_refresh_invalidates_repeat_and_pending_targets(self) -> None:
+        from snapshot import Device
+        snapshot = _snapshot_with_song()
+        changed = replace(snapshot, tracks=(replace(snapshot.tracks[0], devices=(Device(0, "Utility", (), "live_set tracks 0 devices 0"),)),) + snapshot.tracks[1:])
+        service = LiveJevService(bridge=RecordingBridge(), snapshot=snapshot, key="x")
+        service.previous = object()
+        service.pending_confirm = (object(), 0, 0, "x", None, "A")
+        service.pending_confirm_created = service._clock()
+        service.reader = type("Reader", (), {"read": staticmethod(lambda: (changed, 1))})()
+        service.refresh()
+        self.assertIsNone(service.previous)
+        self.assertIsNone(service.pending_confirm)
+
+    def test_english_target_gate_rejects_unknown_names_and_accepts_selection_references(self) -> None:
+        snapshot = _snapshot_with_song()
+        for text in ("turn Reverb off on Ghost", "Ghost mute", "lower Ghost by 3 dB", "mute Ghost", "mute track 99"):
+            intent = parse_local(text, snapshot)
+            self.assertIsNone(intent.track, text)
+            self.assertGreaterEqual(intent.track_stated, 0.8, text)
+        for text in ("mute", "mute it", "solo this", "mute this track", "lower it by 3 dB", "pan left", "set send A to 100%", "arm for recording", "mute the track", "mute it now", "can you mute this", "please mute"):
+            intent = parse_local(text, snapshot)
+            self.assertIsNotNone(intent, text)
+            self.assertFalse(intent.track is None and intent.track_stated >= 0.8, text)
+        for text in ("mute Bass Synth", "pan it right on Ghost"):
+            intent = parse_local(text, snapshot)
+            self.assertIsNone(intent.track, text)
+            self.assertGreaterEqual(intent.track_stated, 0.8, text)
+        from intent import extract_plugin_request
+        self.assertIsNone(extract_plugin_request("mute the track", snapshot))
+
+    def test_relative_pan_modifier_is_a_step_not_absolute_position(self) -> None:
+        relative = parse_local("pan it slightly to the right", _snapshot_with_song())
+        self.assertEqual((relative.action, relative.step, relative.number), (Action.PAN, Step.UP_SMALL, None))
+        for text, value in (("pan hard right", 50.0), ("pan right 50%", 50.0), ("pan center", 0.0)):
+            intent = parse_local(text, _snapshot_with_song())
+            self.assertEqual((intent.step, intent.number.value), (Step.SET, value), text)
+
+    def test_named_missing_owner_candidates_do_not_supply_a_track(self) -> None:
+        from intent import interpret_response
+        from tests.support import choice, response
+        snapshot = _snapshot_with_song()
+        device = response("device_off", "none", track_conf=0.67)
+        device["answers"]["track_stated"] = choice("named", 0.77, named=0.77, absent=0.23)
+        device["answers"]["device_t0"] = choice("d0", 0.95)
+        parsed = interpret_response(snapshot, "Ghostのリバーブをオフにして", device).intent
+        self.assertIsNone(parsed.track)
+
+        parameter = response("param", "none", "set", track_conf=0.67, param="d0p0", param_conf=0.95)
+        parameter["answers"]["track_stated"] = choice("named", 0.77, named=0.77, absent=0.23)
+        parsed = interpret_response(snapshot, "GhostのリバーブのDry/Wetを50%にして", parameter).intent
+        self.assertIsNone(parsed.track)
+
+    def test_setting_only_utterances_can_only_lower_track_stated(self) -> None:
+        from intent import interpret_response, lower_setting_only_track_stated
+        from tests.support import response
+        for text in ("パンを真ん中に", "センドBを少し上げて", "音量を-6dBにして", "ミュートして", "set send A to 100%"):
+            self.assertEqual(lower_setting_only_track_stated(text, 0.83), 0.0, text)
+        for text in ("Ghostをミュート", "ボーカルのパンを真ん中に", "mute the vocals"):
+            self.assertEqual(lower_setting_only_track_stated(text, 0.83), 0.83, text)
+        self.assertEqual(lower_setting_only_track_stated("パンを真ん中に", 0.0), 0.0)
+        outlier = response("pan", "t0", "set", track_conf=0.9)
+        outlier["answers"]["track_stated"] = {"type": "noul", "noul": 0.83}
+        self.assertEqual(interpret_response(_snapshot_with_song(), "パンを真ん中に", outlier).intent.track_stated, 0.0)
+
+    def test_named_track_thresholds_use_shared_constants(self) -> None:
+        from pathlib import Path
+        root = Path(__file__).parents[1]
+        daemon = (root / "daemon.py").read_text()
+        english = (root / "intent_en.py").read_text()
+        self.assertNotRegex(daemon, r"track_stated\s*(?:>=|<)\s*(?:0\.8|0\.5)")
+        self.assertNotRegex(english, r"track_stated\s*(?:>=|<)\s*(?:0\.8|0\.5)")
+        self.assertIn("intent.track_conf < NAMED_TRACK_CONF_MIN", daemon)
+
+    def test_clip_note_factory_keeps_missing_target_and_modifiers_are_not_targets(self) -> None:
+        from intent import parse_clip_notes_phrase
+        snapshot = _snapshot_with_song()
+        for text in ("transpose Ghost clip 1 up an octave", "increase velocity on Ghost clip 1", "Ghostのクリップ1のノートを1オクターブ上げて", "Ghostのクリップ1のベロシティを80にして"):
+            request = parse_clip_notes_phrase(text, snapshot)
+            self.assertTrue(request.target_stated, text)
+            self.assertTrue(request.target_missing, text)
+        for text in ("quantize to 1/8", "quantize lightly", "quantize the notes", "quantize the clip", "quantize this", "quantize to 1/16 50%", "1/8でクオンタイズ", "軽くクオンタイズ", "ノートをクオンタイズ"):
+            self.assertFalse(parse_clip_notes_phrase(text, snapshot).target_missing, text)
+
+    def test_confirmation_id_must_match_and_targeted_cancel_preserves_proposal(self) -> None:
+        import daemon as D
+        service = LiveJevService(bridge=RecordingBridge(), snapshot=_snapshot_with_song(), key="x", requester=lambda *_: (_ for _ in ()).throw(AssertionError("Jev")))
+        with unittest.mock.patch.object(D, "REQUIRE_CONFIRM", True):
+            self.assertEqual(service.process({"id": "A", "text": "record"})["kind"], "confirm")
+            service.process({"id": "cancel", "cmd": "cancel_pending", "target": "old"})
+            self.assertIsNotNone(service.pending_confirm)
+            self.assertEqual(service.process({"id": "old", "confirm": True})["kind"], "info")
+            self.assertIsNotNone(service.pending_confirm)
+
+    def test_operation_words_are_valid_rename_destinations(self) -> None:
+        service = LiveJevService(bridge=RecordingBridge(), snapshot=_snapshot_with_song(), key="x")
+        for text in ("rename Bass to Play", "rename Bass to Stop", "Bassの名前をミュートにして", 'rename Bass to "Stop"'):
+            self.assertFalse(service._has_compound_local_operations(text), text)
+
+    def test_swift_proposal_and_undo_regressions_are_encoded(self) -> None:
+        from pathlib import Path
+        root = Path(__file__).parents[1] / "LiveJev/Sources/LiveJev"
+        view_model = (root / "ViewModel.swift").read_text()
+        panel = (root / "Panel.swift").read_text()
+        messages = (root / "Messages.swift").read_text()
+        self.assertIn("systemUptime", view_model)
+        self.assertNotIn("case let .info(message):\n            canUndoLastSuccess = false", view_model)
+        self.assertIn("outstandingHiddenRequestIDs.remove(requestID)", panel)
+        self.assertIn("systemUptime - proposal.createdAt", panel)
+        self.assertIn("case cancelPending(id: String, target: String? = nil)", messages)
+        self.assertIn("guard pendingUndoID == nil, canUndoLastSuccess else { return }", view_model)
+        self.assertIn("canUndoLastSuccess = false\n            onChange?()", view_model)
+        self.assertIn("private func finishPendingUndo", view_model)
+        self.assertIn("_ = finishPendingUndo(id: message.id)", view_model)
+        self.assertIn("undoButton.isEnabled = viewModel.canUndoLastSuccess", panel)

@@ -9,7 +9,7 @@ import json
 from daemon import LiveJevService
 
 
-VERSION = "0.08"
+VERSION = "0.11"
 
 
 def _print(response: dict[str, object]) -> None:

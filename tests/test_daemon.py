@@ -329,8 +329,7 @@ class DaemonDecisionTests(unittest.TestCase):
             service.process({"text": "Bass"})
         self.assertEqual(count, 1)
         first_real = next(call for call in bridge.calls if "--api-session-context" not in call)
-        self.assertIn("--api-get", first_real)
-        self.assertIn("name", first_real)
+        self.assertIn("--api-mixer-status", first_real)
 
     def test_invalid_input_is_an_error(self) -> None:
         service = LiveJevService(bridge=NoWriteBridge(), snapshot=sample_snapshot(), key="x")
@@ -662,6 +661,33 @@ class JsonLineTests(unittest.TestCase):
         self.assertEqual(len(lines), 3)
         self.assertEqual(json.loads(lines[1])["line"], "再生")
         self.assertTrue(json.loads(lines[2])["quit"])
+
+    def test_stdio_process_exception_replies_and_continues(self) -> None:
+        class FailingService:
+            lang = "en"
+            pending = object()
+            pending_confirm = object()
+            pending_confirm_created = 1.0
+
+            def start(self):
+                return {"kind": "status", "live": True}
+
+            def process(self, message):
+                if message.get("id") == "1":
+                    raise RuntimeError("boom")
+                return {"id": message.get("id"), "kind": "result", "line": "ok"}
+
+        service = FailingService()
+        stdin = io.StringIO('{"id":"1","text":"x"}\n{"id":"2","text":"y"}\n')
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with mock.patch("sys.stdin", stdin), mock.patch("sys.stdout", stdout), mock.patch("sys.stderr", stderr):
+            self.assertEqual(run_stdio(service), 0)
+        replies = [json.loads(line) for line in stdout.getvalue().splitlines()]
+        self.assertEqual((replies[1]["id"], replies[1]["kind"]), ("1", "error"))
+        self.assertEqual(replies[2]["line"], "ok")
+        self.assertIn("RuntimeError: boom", stderr.getvalue())
+        self.assertIsNone(service.pending)
+        self.assertIsNone(service.pending_confirm)
 
     def test_stdio_eof_closes_service_and_stops_owned_child(self) -> None:
         class ChildOwningService:
