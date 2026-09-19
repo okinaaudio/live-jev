@@ -59,9 +59,14 @@ def read_key(variable: str = "TYPESAFE_API_KEY") -> str | None:
     key = os.environ.get(variable, "").strip()
     if key:
         return key
-    try:
-        lines = (Path.home() / ".zshrc").read_text(encoding="utf-8").splitlines()
-    except (OSError, UnicodeError):
+    # Finder から開いたアプリにはシェルの環境変数が渡らないので、シェルの設定ファイルの export 行も読む。
+    lines: list[str] = []
+    for name in (".zshenv", ".zprofile", ".zshrc", ".bash_profile", ".bashrc", ".profile"):
+        try:
+            lines.extend((Path.home() / name).read_text(encoding="utf-8").splitlines())
+        except (OSError, UnicodeError):
+            continue
+    if not lines:
         return None
     pattern = re.compile(rf"^\s*export\s+{re.escape(variable)}\s*=(.*)$")
     found_key = None

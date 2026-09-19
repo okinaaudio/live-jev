@@ -31,6 +31,9 @@ Press **⌘⇧Space** while working in Live, type (or dictate) something like �
 
 Live Jev needs **your own API key for TypeSafe’s Jev model** (sign in at <https://console.typesafe.ai/>, docs at <https://docs.typesafe.ai/>; pricing on their site was $42 per billion input tokens as of Sep 2026 — check the site for current pricing), plus a one-time install of a small **Remote Script** inside Live. There is no installer yet, so setup takes a few terminal commands.
 
+**くわしい手順と確かめ方は [INSTALL.md](INSTALL.md)。AI アシスタントに「このリポジトリの INSTALL.md のとおりに入れて」と頼んでも進められます。**
+**Step-by-step guide with checks: [INSTALL.md](INSTALL.md) — you can also hand it to an AI coding assistant.**
+
 ### 必要なもの / Requirements
 - Apple Silicon の Mac（M1 以降）・macOS 14 以上・Ableton Live 12（Suite でなくても可）
 - [Homebrew](https://brew.sh) と Xcode のコマンドラインツール（`xcode-select --install`）
@@ -55,6 +58,8 @@ echo 'export TYPESAFE_API_KEY="あなたのキー"' >> ~/.zshrc
 # 5. アプリを作る / build the app  →  ~/Applications/Live Jev.app
 bash scripts/build-app.sh
 ```
+**注意**: アプリは取得したフォルダの中の `daemon.py` を使います。作ったあとでフォルダを動かしたり消したりしないでください。
+
 6. **Live の設定**: Live を起動 → 設定（Preferences）→ **Link, Tempo & MIDI** → **コントロールサーフェス（Control Surface）** の空いている欄で **LiveJev** を選ぶ → Live を再起動
 7. `~/Applications/Live Jev.app` を開く（メニューバーに波形のアイコンが出ます。Dock には出ません）
 8. Live を手前にして **⌘⇧Space** → 「ミュート」や “mute” と打って Enter
