@@ -170,7 +170,7 @@ class ScriptBridgeClient:
         with self._lock:
             try:
                 response = self._request({"action": "ping"})
-            except BridgeError:
+            except (BridgeError, TimeoutError):
                 return False
         if self.verbose:
             elapsed = round((time.perf_counter() - started) * 1000)

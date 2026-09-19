@@ -67,30 +67,36 @@ enum AppText {
 }
 
 enum DaemonRequest: Encodable {
-    case text(id: String, text: String)
+    case text(id: String, text: String, answering: String?)
     case refresh(id: String)
     case status(id: String)
+    case cancelPending(id: String, target: String? = nil)
     case confirm(id: String, confirmed: Bool)
     case undo(id: String)
     case language(id: String, value: String)
     case quit
 
     private enum CodingKeys: String, CodingKey {
-        case id, text, cmd, confirm, value
+        case id, text, cmd, confirm, value, target, answering
     }
 
     func encode(to encoder: Encoder) throws {
         var container = encoder.container(keyedBy: CodingKeys.self)
         switch self {
-        case let .text(id, text):
+        case let .text(id, text, answering):
             try container.encode(id, forKey: .id)
             try container.encode(text, forKey: .text)
+            try container.encodeIfPresent(answering, forKey: .answering)
         case let .refresh(id):
             try container.encode(id, forKey: .id)
             try container.encode("refresh", forKey: .cmd)
         case let .status(id):
             try container.encode(id, forKey: .id)
             try container.encode("status", forKey: .cmd)
+        case let .cancelPending(id, target):
+            try container.encode(id, forKey: .id)
+            try container.encode("cancel_pending", forKey: .cmd)
+            try container.encodeIfPresent(target, forKey: .target)
         case let .confirm(id, confirmed):
             try container.encode(id, forKey: .id)
             try container.encode(confirmed, forKey: .confirm)
@@ -179,7 +185,7 @@ enum DaemonMessage: Decodable, Sendable {
     }
 
     private enum Kind: String, Decodable {
-        case status, result, ask, confirm, info, error
+        case status, result, ask, confirm, info, error, unknown
     }
 
     init(from decoder: Decoder) throws {
@@ -196,6 +202,8 @@ enum DaemonMessage: Decodable, Sendable {
         case .info:
             self = .info(try LineMessage(from: decoder))
         case .error:
+            self = .error(try LineMessage(from: decoder))
+        case .unknown:
             self = .error(try LineMessage(from: decoder))
         }
     }

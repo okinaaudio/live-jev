@@ -207,6 +207,10 @@ class CapsuleButton: NSButton {
     }
 }
 
+final class ProposalButton: CapsuleButton {
+    var requestID: String?
+}
+
 final class ConfirmationButton: CapsuleButton {
     let confirmationID: String
     let confirmed: Bool
@@ -242,7 +246,9 @@ final class PanelController: NSWindowController, NSTextFieldDelegate, NSWindowDe
     private var displayedItem: ResultItem?
     private var seenResults = Set<UUID>()
     private var autoHideTask: Task<Void, Never>?
-    private var awaitingHiddenResult = false
+    private var proposalExpiryTask: Task<Void, Never>?
+    private let proposalLifetime: TimeInterval = 20
+    private var outstandingHiddenRequestIDs = Set<String>()
     private var isHiding = false
 
     var isPanelVisible: Bool { window?.isVisible == true }
@@ -282,10 +288,16 @@ final class PanelController: NSWindowController, NSTextFieldDelegate, NSWindowDe
         window.orderFrontRegardless()
         window.makeKeyAndOrderFront(nil)
         window.makeFirstResponder(inputField)
-        if let pending = viewModel.results.first(where: { $0.confirmationID != nil }) {
-            displayedItem = pending
-        } else if let latest = viewModel.results.first, latest.kind == .ask {
-            displayedItem = latest
+        let latestAsk = viewModel.results.first.flatMap { $0.kind == .ask ? $0 : nil }
+        let proposal = viewModel.results.first(where: { $0.confirmationID != nil }) ?? latestAsk
+        if let proposal {
+            if ProcessInfo.processInfo.systemUptime - proposal.createdAt < proposalLifetime {
+                displayedItem = proposal
+                scheduleProposalExpiry(for: proposal)
+            } else {
+                displayedItem = nil
+                viewModel.expireProposal(proposal)
+            }
         }
         renderContent(animated: false)
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
@@ -302,6 +314,7 @@ final class PanelController: NSWindowController, NSTextFieldDelegate, NSWindowDe
         guard !isHiding else { return }
         isHiding = true
         cancelAutoHide()
+        cancelProposalExpiry()
         window?.orderOut(nil)
         inputField.stringValue = ""
         historyIndex = nil
@@ -332,6 +345,33 @@ final class PanelController: NSWindowController, NSTextFieldDelegate, NSWindowDe
     private func cancelAutoHide() {
         autoHideTask?.cancel()
         autoHideTask = nil
+    }
+
+    private func cancelProposalExpiry() {
+        proposalExpiryTask?.cancel()
+        proposalExpiryTask = nil
+    }
+
+    private func scheduleProposalExpiry(for item: ResultItem) {
+        cancelProposalExpiry()
+        let remaining = max(0, proposalLifetime - (ProcessInfo.processInfo.systemUptime - item.createdAt))
+        proposalExpiryTask = Task { [weak self] in
+            do { try await Task.sleep(for: .seconds(remaining)) }
+            catch { return }
+            guard let self,
+                  self.displayedItem?.id == item.id,
+                  self.viewModel.results.contains(where: { $0.id == item.id }) else { return }
+            self.displayedItem = nil
+            self.proposalExpiryTask = nil
+            let shouldHide = self.inputField.stringValue.isEmpty
+            self.viewModel.expireProposal(item)
+            if shouldHide {
+                self.hide()
+            } else {
+                self.renderContent(animated: true)
+                self.window?.makeFirstResponder(self.inputField)
+            }
+        }
     }
 
     func toggle() {
@@ -393,7 +433,7 @@ final class PanelController: NSWindowController, NSTextFieldDelegate, NSWindowDe
         panel.appearance = NSAppearance(named: .darkAqua)
         panel.handleUndo = { [weak self] in
             guard let self, self.inputField.stringValue.isEmpty,
-                  self.displayedItem?.kind == .result else { return false }
+                  self.viewModel.canUndoLastSuccess else { return false }
             self.undoLast()
             return true
         }
@@ -539,19 +579,22 @@ final class PanelController: NSWindowController, NSTextFieldDelegate, NSWindowDe
         waveform.toolTip = viewModel.statusLine
         let latest = viewModel.results.first
         let isNew = latest.map { !seenResults.contains($0.id) } ?? false
+        let matchesHiddenRequest = latest?.requestID.map { outstandingHiddenRequestIDs.contains($0) } == true
         seenResults = Set(viewModel.results.map(\.id))
+        if isNew, let requestID = latest?.requestID {
+            outstandingHiddenRequestIDs.remove(requestID)
+        }
         // Removal of a confirmation must not reveal an older result.
         if let displayedItem, displayedItem.kind == .confirm,
            !viewModel.results.contains(where: { $0.id == displayedItem.id }) {
             self.displayedItem = nil
+            cancelProposalExpiry()
         }
         let isAwaitingAnswer = displayedItem?.kind == .ask || displayedItem?.kind == .confirm
         let isIncomingQuestion = latest?.kind == .ask || latest?.kind == .confirm
-        if isNew, awaitingHiddenResult, latest?.kind == .result {
+        if isNew, matchesHiddenRequest, latest?.kind == .result {
             // Success needs no message; it would interrupt users who reopen the panel to enter the next command.
-            awaitingHiddenResult = false
-        } else if isNew, !isPanelVisible, awaitingHiddenResult, let latest {
-            awaitingHiddenResult = false
+        } else if isNew, !isPanelVisible, matchesHiddenRequest, let latest {
             if latest.kind != .result {
                 showAndFocus()
                 displayedItem = latest
@@ -581,6 +624,9 @@ final class PanelController: NSWindowController, NSTextFieldDelegate, NSWindowDe
                 }
             }
         }
+        if let displayedItem, displayedItem.kind == .ask || displayedItem.kind == .confirm {
+            scheduleProposalExpiry(for: displayedItem)
+        }
         renderContent(animated: isPanelVisible)
     }
 
@@ -598,7 +644,8 @@ final class PanelController: NSWindowController, NSTextFieldDelegate, NSWindowDe
             $0.removeFromSuperview()
         }
         if let displayedItem { addResultRow(makeResultRow(displayedItem, isLatest: true)) }
-        undoButton.isHidden = displayedItem?.kind != .result
+        undoButton.isHidden = !viewModel.canUndoLastSuccess
+        undoButton.isEnabled = viewModel.canUndoLastSuccess
         resultSurface.isHidden = displayedItem == nil
         resultsStack.layoutSubtreeIfNeeded()
         let height = resultsStack.fittingSize.height
@@ -774,7 +821,8 @@ final class PanelController: NSWindowController, NSTextFieldDelegate, NSWindowDe
         question.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
 
         let buttons = item.options.map { option in
-            let button = CapsuleButton(title: option, target: self, action: #selector(selectOption(_:)))
+            let button = ProposalButton(title: option, target: self, action: #selector(selectOption(_:)))
+            button.requestID = item.requestID
             styleSecondaryButton(button)
             button.toolTip = option
             return button
@@ -798,17 +846,22 @@ final class PanelController: NSWindowController, NSTextFieldDelegate, NSWindowDe
     }
 
     @objc private func undoLast() {
-        guard displayedItem?.kind == .result else { return }
+        guard viewModel.canUndoLastSuccess else { return }
         cancelAutoHide()
         viewModel.undoLast()
         window?.makeFirstResponder(inputField)
     }
 
-    @objc private func selectOption(_ sender: NSButton) {
+    @objc private func selectOption(_ sender: ProposalButton) {
         cancelAutoHide()
-        inputField.stringValue = sender.title
+        inputField.stringValue = ""
+        historyIndex = nil
+        displayedItem = nil
+        renderContent(animated: false)
+        let requestID = viewModel.submit(sender.title, answering: sender.requestID)
+        if let requestID { outstandingHiddenRequestIDs.insert(requestID) }
         window?.makeFirstResponder(inputField)
-        submitInput()
+        hide()
     }
 
     @objc private func answerConfirmation(_ sender: ConfirmationButton) {
@@ -827,10 +880,10 @@ final class PanelController: NSWindowController, NSTextFieldDelegate, NSWindowDe
         historyIndex = nil
         displayedItem = nil
         renderContent(animated: false)
-        viewModel.submit(text)
+        let requestID = viewModel.submit(text)
         // Return to Live as soon as the command is submitted. Do not show successful results.
         // Reopen only for clarification, confirmation, notices, or errors in render below.
-        awaitingHiddenResult = true
+        if let requestID { outstandingHiddenRequestIDs.insert(requestID) }
         hide()
     }
 

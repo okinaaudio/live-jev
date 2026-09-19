@@ -56,7 +56,7 @@ open ~/Applications/Live\ Jev.app
 A waveform icon appears in the menu bar. There is no Dock icon.
 
 ## 6. Use it
-Bring Live to the front and press **⌘⇧Space** → type “mute” → Enter. The bar disappears at once and Live stays in front. It only comes back when it needs to ask you something. To undo, summon the bar and press ⌘Z.
+Bring Live to the front and press **⌘⇧Space** → type “mute” → Enter. The bar disappears at once and Live stays in front. It only comes back when it needs to ask you something. To undo the last successful command, including a success with a hidden result row, summon the bar and press ⌘Z.
 
 Check from Terminal (mutes the selected track, then unmutes it):
 ```bash

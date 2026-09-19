@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 from functools import lru_cache
 import json
 from pathlib import Path
 import re
-from typing import Any, Literal, Mapping, Callable
+from typing import Iterable, Any, Literal, Mapping, Callable
 
 from bridge_client import NATIVE_DEVICES
 from snapshot import Param, Snapshot, is_bridge_track, Device, Track
@@ -78,6 +78,16 @@ class Step(Enum):
     NONE = "none"
 
 
+class TargetOrigin(Enum):
+    NONE = "none"
+    NAMED = "named"
+    SELECTED = "selected"
+    CLARIFIED = "clarified"
+    OWNER = "owner"
+    PREVIOUS = "previous"
+    MASTER = "master"
+
+
 @dataclass(frozen=True)
 class Number:
     value: float
@@ -111,6 +121,13 @@ class Intent:
     native_device: str | None = None
     native_device_conf: float = 0.0
     plugin: str | None = None
+    track_kind: Literal["audio", "midi"] | None = None
+    device_name: str | None = None
+    target_origin: TargetOrigin = TargetOrigin.NONE
+    named_evidence: float = 0.0
+    utterance: str = ""
+    clip_name: str | None = None
+    clip_path: str | None = None
 
 
 @dataclass(frozen=True)
@@ -305,6 +322,74 @@ def _param_label(snapshot: Snapshot, track_index: int, parameter: Param) -> str:
     return parameter.name
 
 
+# A yes/no score could not separate "Ghostをミュート" (a name that is not in the set) from "センドAを上げて" (no name):
+# measured ranges overlapped (0.16-0.77 vs 0.04-0.75). This three-way choice was measured at P(named) <= 0.23 for
+# utterances without a name and >= 0.67 for Japanese utterances naming a missing track.
+TRACK_STATED_QUESTION: dict[str, Any] = {
+    "type": "choice",
+    "instructions": _bi(
+        "一言の中に、操作を受けるトラック（楽器・パート）の名前が書かれているか。設定項目の名前は数えない",
+        "Does the utterance name the track, instrument, or part that receives the action? Names of settings do not count",
+    ),
+    "criteria": {
+        "named": _bi(
+            "操作を受ける楽器・パート・トラックの名前、または『マスター』『全体』が書かれている（例: ボーカルを〜、ピアノの〜、Ghostを〜、ドラム〜、mute the vocals）。歌・低音・弦・リズム・上もの のような一般的な呼び方でもこれ。一覧にない名前でもこれ",
+            "The receiving track, instrument, or part is named, or master / the whole mix is. Generic words for a part (the vocals, the low end, the strings, the rhythm) count too, even if the name is not in the track list",
+        ),
+        "reference": _bi(
+            "『これ』『この/選択中のトラック』『it』『this』など、名前ではない指し方",
+            "Refers to it without a name: this, it, the selected track",
+        ),
+        "absent": _bi(
+            "操作を受けるトラックの名前はない。センドA・センドB・Send A・リターン・パン・音量・リバーブ・ディレイ・モニター・クリップ番号・シーン番号・テンポ・プラグイン名・デバイス名は設定項目であってトラック名ではない。『名前をXにして』『rename it to X』のXは新しい名前であって対象ではない",
+            "No receiving track is named. Send A, send B, return, pan, volume, reverb, delay, monitor, clip or scene numbers, tempo, plug-in and device names are settings, not track names. In 'rename it to X', X is the new name, not the target",
+        ),
+    },
+}
+# At or above this, the utterance names a target, so the selected-track default must not apply.
+TRACK_STATED_MIN = 0.5
+# Valid vague names were measured at 0.79-0.83. Wrong picks stayed at or below 0.67.
+NAMED_TRACK_CONF_MIN = 0.75
+# Below this, no target is named and the selected track is used. Between the two, only a track Jev is sure about is used; otherwise ask.
+TRACK_UNSTATED_MAX = 0.25
+
+
+def _track_stated_score(answer: Any) -> float:
+    if isinstance(answer, Mapping) and answer.get("type") == "choice":
+        probabilities = answer.get("probabilities")
+        if isinstance(probabilities, Mapping) and isinstance(probabilities.get("named"), (int, float)):
+            return float(probabilities["named"])
+        name, confidence = _choice(answer)
+        return confidence if name == "named" else 0.0
+    return _score(answer, "noul")
+
+
+_SETTING_ONLY_WORDS = re.compile(
+    r"(?:pan|volume|mute|unmute|solo|unsolo|arm|disarm|monitor(?:ing)?|send\s*[a-z]|return|"
+    r"パン|音量|ボリューム|ミュート|ソロ|アーム|録音待機|モニター|センド\s*[a-zA-ZＡ-Ｚａ-ｚ]|リターン|"
+    r"名前|トラック|選択(?:中|した)?|center|centre|middle|left|right|up|down|more|less|"
+    r"真ん中|センター|中央|左|右|上げ|下げ|増や|減ら|少し|ちょっと|やや|かなり|"
+    r"set|turn|switch|enable|disable|please|can\s+you|could\s+you|would\s+you|to|at|by|the|it|this|that|"
+    r"して|して下さい|してください|お願い(?:します)?|dB|bpm|percent|パーセント)",
+    re.IGNORECASE,
+)
+
+
+def lower_setting_only_track_stated(utterance: str, score: float, track_names: Iterable[str] = ()) -> float:
+    """Lower a false named-target score when the utterance contains only setting grammar."""
+    # A track called "808" is a name, not a value; numbers are stripped below, so check names first.
+    folded = utterance.casefold()
+    if any(name and name.casefold() in folded for name in track_names):
+        return score
+    residual = _SETTING_ONLY_WORDS.sub(" ", utterance)
+    residual = re.sub(r"(?:[-+]\s*\d+(?:\.\d+)?|\d+(?:\.\d+)?\s*(?:%|％|dB|bpm|パーセント|半音|st\b)|(?:に|to|by|at|of)\s*\d+(?:\.\d+)?)", " ", residual, flags=re.IGNORECASE)
+    residual = re.sub(r"(?:を|に|は|が|の|へ|で|も|と|から|まで|って|て|して|した|する|ください|下さい|お願い(?:します)?)", " ", residual)
+    residual = re.sub(r"[\s\W_]+", " ", residual)
+    if not re.search(r"[A-Za-z0-9\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff]", residual):
+        return 0.0
+    return score
+
+
 def build_request(snapshot: Snapshot, utterance: str) -> dict[str, Any]:
     candidates_by_track = candidate_params(snapshot)
     aliases = load_aliases()
@@ -339,7 +424,7 @@ def build_request(snapshot: Snapshot, utterance: str) -> dict[str, Any]:
         "action": {"type": "choice", "instructions": _bi("この一言がLiveに求めている操作を1つ選ぶ。数値の指定があっても操作の種類だけを選ぶ", "Choose the one Ableton Live action requested. Choose only the action type even when a value is given"), "criteria": ACTION_CRITERIA},
         "track": {"type": "choice", "instructions": _bi("一言が指しているトラックを選ぶ", "Choose the track named by the utterance"), "criteria": track_criteria},
         "step": {"type": "choice", "instructions": _bi("変化の方向と大きさ", "Choose the direction and size of the change"), "criteria": STEP_CRITERIA},
-        "track_stated": {"type": "noul", "instructions": _bi("一言の中でトラック名や『マスター』『全体』が明示されているか", "Whether a track name, master, or the whole mix is explicitly stated")},
+        "track_stated": TRACK_STATED_QUESTION,
         "needs_generation": {"type": "noul", "instructions": _bi("新しいノート・クリップ・フレーズの作成、曲の雰囲気やジャンルの変更など、あらかじめ用意した選択肢では表せない自由な作業を求めているか", "Whether the request needs free-form generation not covered by the choices")},
         "compound": {"type": "noul", "instructions": _bi("一言に2つ以上の別々の操作が含まれているか", "Whether the utterance contains two or more separate actions")},
         "refers_previous": {"type": "noul", "instructions": _bi("直前の操作の続きや取り消し（もう少し・もっと・戻して）を指しているか", "Whether it refers to continuing or undoing the previous action")},
@@ -491,7 +576,7 @@ def parse_number(utterance: str, action: Action) -> Number | None:
 def _local_intent(
     action: Action,
     *,
-    track: int | None = None,
+    track: int | None | Literal["master", "selected"] = None,
     step: Step = Step.NONE,
     number: Number | None = None,
     refers_previous: float = 0.0,
@@ -501,13 +586,20 @@ def _local_intent(
     send: int | None = None,
     native_device: str | None = None,
     plugin: str | None = None,
+    track_stated: float | None = None,
+    track_kind: Literal["audio", "midi"] | None = None,
+    device_name: str | None = None,
+    target_origin: TargetOrigin | None = None,
+    utterance: str = "",
 ) -> Intent:
+    origin = target_origin or (TargetOrigin.MASTER if track == "master" else TargetOrigin.SELECTED if track == "selected" else TargetOrigin.NAMED if isinstance(track, int) else TargetOrigin.NONE)
+    evidence = (1.0 if origin in {TargetOrigin.NAMED, TargetOrigin.MASTER} else 0.0) if track_stated is None else track_stated
     return Intent(
         action=action,
         action_conf=1.0,
         track=track,
         track_conf=1.0 if track is not None else 0.0,
-        track_stated=1.0 if track is not None else 0.0,
+        track_stated=evidence,
         param=None,
         param_conf=0.0,
         step=step,
@@ -525,6 +617,12 @@ def _local_intent(
         native_device=native_device,
         native_device_conf=1.0 if native_device is not None else 0.0,
         plugin=plugin,
+        track_kind=track_kind,
+        device_name=device_name,
+        target_origin=origin,
+        # "this track" / "it" points at the selection without naming anything, so it must pass the gate as SELECTED.
+        named_evidence=0.0 if track == "selected" else evidence,
+        utterance=utterance,
     )
 
 
@@ -621,12 +719,12 @@ def _parse_local_ja(utterance: str, snapshot: Snapshot) -> Intent | None:
         if device is not None:
             kind = (with_device.group("kind") or "").lower()
             name = (with_device.group("name") or "").strip() or None
-            return _local_intent(Action.ADD_TRACK_WITH_DEVICE, text=name or ("audio" if kind in {"オーディオ", "audio"} else None), native_device=device)
+            return _local_intent(Action.ADD_TRACK_WITH_DEVICE, text=name, track_kind="audio" if kind in {"オーディオ", "audio"} else "midi", native_device=device)
     opened = match_new_track_open(text)
     if opened is not None:
         device = resolve_native_device(opened[0])
         if device is not None:
-            return _local_intent(Action.ADD_TRACK_WITH_DEVICE, text=opened[2] or opened[1], native_device=device)
+            return _local_intent(Action.ADD_TRACK_WITH_DEVICE, text=opened[2], track_kind=opened[1] or "midi", native_device=device)
     added = re.fullmatch(rf"(?:(?P<name>.+?)\s*(?:という|って)\s*(?:名前|名)\s*(?:で|の)\s*)?(?:{_NEW_MARK}\s*)?(?P<kind>{_KIND})?\s*トラック\s*(?:を|も)?\s*(?:{_NEW_MARK}\s*)?{MAKE_VERB}", text, re.IGNORECASE)
     if added:
         kind = (added.group("kind") or "midi").lower()
@@ -652,6 +750,10 @@ def _parse_local_ja(utterance: str, snapshot: Snapshot) -> Intent | None:
             step=Step.SET,
             number=Number(_numeric_value(tempo.group(1)), "bpm"),
         )
+    master_volume = re.fullmatch(r"(?:マスター|全体)(?:の音量)?(?:を)?\s*(?P<direction>上げ|あげ|下げ|さげ)(?:て)?", text)
+    if master_volume:
+        step = Step.DOWN_SMALL if master_volume.group("direction") in {"下げ", "さげ"} else Step.UP_SMALL
+        return _local_intent(Action.VOLUME, track="master", step=step)
 
     named_tracks = [track for track in snapshot.tracks if not is_bridge_track(track)]
     target_pattern = (
@@ -681,11 +783,21 @@ def _parse_local_ja(utterance: str, snapshot: Snapshot) -> Intent | None:
                 number=Number(_numeric_value(volume.group("number")), "db"),
             )
 
+    # A bare "XをYにして" is how values and states are phrased ("Bassを-6dBにして"), so renaming needs an explicit marker.
     rename = re.fullmatch(
-        rf"(?P<target>{target_pattern})\s*(?:の名前|の名)?\s*を\s*(?P<name>.+?)\s*に\s*(?:して|変えて|改名|リネーム)(?:して)?",
+        rf"(?P<target>{target_pattern})\s*(?:の名前|の名)\s*を\s*(?P<name>.+?)\s*に\s*(?:して|変えて|変更|改名|リネーム)(?:して)?",
+        text,
+        re.IGNORECASE,
+    ) or re.fullmatch(
+        rf"(?P<target>{target_pattern})\s*を\s*(?P<name>.+?)\s*(?:に\s*(?:改名|リネーム)|という名前に\s*(?:して|変えて|変更))(?:して)?",
         text,
         re.IGNORECASE,
     )
+    bare_rename = re.fullmatch(r"(?:この|選択(?:中の|した)?)?(?:トラック)?(?:の)?(?:名前|トラック名)\s*を\s*(?P<name>.+?)\s*に\s*(?:して|変えて|変更)(?:して)?", text)
+    if bare_rename and not rename:
+        new_name = bare_rename.group("name").strip().strip("「」\"'")
+        if new_name:
+            return _local_intent(Action.RENAME, text=new_name, track_stated=0.0)
     if rename:
         track = _local_track(snapshot, rename.group("target"))
         new_name = rename.group("name").strip().strip("「」\"'")
@@ -740,8 +852,8 @@ def _parse_local_ja(utterance: str, snapshot: Snapshot) -> Intent | None:
     )
     if toggle:
         track = _local_track(snapshot, toggle.group("target"))
-        if track is not None:
-            action = {
+        key = (toggle.group("action").casefold(), bool(toggle.group("undo")))
+        action = {
                 ("ミュート", False): Action.MUTE,
                 ("ミュート", True): Action.UNMUTE,
                 ("ソロ", False): Action.SOLO,
@@ -756,8 +868,36 @@ def _parse_local_ja(utterance: str, snapshot: Snapshot) -> Intent | None:
                 ("unsolo", False): Action.UNSOLO,
                 ("arm", False): Action.ARM,
                 ("disarm", False): Action.DISARM,
-            }[(toggle.group("action"), bool(toggle.group("undo")))]
-            return _local_intent(action, track=track)
+        }.get(key)
+        if action is None:
+            return None
+        return _local_intent(action, track=track, track_stated=1.0)
+    unknown_toggle = re.fullmatch(
+        r"(?P<target>.+?)\s*(?:を)?\s*(?P<action>ミュート|ソロ|アーム|録音待機)\s*(?P<undo>解除)?(?:して|に)?",
+        text,
+        re.IGNORECASE,
+    )
+    if unknown_toggle:
+        target_text = unknown_toggle.group("target").strip()
+        track = _local_track(snapshot, target_text)
+        if track is None and not any(item.name and item.name.casefold() in target_text.casefold() for item in named_tracks):
+            return None
+        key = (unknown_toggle.group("action"), bool(unknown_toggle.group("undo")))
+        action = {
+            ("ミュート", False): Action.MUTE, ("ミュート", True): Action.UNMUTE,
+            ("ソロ", False): Action.SOLO, ("ソロ", True): Action.UNSOLO,
+            ("アーム", False): Action.ARM, ("アーム", True): Action.DISARM,
+            ("録音待機", False): Action.ARM, ("録音待機", True): Action.DISARM,
+        }[key]
+        return _local_intent(action, track=track, track_stated=1.0)
+    unknown_volume = re.fullmatch(r"(?P<target>.+?)(?:の音量)?(?:を)?\s*(?:少し|ちょっと|ちょい)?\s*(?P<direction>上げ|あげ|下げ|さげ)(?:て)?", text)
+    if unknown_volume:
+        target_text = unknown_volume.group("target").strip()
+        track = _local_track(snapshot, target_text)
+        if track is None and not any(item.name and item.name.casefold() in target_text.casefold() for item in named_tracks):
+            return None
+        step = Step.DOWN_SMALL if unknown_volume.group("direction") in {"下げ", "さげ"} else Step.UP_SMALL
+        return _local_intent(Action.VOLUME, track=track, track_stated=1.0, step=step)
     return None
 
 
@@ -767,9 +907,11 @@ def detect_language(utterance: str) -> Literal["ja", "en"]:
 
 def parse_local(utterance: str, snapshot: Snapshot) -> Intent | None:
     if detect_language(utterance) == "ja":
-        return _parse_local_ja(utterance, snapshot)
-    from intent_en import parse_local_en
-    return parse_local_en(utterance, snapshot)
+        parsed = _parse_local_ja(utterance, snapshot)
+    else:
+        from intent_en import parse_local_en
+        parsed = parse_local_en(utterance, snapshot)
+    return replace(parsed, utterance=utterance) if parsed is not None else None
 
 
 def _score(answer: Any, field: str) -> float:
@@ -812,6 +954,9 @@ def interpret_response(snapshot: Snapshot, utterance: str, response: Mapping[str
         track = int(track_name[1:])
     else:
         track = None
+    track_stated = lower_setting_only_track_stated(
+        utterance, _track_stated_score(answers.get("track_stated")), (item.name for item in snapshot.tracks)
+    )
     step_name, step_conf = _choice(answers.get("step"))
     try:
         step = Step(step_name)
@@ -842,9 +987,8 @@ def interpret_response(snapshot: Snapshot, utterance: str, response: Mapping[str
         if selected is not None:
             param_conf, selected_track_index, param_name, param_answer = selected
             param = candidates_by_track[selected_track_index][param_name]
-            if not isinstance(track, int) or track_conf < 0.6:
-                track = selected_track_index
-                track_conf = param_conf
+            if track_stated < TRACK_UNSTATED_MAX and (not isinstance(track, int) or track_conf < 0.6):
+                track, track_conf = selected_track_index, param_conf
         if isinstance(track, int):
             for key, candidate in candidates_by_track.get(track, {}).items():
                 param_labels[key] = _param_label(snapshot, track, candidate)
@@ -868,13 +1012,14 @@ def interpret_response(snapshot: Snapshot, utterance: str, response: Mapping[str
     clip_conf = 0.0
     device: Device | None = None
     device_conf = 0.0
+    picked_track: int | None = None
     if action in CLIP_ACTIONS:
         picked, clip_conf, picked_track = _pick_per_track(
             snapshot, answers, "clip_t", track, track_conf, lambda item: {f"c{c.slot}": c.slot for c in item.clips}
         )
         if picked is not None:
             clip = int(picked)
-            if not isinstance(track, int) or track_conf < 0.6:
+            if track_stated < TRACK_UNSTATED_MAX and (not isinstance(track, int) or track_conf < 0.6):
                 track, track_conf = picked_track, clip_conf
     if action in {Action.DEVICE_ON, Action.DEVICE_OFF}:
         picked, device_conf, picked_track = _pick_per_track(
@@ -882,7 +1027,7 @@ def interpret_response(snapshot: Snapshot, utterance: str, response: Mapping[str
         )
         if picked is not None:
             device = picked
-            if not isinstance(track, int) or track_conf < 0.6:
+            if track_stated < TRACK_UNSTATED_MAX and (not isinstance(track, int) or track_conf < 0.6):
                 track, track_conf = picked_track, device_conf
             param = next((p for p in device.params if p.index == 0), None)
             param_conf = device_conf
@@ -902,7 +1047,7 @@ def interpret_response(snapshot: Snapshot, utterance: str, response: Mapping[str
         action_conf=action_conf,
         track=track,
         track_conf=track_conf,
-        track_stated=_score(answers.get("track_stated"), "noul"),
+        track_stated=track_stated,
         param=param,
         param_conf=param_conf,
         step=step,
@@ -922,6 +1067,17 @@ def interpret_response(snapshot: Snapshot, utterance: str, response: Mapping[str
         native_device=native_device,
         native_device_conf=native_conf,
         text=_track_name_in(utterance),
+        target_origin=(
+            TargetOrigin.MASTER if track == "master" and re.search(r"マスター|全体|\bmaster\b|\bwhole\s+mix\b|\bmain\s+out\b", utterance, re.IGNORECASE) else
+            TargetOrigin.SELECTED if track == "selected" else
+            TargetOrigin.NAMED if isinstance(track, int) and track_stated >= TRACK_UNSTATED_MAX and track_conf >= NAMED_TRACK_CONF_MIN else
+            TargetOrigin.NONE
+        ),
+        named_evidence=track_stated,
+        utterance=utterance,
+        clip_name=next((c.name for t in snapshot.tracks for c in t.clips if c.slot == clip and (picked_track is None or t.index == picked_track)), None) if clip is not None else None,
+        clip_path=next((c.path for t in snapshot.tracks for c in t.clips if c.slot == clip and (picked_track is None or t.index == picked_track)), None) if clip is not None else None,
+        device_name=device.name if device is not None else None,
     )
     send_labels = {f"send{index}": f"{chr(ord('A') + index)}（{name}）" for index, name in enumerate(snapshot.returns)}
     scene_labels = {f"s{item.index}": item.name for item in snapshot.scenes}
@@ -1056,6 +1212,8 @@ class ClipNotesRequest:
     semitones: int = 0
     factor: "float | None" = None
     value: "float | None" = None
+    target_stated: bool = False
+    target_missing: bool = False
 
 
 _KANJI_DIGITS = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9, "十": 10, "1": 1, "１": 1, "２": 2, "３": 3, "４": 4}
@@ -1082,20 +1240,46 @@ def _parse_clip_notes_phrase_ja(utterance: str, snapshot: Snapshot) -> "ClipNote
     text = normalize_phrase(utterance)
     track: "int | None" = None
     slot: "int | None" = None
+    target_stated = False
+    target_missing = False
     named_tracks = [item for item in snapshot.tracks if not is_bridge_track(item) and item.name]
-    names = "|".join(re.escape(item.name) for item in sorted(named_tracks, key=lambda item: len(item.name), reverse=True))
-    target = rf"(?:トラック\s*\d+|\d+\s*番目(?:のトラック)?|{names})" if names else r"(?:トラック\s*\d+|\d+\s*番目(?:のトラック)?)"
-    slotted = re.search(rf"(?P<target>{target})\s*の\s*クリップ\s*(?P<slot>\d+)", text, re.IGNORECASE)
+    slotted = re.search(r"(?P<target>[^、。]+?)\s*の\s*クリップ\s*(?P<slot>\d+)", text, re.IGNORECASE)
     if slotted:
-        found = _local_track(snapshot, slotted.group("target"))
+        target_stated = True
+        found = _local_track(snapshot, slotted.group("target").strip())
         if not isinstance(found, int):
-            return None
-        track, slot = found, int(slotted.group("slot")) - 1
+            target_missing = True
+        else:
+            track = found
+        slot = int(slotted.group("slot")) - 1
         if slot < 0:
             return None
+    if not target_stated:
+        matches = [
+            item for item in sorted(named_tracks, key=lambda item: len(item.name), reverse=True)
+            if re.search(rf"(?<![A-Za-z0-9_]){re.escape(item.name)}(?![A-Za-z0-9_])", text, re.IGNORECASE)
+        ]
+        if matches:
+            track = matches[0].index
+            target_stated = True
+        else:
+            residual = re.sub(
+                rf"{_QUANTIZE}|{_LEGATO}|{_DUPLICATE}|{_VELOCITY}|トランスポーズ|移調|transpose|"
+                rf"{_NOTE_WORDS}|{_UP}|{_DOWN}|オクターブ|半音|セミトーン|グリッド|タイミング|"
+                r"軽く|ゆるく|緩く|少し|ちょっと|やや|半分|倍|分|長さ|選択(?:中|した)?|この|これ",
+                " ", text, flags=re.IGNORECASE,
+            )
+            residual = re.sub(r"\d+(?:/\d+)?|[%％]|[\s\W_]+", " ", residual)
+            residual = re.sub(r"[\u3040-\u309f]+", " ", residual)
+            if re.search(r"[A-Za-z\u30a0-\u30ff\u3400-\u4dbf\u4e00-\u9fff]", residual):
+                target_stated = True
+                target_missing = True
+
+    def request(op: str, **values) -> ClipNotesRequest:
+        return ClipNotesRequest(op, track, slot, target_stated=target_stated, target_missing=target_missing, **values)
 
     if re.search(_DUPLICATE, text, re.IGNORECASE):
-        return ClipNotesRequest("duplicate_loop", track, slot)
+        return request("duplicate_loop")
     if re.search(_QUANTIZE, text, re.IGNORECASE):
         triplet = re.search(r"3連|三連|トリプレット|triplet", text, re.IGNORECASE) is not None
         base = "1/16"
@@ -1111,18 +1295,18 @@ def _parse_clip_notes_phrase_ja(utterance: str, snapshot: Snapshot) -> "ClipNote
             amount = max(0.0, min(1.0, int(percent.group(1)) / 100.0))
         elif re.search(r"半分|軽く|ゆるく|緩く|少し|ちょっと|やや", text):
             amount = 0.5
-        return ClipNotesRequest("quantize", track, slot, grid=base, amount=amount)
+        return request("quantize", grid=base, amount=amount)
     if re.search(_LEGATO, text, re.IGNORECASE):
-        return ClipNotesRequest("legato", track, slot)
+        return request("legato")
     if re.search(_VELOCITY, text, re.IGNORECASE) or (re.search(r"ノート|音符", text) and re.search(r"強く|弱く|強め|弱め", text)):
         fixed = re.search(r"(\d+)\s*(?:に|へ)", text)
         if fixed:
-            return ClipNotesRequest("velocity", track, slot, value=float(max(1, min(127, int(fixed.group(1))))))
+            return request("velocity", value=float(max(1, min(127, int(fixed.group(1))))))
         small = re.search(r"少し|ちょっと|やや|軽く|強め|弱め", text) is not None
         if re.search(rf"{_UP}|強く|強め|大きく", text):
-            return ClipNotesRequest("velocity", track, slot, factor=1.1 if small else 1.25)
+            return request("velocity", factor=1.1 if small else 1.25)
         if re.search(rf"{_DOWN}|弱く|弱め|小さく|抑え", text):
-            return ClipNotesRequest("velocity", track, slot, factor=0.9 if small else 0.8)
+            return request("velocity", factor=0.9 if small else 0.8)
         return None
     octave = re.search(rf"(?:{_COUNT}\s*)?オクターブ", text)
     semis = re.search(r"(?P<semis>\d+)\s*(?:半音|セミトーン|st\b)", text, re.IGNORECASE)
@@ -1137,7 +1321,7 @@ def _parse_clip_notes_phrase_ja(utterance: str, snapshot: Snapshot) -> "ClipNote
             amount_semis = -amount_semis
         elif not re.search(_UP, text):
             return None
-        return ClipNotesRequest("transpose", track, slot, semitones=amount_semis)
+        return request("transpose", semitones=amount_semis)
     return None
 
 
@@ -1178,12 +1362,30 @@ def resolve_plugin_name(text: str, catalog: "tuple[str, ...]") -> str | None:
     return None
 
 
+def resolve_bare_plugin_name(text: str, catalog: "tuple[str, ...]") -> str | None:
+    """Resolve a verb-free plug-in request without accepting an inner substring."""
+    key = text.strip().strip("「」\"'").casefold()
+    squeezed = key.replace(" ", "")
+    if not squeezed:
+        return None
+    alias = load_plugin_aliases().get(squeezed)
+    if alias and alias in catalog:
+        return alias
+    exact = [name for name in catalog if name.casefold() == key or name.casefold().replace(" ", "") == squeezed]
+    if exact:
+        return exact[0]
+    prefix = [name for name in catalog if name.casefold().replace(" ", "").startswith(squeezed)]
+    return sorted(prefix, key=lambda name: (len(name), name))[0] if prefix else None
+
+
 @dataclass(frozen=True)
 class PluginRequest:
     action: Action
     raw_name: str
     track: "int | None | Literal['selected']"
     text: str | None
+    target_text: str | None = None
+    target_missing: bool = False
 
 
 def _extract_plugin_request_ja(utterance: str, snapshot: Snapshot) -> PluginRequest | None:
@@ -1209,14 +1411,17 @@ def _extract_plugin_request_ja(utterance: str, snapshot: Snapshot) -> PluginRequ
         if resolve_native_device(opened[0]) is None:
             return PluginRequest(Action.ADD_TRACK_WITH_PLUGIN, opened[0], None, opened[2] or opened[1])
         return None
-    insert = re.fullmatch(rf"(?:(?P<target>{target})\s*(?:に|へ|で|の)\s*)?(?P<plugin>.+?)\s*{INSERT_VERB}", text, re.IGNORECASE)
+    insert = re.fullmatch(rf"(?:(?P<target>.+?)\s*(?:の上に|に|へ|で|の)\s*)?(?P<plugin>.+?)\s*{INSERT_VERB}", text, re.IGNORECASE)
     if insert:
-        track = _local_track(snapshot, insert.group("target")) if insert.group("target") else None
+        target_text = insert.group("target")
+        track = _local_track(snapshot, target_text) if target_text else None
         # Requests to add an audio track or open a clip are not device requests.
         if re.search(r"トラック|クリップ|シーン", insert.group("plugin")):
             return None
-        if insert.group("target") is None or track is not None:
-            return PluginRequest(Action.INSERT_PLUGIN, insert.group("plugin"), track, None)
+        return PluginRequest(
+            Action.INSERT_PLUGIN, insert.group("plugin"), track, None,
+            target_text=target_text, target_missing=target_text is not None and track is None,
+        )
     return None
 
 
@@ -1228,7 +1433,9 @@ def extract_plugin_request(utterance: str, snapshot: Snapshot) -> PluginRequest 
 
 
 def plugin_intent(request: PluginRequest, plugin: str) -> Intent:
-    return _local_intent(request.action, track=request.track, text=request.text, plugin=plugin)
+    kind = "audio" if request.text == "audio" else "midi"
+    name = None if request.text == "audio" else request.text
+    return _local_intent(request.action, track=request.track, text=name, track_kind=kind, plugin=plugin)
 
 
 def parse_plugin_phrase(utterance: str, snapshot: Snapshot, catalog: "tuple[str, ...]") -> Intent | None:

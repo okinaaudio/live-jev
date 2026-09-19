@@ -58,18 +58,21 @@ final class DaemonClient: @unchecked Sendable {
         launch(isRetry: false)
     }
 
-    func send(_ request: DaemonRequest) {
+    @discardableResult
+    func send(_ request: DaemonRequest) -> Bool {
         guard let input else {
             onConnectionChange?(false, AppText.text(.daemonUnavailable, language: language))
-            return
+            return false
         }
         do {
             var data = try JSONEncoder().encode(request)
             data.append(0x0A)
             try input.write(contentsOf: data)
+            return true
         } catch {
             Log.shared.write("daemon stdin write failed: \(error.localizedDescription)")
             onConnectionChange?(false, AppText.text(.daemonSendFailed, language: language))
+            return false
         }
     }
 

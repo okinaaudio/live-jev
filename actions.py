@@ -520,9 +520,9 @@ def _clip_prop(prop: str, value: bool, label: str) -> ActionSpec:
 def apply_add_track_with_device(_snapshot: Snapshot, intent: Intent) -> list[list[str]]:
     if not intent.native_device and not intent.plugin:
         raise LocalizedError("error.device_name_required")
-    audio = intent.text == "audio"
+    audio = intent.track_kind == "audio"
     arguments = ["--write", "--add-audio-tracks" if audio else "--add-midi-tracks", "1"]
-    if intent.text and intent.text != "audio":
+    if intent.text:
         arguments += ["--audio-prefix" if audio else "--midi-name", intent.text]
     return [arguments]
 

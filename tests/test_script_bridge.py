@@ -23,6 +23,11 @@ def _loopback_tcp_available() -> bool:
 
 
 class TranslationTests(unittest.TestCase):
+    def test_ping_timeout_returns_false(self) -> None:
+        client = ScriptBridgeClient()
+        with mock.patch.object(client, "_request", side_effect=TimeoutError("slow")):
+            self.assertFalse(client.ping())
+
     def test_translates_allowed_arguments_and_keeps_ack_metadata_local(self) -> None:
         commands = translate_arguments([
             "--api-get", "live_set tracks 1", "mute", "get-1",
