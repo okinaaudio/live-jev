@@ -1,5 +1,5 @@
 #!/opt/homebrew/bin/python3.13
-"""Live Jev の一発実行と対話モード。"""
+"""Provide one-shot and interactive modes for Live Jev."""
 
 from __future__ import annotations
 

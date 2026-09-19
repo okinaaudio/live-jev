@@ -1,5 +1,5 @@
 #!/usr/bin/env python3.13
-"""Live Jev のアプリアイコン（PNG 1024px）を標準ライブラリだけで描く。"""
+"""Draw the 1024 px Live Jev app icon as a PNG using only the standard library."""
 
 from __future__ import annotations
 

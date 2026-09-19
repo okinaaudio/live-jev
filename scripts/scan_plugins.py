@@ -1,5 +1,5 @@
 #!/usr/bin/env python3.13
-"""Macに入っているプラグイン（VST3・AU・VST）の名前を一覧にして plugins.json に書く。読むだけで何も変えない。"""
+"""List installed Mac plug-ins (VST3, AU, and VST) in plugins.json without modifying them."""
 
 from __future__ import annotations
 

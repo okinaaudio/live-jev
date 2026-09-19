@@ -1,4 +1,4 @@
-"""テストは本物の Live や Remote Script に触らない。"""
+"""Tests never access a real Live instance or Remote Script."""
 
 import plugin_script
 

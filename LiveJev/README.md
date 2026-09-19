@@ -1,13 +1,13 @@
-# LiveJev（呼び出し型の入力バー）
+# LiveJev (the summon bar)
 
-macOS 14 以降向けの小さな入力バーです。Swift 側は Jev や Live に直接つながず、同じフォルダの親にある `daemon.py`（Python 3.13）を起動して、1行1JSONでやり取りします。
+A small input bar for macOS 14 or later. The Swift side never talks to Jev or Live directly: it starts `daemon.py` (Python 3.13) from the parent folder and exchanges one JSON object per line with it.
 
 ```sh
 swift build -c release --scratch-path ~/dev/live-jev-build
 ~/dev/live-jev-build/release/LiveJev
 ```
 
-`daemon.py` の場所を変えるときは `LIVE_JEV_DAEMON=/absolute/path/to/daemon.py` を指定します。普段は `scripts/build-app.sh` で `.app` にして使います。
+Set `LIVE_JEV_DAEMON=/absolute/path/to/daemon.py` to use a different `daemon.py`. For everyday use, build the `.app` with `scripts/build-app.sh`.
 
-- `⌘⇧Space`: 呼び出す／隠す　`Enter`: 送ってすぐ Live に戻る　`Esc`: 隠す　`↑`/`↓`: 入力履歴　`⌘Z`（入力が空のとき）: 元に戻す
-- メニューバーの波形アイコン: 呼び出す・ログイン時に起動・言語（自動／日本語／English）・詳細を表示・終了
+- `⌘⇧Space` summon / hide · `Enter` send and return to Live at once · `Esc` hide · `↑` / `↓` input history · `⌘Z` (with an empty field) undo
+- Menu bar waveform icon: Show, Launch at Login, Language (Automatic / Japanese / English), Show Details, Quit

@@ -1,4 +1,4 @@
-"""Gemini を使い、曖昧な一言を許可済みの命令へ言い換える。"""
+"""Use Gemini to rewrite an ambiguous phrase as an allowed command."""
 
 from __future__ import annotations
 

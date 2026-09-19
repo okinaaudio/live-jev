@@ -1,4 +1,4 @@
-"""許可した操作と live.py 引数の対応表。"""
+"""Map allowed actions to live.py arguments."""
 
 from __future__ import annotations
 

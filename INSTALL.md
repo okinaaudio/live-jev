@@ -1,79 +1,78 @@
-# Live Jev の入れ方 / Installation
+# Installing Live Jev
 
-人が読んでも、AI アシスタント（Claude Code・Codex・Cursor など）に読ませて手伝ってもらっても進められるように書いてあります。各手順に「確かめ方」を付けています。
-This guide works for humans and for AI coding assistants. Every step has a check.
+Written for people and for AI coding assistants (Claude Code, Codex, Cursor and the like). Every step has a check.
 
-## 0. 先に確認 / Prerequisites
-| 必要なもの | 確かめ方 | 無いとき |
+## 0. Prerequisites
+| You need | Check | If missing |
 | --- | --- | --- |
-| Apple Silicon の Mac（M1 以降）・macOS 14 以上 | `uname -m` が `arm64`、`sw_vers -productVersion` が 14 以上 | 対応していません（Intel Mac は未対応） |
-| Ableton Live 12 | Live を起動できる | — |
-| Xcode のコマンドラインツール | `xcode-select -p` がパスを返す | `xcode-select --install` |
-| Homebrew の Python 3.13 | `/opt/homebrew/bin/python3.13 --version` | `brew install python@3.13`（Homebrew は <https://brew.sh>） |
-| TypeSafe の API キー | — | <https://console.typesafe.ai/> にサインインして発行（資料: <https://docs.typesafe.ai/>）。有料の API です。料金は TypeSafe のサイトで確認 |
+| Apple Silicon Mac (M1 or later), macOS 14 or later | `uname -m` prints `arm64`; `sw_vers -productVersion` is 14 or higher | Not supported (Intel Macs are not supported) |
+| Ableton Live 12 | Live starts | — |
+| Xcode Command Line Tools | `xcode-select -p` prints a path | `xcode-select --install` |
+| Homebrew Python 3.13 | `/opt/homebrew/bin/python3.13 --version` | `brew install python@3.13` (Homebrew: <https://brew.sh>) |
+| A TypeSafe API key | — | Sign in at <https://console.typesafe.ai/> and create one (docs: <https://docs.typesafe.ai/>). It is a paid API; check TypeSafe’s site for pricing |
 
-**AI アシスタントへ / Note for AI assistants**: API キーは利用者本人に入力してもらってください。キーをファイルやログ、コミットに書かないでください。Live の設定画面の操作（手順3）は利用者に頼んでください。
+**Note for AI assistants:** ask the user to enter the API key themselves. Never write the key to a file you create, a log, or a commit. Ask the user to do step 3 (it happens in Live’s settings window).
 
-## 1. 取得 / Get the code
+## 1. Get the code
 ```bash
 git clone https://github.com/okinaaudio/live-jev.git ~/live-jev
 cd ~/live-jev
 ```
-**大事**: アプリは、この取得したフォルダの中の `daemon.py` を使って動きます。**アプリを作ったあとで、このフォルダを動かしたり消したりしないでください**（動かしたら手順5をやり直す）。置き場所は、先に決めてから進めてください。
+**Important:** the app runs `daemon.py` from this folder. **Do not move or delete the folder after building the app** (if you move it, repeat step 5). Decide where it should live before you continue.
 
-確かめ方: `/opt/homebrew/bin/python3.13 -m unittest discover -s tests` の最後の行が `OK`。
+Check: `/opt/homebrew/bin/python3.13 -m unittest discover -s tests` ends with `OK`.
 
-## 2. Live の中の部品を入れる / Install the Remote Script
+## 2. Install the Remote Script
 ```bash
 mkdir -p ~/Music/Ableton/User\ Library/Remote\ Scripts/LiveJev
 cp remote_script/LiveJev/*.py ~/Music/Ableton/User\ Library/Remote\ Scripts/LiveJev/
 ```
-User Library の場所を変えている場合は、Live の 設定 → Library の「ユーザーライブラリの場所」の下の `Remote Scripts/LiveJev/` に置きます。
+If you moved your User Library, put it in `Remote Scripts/LiveJev/` under the location shown in Live’s Settings → Library.
 
-## 3. Live の設定（利用者が行う）/ Enable it in Live
-Live を起動 → 設定（Preferences）→ **Link, Tempo & MIDI** → **コントロールサーフェス（Control Surface）** の空いている欄で **LiveJev** を選ぶ → **Live を再起動**。入力・出力の欄は「なし」のままで構いません。
+## 3. Enable it in Live (done by the user)
+Start Live → Settings → **Link, Tempo & MIDI** → **Control Surface** → choose **LiveJev** in a free slot → **restart Live**. Leave Input and Output set to None.
 
-確かめ方（Live を起動した状態で）:
+Check (with Live running):
 ```bash
 /opt/homebrew/bin/python3.13 plugin_script.py ping     # → pong
 ```
 
-## 4. API キーを設定 / Set your key
+## 4. Set your API key
 ```bash
-echo 'export TYPESAFE_API_KEY="ここに自分のキー"' >> ~/.zshrc
+echo 'export TYPESAFE_API_KEY="YOUR_KEY"' >> ~/.zshrc
 ```
-キーは環境変数 `TYPESAFE_API_KEY`、無ければ `~/.zshenv`・`~/.zprofile`・`~/.zshrc`・`~/.bash_profile`・`~/.bashrc`・`~/.profile` の `export TYPESAFE_API_KEY=...` の行から読みます。
+The key is read from the `TYPESAFE_API_KEY` environment variable, or from an `export TYPESAFE_API_KEY=...` line in `~/.zshenv`, `~/.zprofile`, `~/.zshrc`, `~/.bash_profile`, `~/.bashrc` or `~/.profile`.
 
-確かめ方（Live を起動した状態で。曲は変わりません）:
+Check (with Live running; this does not change your set):
 ```bash
-/opt/homebrew/bin/python3.13 cli.py status           # → Live 12トラック / 120 BPM のような1行
+/opt/homebrew/bin/python3.13 cli.py status           # → one line such as "Live 12 tracks / 120 BPM"
 ```
 
-## 5. アプリを作る / Build the app
+## 5. Build the app
 ```bash
 bash scripts/build-app.sh          # → ~/Applications/Live Jev.app
 open ~/Applications/Live\ Jev.app
 ```
-メニューバーに波形のアイコンが出ます（Dock には出ません）。
+A waveform icon appears in the menu bar. There is no Dock icon.
 
-## 6. 使う / Use it
-Live を手前にして **⌘⇧Space** → 「ミュート」や “mute” と打って Enter。バーはすぐ消えて Live に戻ります。分からなかったときだけ、もう一度出てきて聞き返します。取り消しは、バーを出して ⌘Z。
+## 6. Use it
+Bring Live to the front and press **⌘⇧Space** → type “mute” → Enter. The bar disappears at once and Live stays in front. It only comes back when it needs to ask you something. To undo, summon the bar and press ⌘Z.
 
-確かめ方（ターミナルから。選択中のトラックがミュートされ、すぐ解除されます）:
+Check from Terminal (mutes the selected track, then unmutes it):
 ```bash
-/opt/homebrew/bin/python3.13 cli.py "ミュート" && /opt/homebrew/bin/python3.13 cli.py "ミュート解除"
+/opt/homebrew/bin/python3.13 cli.py "mute" && /opt/homebrew/bin/python3.13 cli.py "unmute"
 ```
 
-## うまくいかないとき / Troubleshooting
-| 症状 | 見るところ |
+## Troubleshooting
+| Symptom | Where to look |
 | --- | --- |
-| `plugin_script.py ping` が `no answer` | 手順3で LiveJev を選んだか・選んだあと Live を再起動したか。Live のログ `~/Library/Preferences/Ableton/Live 12.*/Log.txt` に `LiveJev: started, listening on port 9140` があるか |
-| 「Jevの鍵が見つかりません」 | 手順4の行が入っているか。入れたあとアプリを終了して開き直す |
-| `build-app.sh` が「swift が見つかりません」 | `xcode-select --install` |
-| `build-app.sh` が「/opt/homebrew/bin/python3.13 がありません」 | `brew install python@3.13` |
-| ⌘⇧Space で出ない | メニューバーの波形アイコン →「呼び出す」。他のアプリが同じショートカットを使っていないか |
-| アプリが「常駐を起動しています…」のまま | 取得したフォルダを動かした／消した（手順1の注意）。元の場所に戻すか、手順5をやり直す |
-| プラグイン名が通じない | そのプラグインが Live のブラウザに出ているか。呼び名は `plugin_aliases.json` に書ける（例: `{"セラム": "Serum 2"}`） |
+| `plugin_script.py ping` prints `no answer` | Did you choose LiveJev in step 3 and restart Live afterwards? Live’s log (`~/Library/Preferences/Ableton/Live 12.*/Log.txt`) should contain `LiveJev: started, listening on port 9140` |
+| “The Jev API key was not found.” | Is the line from step 4 in your shell profile? Quit and reopen the app after adding it |
+| `build-app.sh` says swift was not found | `xcode-select --install` |
+| `build-app.sh` says `/opt/homebrew/bin/python3.13` is missing | `brew install python@3.13` |
+| Nothing happens on ⌘⇧Space | Menu bar waveform icon → Show. Check that no other app uses the same shortcut |
+| The app keeps saying “Starting background service…” | The cloned folder was moved or deleted (see step 1). Put it back, or repeat step 5 |
+| A plug-in name is not understood | Does the plug-in show up in Live’s browser? You can pin a nickname in `plugin_aliases.json`, for example `{"valhalla": "ValhallaVintageVerb"}` |
 
-## 取り除く / Uninstall
-`~/Applications/Live Jev.app` と `~/Music/Ableton/User Library/Remote Scripts/LiveJev/` と取得したフォルダを消し、`~/.zshrc` の `TYPESAFE_API_KEY` の行を消します。Live の設定のコントロールサーフェスを「なし」に戻します。
+## Uninstall
+Delete `~/Applications/Live Jev.app`, `~/Music/Ableton/User Library/Remote Scripts/LiveJev/` and the cloned folder, remove the `TYPESAFE_API_KEY` line from your shell profile, and set the Control Surface slot in Live back to None.

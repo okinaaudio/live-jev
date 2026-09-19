@@ -34,7 +34,7 @@ final class HotKey: @unchecked Sendable {
         let identifier = EventHotKeyID(signature: fourCharacterCode("LvSy"), id: 1)
         let registerStatus = RegisterEventHotKey(
             UInt32(kVK_Space),
-            UInt32(cmdKey | shiftKey),  // ⌘⇧Space。⌃⌥Space は macOS の「入力ソースの切り替え」、⌥Space は Live の「選択範囲を再生」とぶつかる
+            UInt32(cmdKey | shiftKey),  // Cmd-Shift-Space. Ctrl-Option-Space conflicts with macOS input source switching; Option-Space conflicts with Live's Play Selection.
             identifier,
             GetApplicationEventTarget(),
             0,

@@ -1,4 +1,4 @@
-"""0.08 第1弾: トランスポートとトラックの動詞。"""
+"""Version 0.08, phase 1: transport and track verbs."""
 
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ from tests.support import sample_snapshot
 
 
 class RecordingBridge:
-    """書き込みは記録だけ、読み取りは決め打ちで返す偽の橋渡し。"""
+    """Fake bridge that records writes and returns fixed values for reads."""
 
     def __init__(self) -> None:
         self.calls: list[list[str]] = []
@@ -597,7 +597,7 @@ class UndoButtonTests(unittest.TestCase):
 
 
 class SelectedTrackTests(unittest.TestCase):
-    """「選択トラック」の指定と、トラック未指定のときの既定（選択中のトラック）。"""
+    """Explicit selected-track targets and the selected-track default when no track is given."""
 
     class SelectedBridge(RecordingBridge):
         def run(self, arguments):
@@ -703,7 +703,7 @@ class RelativeDbTests(unittest.TestCase):
 
 
 class PluginFallbackTests(unittest.TestCase):
-    """定型文に当たらない言い方でも、Jev が「内蔵デバイス入り」と迷ったら一覧のプラグイン名を探す。"""
+    """Search catalog plug-in names when Jev mistakes an unrecognized phrase for a built-in-device request."""
 
     def _service(self, requester):
         bridge = SelectedTrackTests.SelectedBridge()
@@ -748,7 +748,7 @@ class PluginFallbackTests(unittest.TestCase):
 
 
 class PhraseVocabularyTests(unittest.TestCase):
-    """言い方のゆれ: 丁寧語・願望・終止形・語順の違いを全部同じ依頼にそろえる。"""
+    """Normalize polite, desiderative, and terminal forms plus word-order variants to the same request."""
 
     def test_normalize_phrase(self) -> None:
         from intent import normalize_phrase
@@ -810,7 +810,7 @@ class PhraseVocabularyTests(unittest.TestCase):
 
 
 class StaleSnapshotTests(unittest.TestCase):
-    """曲の構成（トラック数・名前・装置数）が変わっていたら、写しを取り直してから同じ一言をやり直す。"""
+    """Refresh the snapshot and retry the utterance when track count, names, or device counts change."""
 
     def test_changed_track_list_triggers_reread_and_retry(self) -> None:
         import time as _time
@@ -853,7 +853,7 @@ class StaleSnapshotTests(unittest.TestCase):
 
 
 class ClipNotesTests(unittest.TestCase):
-    """クオンタイズ・レガート・移調・強弱・ループ倍。実行は Live の中の部品（ここでは偽物）。"""
+    """Quantize, legato, transpose, velocity, and loop doubling through the component inside Live, faked here."""
 
     def test_phrases(self) -> None:
         from intent import parse_clip_notes_phrase as parse
@@ -900,7 +900,7 @@ class ClipNotesTests(unittest.TestCase):
 
 
 class ReviewFindingsTests(unittest.TestCase):
-    """レビューで見つかった不具合の再発防止。"""
+    """Regression coverage for defects found during review."""
 
     def test_negated_requests_do_nothing_locally(self) -> None:
         from intent import extract_plugin_request, parse_clip_notes_phrase
@@ -946,7 +946,7 @@ class ReviewFindingsTests(unittest.TestCase):
 
 
 class AbletonStyleStructureTests(unittest.TestCase):
-    """トラック追加とプラグイン挿入は Live の中の部品が Live の作法で行う（選択トラックの右・既定名・1回の取り消し）。"""
+    """The component inside Live adds tracks and plug-ins using Live's position, default name, and single-undo behavior."""
 
     def _service(self):
         service = LiveJevService(bridge=RecordingBridge(), snapshot=_snapshot_with_song(), key="x",
@@ -1015,7 +1015,7 @@ class InsertVerbCoverageTests(unittest.TestCase):
 
 
 class AmbiguousInsertVerbTests(unittest.TestCase):
-    """「つけて」「入れて」は他の操作にも使う。名前が一覧に無ければ、ふつうの判定を先に試す。"""
+    """Insertion verbs also describe other actions. Try normal parsing first when the name is absent from the catalog."""
 
     def _service(self, requester):
         service = LiveJevService(bridge=SelectedTrackTests.SelectedBridge(), snapshot=_snapshot_with_song(), key="x", requester=requester, llm_key=None,

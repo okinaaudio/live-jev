@@ -1,4 +1,4 @@
-"""Live を import せずに LOM path と Remote Script 側の許可を扱う。"""
+"""Handle LOM paths and Remote Script permissions without importing Live."""
 
 from dataclasses import dataclass
 import re

@@ -1,4 +1,4 @@
-"""Remote Script「LiveJev」（Live の中の Python）と話す薄い窓口。TCP 127.0.0.1:9140、JSON 1行。"""
+"""Thin client for the LiveJev Remote Script running inside Live. Uses newline-delimited JSON over TCP 127.0.0.1:9140."""
 
 from __future__ import annotations
 
@@ -60,7 +60,7 @@ def load(name: str, track_index: int | None, uri: str = "") -> Mapping[str, Any]
 
 
 def add_track(kind: str, name: str | None = None, device: str | None = None) -> Mapping[str, Any]:
-    """選択中のトラックの右に1本足す（Live と同じ位置・既定名）。device があれば続けて読み込む。"""
+    """Add a track to the right of the selected track, using Live's position and default name. Load device if provided."""
     answer = call("add_track", timeout=70.0, kind=kind, name=name, device=device)
     if not answer.get("ok"):
         raise ScriptError(str(answer.get("error") or "add_track_failed"))
@@ -68,7 +68,7 @@ def add_track(kind: str, name: str | None = None, device: str | None = None) -> 
 
 
 def clip_notes(op: str, track_index: int | None = None, slot_index: int | None = None, **fields: Any) -> Mapping[str, Any]:
-    """開いているクリップ（または指定スロット）のノートを変形する。失敗は ScriptError（error の語を含む）。"""
+    """Transform notes in the open clip or specified slot. Raise ScriptError on failure when the response contains 'error'."""
     answer = call("clip_notes", timeout=15.0, op=op, track_index=track_index, slot_index=slot_index, **fields)
     if not answer.get("ok"):
         raise ScriptError(str(answer.get("error") or "clip_notes_failed"))

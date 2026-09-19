@@ -103,7 +103,7 @@ final class WaveformView: NSView {
     }
 
     @objc private func updateWaveform() {
-        // 動かさない（波打っていると「音声入力できる」ように見えてしまう）。静止した棒で接続の有無だけ示す。
+        // Keep this static. Animation suggests voice input; a still bar indicates only connection status.
         let shouldAnimate = false
             && isConnected
             && window?.isVisible == true
@@ -268,8 +268,8 @@ final class PanelController: NSWindowController, NSTextFieldDelegate, NSWindowDe
 
     private var previousApp: NSRunningApplication?
 
-    // 窓を出すときはこのアプリを前面にする。前面でないと、音声入力アプリ（Aqua Voice など）や
-    // ⌘C/⌘V の宛先が「直前まで前面だったアプリ」になり、窓に文字が入らない。
+    // Bring this app to the front when showing the window. Otherwise voice-input apps such as Aqua Voice
+    // and Cmd-C/Cmd-V target the previously active app, so text never reaches this window.
     func showAndFocus() {
         guard let window else { return }
         let frontmost = NSWorkspace.shared.frontmostApplication
@@ -293,7 +293,7 @@ final class PanelController: NSWindowController, NSTextFieldDelegate, NSWindowDe
         }
     }
 
-    // 閉じたら前面を元のアプリ（たいてい Live）へ返す。
+    // When the window closes, return focus to the previous app, usually Live.
     func hide() {
         hide(returnFocus: true)
     }
@@ -416,7 +416,7 @@ final class PanelController: NSWindowController, NSTextFieldDelegate, NSWindowDe
         surface.wantsLayer = true
         surface.layer?.cornerRadius = radius
         surface.layer?.masksToBounds = true
-        // Live の灰色の画面の上では HUD 素材だけだと溶けるので、黒を重ねて濃くする（音声入力アプリのバーに近い濃さ）。
+        // The HUD material disappears against Live's gray UI, so add black to match the density of a voice-input bar.
         let tint = NSView()
         tint.wantsLayer = true
         tint.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.58).cgColor
@@ -548,7 +548,7 @@ final class PanelController: NSWindowController, NSTextFieldDelegate, NSWindowDe
         let isAwaitingAnswer = displayedItem?.kind == .ask || displayedItem?.kind == .confirm
         let isIncomingQuestion = latest?.kind == .ask || latest?.kind == .confirm
         if isNew, awaitingHiddenResult, latest?.kind == .result {
-            // うまくいった。何も出さない（呼び直して次を打っている最中でも邪魔しない）。
+            // Success needs no message; it would interrupt users who reopen the panel to enter the next command.
             awaitingHiddenResult = false
         } else if isNew, !isPanelVisible, awaitingHiddenResult, let latest {
             awaitingHiddenResult = false
@@ -571,7 +571,7 @@ final class PanelController: NSWindowController, NSTextFieldDelegate, NSWindowDe
             cancelAutoHide()
             if let latest, latest.kind != .ask, latest.kind != .confirm,
                !viewModel.hasPendingConfirmation, inputField.stringValue.isEmpty {
-                // 成功は一瞬だけ見せてすぐ消す（終わってから消えるまでを最速に）。お知らせ・エラーは読む時間を残す。
+                // Flash success briefly and dismiss it as soon as possible. Keep notices and errors visible long enough to read.
                 let delay = latest.kind == .result ? 0.15 : 3.0
                 autoHideTask = Task { [weak self] in
                     do { try await Task.sleep(for: .seconds(delay)) }
@@ -828,8 +828,8 @@ final class PanelController: NSWindowController, NSTextFieldDelegate, NSWindowDe
         displayedItem = nil
         renderContent(animated: false)
         viewModel.submit(text)
-        // 打ち込んだ瞬間に Live へ戻る。うまくいった結果は見せない。
-        // 聞き返し・確認・お知らせ・エラーのときだけ、もう一度出す（下の render 側）。
+        // Return to Live as soon as the command is submitted. Do not show successful results.
+        // Reopen only for clarification, confirmation, notices, or errors in render below.
         awaitingHiddenResult = true
         hide()
     }
