@@ -19,8 +19,22 @@ import uuid
 
 
 PYTHON = "/opt/homebrew/bin/python3.13"
-LIVE_PY = Path(__file__).resolve().parent.parent / "live.py"
-UPSTREAM_PY = Path(__file__).resolve().parents[2] / "bridge" / "ableton_udp_bridge.py"
+def _udp_bridge_root() -> Path:
+    # The legacy UDP bridge (codex-live-bridge) is optional and lives outside this project.
+    # LIVE_JEV_UDP_BRIDGE_ROOT overrides the location; otherwise look for a sibling checkout.
+    configured = os.environ.get("LIVE_JEV_UDP_BRIDGE_ROOT", "").strip()
+    if configured:
+        return Path(configured).expanduser()
+    here = Path(__file__).resolve().parent
+    for candidate in (here.parent / "codex-live-bridge", here.parents[1]):
+        if (candidate / "bridge" / "ableton_udp_bridge.py").exists():
+            return candidate
+    return here.parent / "codex-live-bridge"
+
+
+UDP_BRIDGE_ROOT = _udp_bridge_root()
+LIVE_PY = UDP_BRIDGE_ROOT / "local" / "live.py"
+UPSTREAM_PY = UDP_BRIDGE_ROOT / "bridge" / "ableton_udp_bridge.py"
 RAW_ACK = re.compile(r"^ack:\s+/ack(?:\s+(.*))?$")
 
 
