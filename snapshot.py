@@ -1,4 +1,4 @@
-"""Live の現在値を、判定と実行で使う不変データへ変換する。"""
+"""Convert the current Live state into immutable data used for decisions and actions."""
 
 from __future__ import annotations
 

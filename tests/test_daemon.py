@@ -15,7 +15,7 @@ from tests.support import response, sample_snapshot
 
 
 class NoWriteBridge:
-    """聞き返しの段では書き込みをしない。選択トラックの読み取り（session-context）だけは許す。"""
+    """Clarification may read the selected track through session context but must not write anything."""
 
     def __init__(self) -> None:
         self.calls: list[list[str]] = []

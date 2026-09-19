@@ -1,4 +1,4 @@
-"""既存の live.py を呼び、相関IDつき ACK を安全に取り出す。"""
+"""Call the existing live.py and safely extract ACKs with correlation IDs."""
 
 from __future__ import annotations
 
@@ -38,8 +38,8 @@ def _load_module(name: str, path: Path) -> ModuleType:
 
 
 class _LazyModule:
-    """旧来の UDP の橋渡し（codex-live-bridge）は任意の部品。使うときに初めて読み込み、無ければ分かる言葉で断る。
-    ふだんの通信は Live の中の部品（Remote Script）なので、橋渡しが無い環境でもこのモジュールは import できる。"""
+    """Load the optional legacy UDP bridge (codex-live-bridge) only when needed and report a clear error if it is missing.
+    Normal communication uses the Remote Script inside Live, so this module can be imported without the legacy bridge."""
 
     def __init__(self, name: str, path: Path) -> None:
         self.__dict__["_name"] = name
@@ -733,8 +733,8 @@ def make_bridge_client(
         return ScriptBridgeClient(verbose=verbose)
     if mode == "auto":
         script = ScriptBridgeClient(verbose=verbose)
-        # 旧来の UDP の橋渡しが入っていない環境（公開版の通常の姿）では、Live がまだ起動していなくても
-        # Remote Script の口を使い続ける（次の命令で繋ぎ直す）。
+        # The public build normally omits the legacy UDP bridge. Keep using the
+        # Remote Script endpoint even when Live is not running, then reconnect on the next command.
         if script.ping() or not UPSTREAM_PY.exists():
             return script
         script.close()

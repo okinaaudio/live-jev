@@ -27,7 +27,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         viewModel.start()
-        // 呼び出し型なので起動時には出さない（ログイン時起動で毎回ピルが出るのを避ける）。⌘⇧Space かメニューから呼ぶ。
+        // Do not show the on-demand UI at launch, which would display the pill after every login. Open it with Cmd-Shift-Space or the menu.
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
@@ -85,7 +85,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return menu
     }
 
-    // メニューバーだけのアプリでも、編集メニューが無いと ⌘C/⌘V/⌘A/⌘Z が窓に届かない。
+    // Even a menu-bar-only app needs an Edit menu for Cmd-C/V/A/Z to reach its window.
     private func makeMainMenu() -> NSMenu {
         let main = NSMenu()
         let appItem = NSMenuItem()

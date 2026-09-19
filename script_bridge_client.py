@@ -1,4 +1,4 @@
-"""Remote Script の常時接続口を既存の bridge API に合わせる。"""
+"""Adapt the persistent Remote Script connection to the existing bridge API."""
 
 from __future__ import annotations
 

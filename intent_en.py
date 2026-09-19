@@ -456,7 +456,7 @@ def parse_clip_notes_phrase_en(utterance: str, snapshot: Snapshot) -> ClipNotesR
         return None
     transpose = re.search(r"\b(?:transpose|shift|move|pitch)\b", text)
     amount = re.search(r"\b(\d+|an?|one|two|three|four)\s*(octaves?|semitones?|half steps?|st)\b", text)
-    # 「an octave up」のようにオクターブと向きがあれば、transpose と言わなくてもノートの移調（日本語の「オクターブ上げて」と同じ扱い）
+    # An octave plus a direction, such as "an octave up," means note transposition even without the word "transpose."
     if amount and (transpose or amount.group(2).startswith("octave") or re.search(r"\b(?:notes?|midi|clip)\b", text)):
         words = {"a": 1, "an": 1, "one": 1, "two": 2, "three": 3, "four": 4}
         number = int(amount.group(1)) if amount.group(1).isdigit() else words[amount.group(1)]

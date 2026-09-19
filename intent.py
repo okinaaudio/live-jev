@@ -1,4 +1,4 @@
-"""Jev の質問と回答を扱う純粋関数。"""
+"""Pure functions for handling Jev questions and answers."""
 
 from __future__ import annotations
 
@@ -397,7 +397,7 @@ def _pick_per_track(
     track_conf: float,
     keys_for: Callable[[Track], dict[str, Any]],
 ) -> tuple[Any, float, int | None]:
-    """トラックごとの頭（clip_t / device_t）から、選ばれた項目と、逆引きしたトラックを返す。"""
+    """Return the selected item and its track, derived from per-track prefixes such as clip_t and device_t."""
     if isinstance(track, int) and track_conf >= 0.6:
         indexes = [track]
     elif track is None or track_conf < 0.6:
@@ -566,7 +566,7 @@ GENERIC_DEVICE_WORDS = {
 
 
 def resolve_native_device(text: str) -> str | None:
-    """日本語や表記ゆれから内蔵デバイスの正式名を引く。見つからなければ None。"""
+    """Resolve Japanese names and spelling variants to a built-in device's canonical name, or return None."""
     key = text.strip().strip("「」\"'").casefold().replace(" ", "")
     for name in NATIVE_DEVICES:
         if key == name.casefold().replace(" ", ""):
@@ -600,7 +600,7 @@ LOCAL_TRANSPORT: tuple[tuple[str, Action], ...] = (
 
 
 def _parse_local_ja(utterance: str, snapshot: Snapshot) -> Intent | None:
-    """完全に形が決まった操作だけを Jev なしで解釈する。"""
+    """Parse only fully deterministic actions without Jev."""
     text = normalize_phrase(utterance)
     if re.fullmatch(r"再生(?:して)?", text):
         return _local_intent(Action.PLAY)
@@ -944,7 +944,7 @@ def interpret_response(snapshot: Snapshot, utterance: str, response: Mapping[str
     )
 
 
-# ---- 言い回しの語彙。丁寧語・願望・終止形を「て形」にそろえてから照合する ----
+# ---- Phrase vocabulary. Normalize polite, desiderative, and terminal forms to the te-form before matching. ----
 _POLITE_TAIL = r"(?:\s*(?:ください|下さい|くれますか|くれない|くれる|くれ|ほしいな|ほしい|欲しい|もらえますか|もらえる|もらいたい|お願いします|お願いね|お願い|頂戴|ちょうだい|みて|おいて|ね|よ|な|か))*\s*[。．.!！?？]*\s*$"
 _TE_FORMS = {
     "作り": "作って", "つくり": "作って", "開き": "開いて", "ひらき": "開いて", "入れ": "入れて", "いれ": "入れて",
@@ -968,7 +968,7 @@ _DICT_ALT = "|".join(sorted(map(re.escape, _DICT_FORMS), key=len, reverse=True))
 _WISH_TAIL = r"(?:たいと思います|たいと思う|たいんですが|たいんだけど|たいです|たいな|たい|ましょうか|ましょう|ませんか|ます)"
 
 
-# 「〜しないで」「〜は不要」などの打ち消し。曲を変える依頼として扱わない（確認なしで即実行するため、誤爆の害が大きい）。
+# Negations such as "do not" and "not needed" are not change requests. False positives are dangerous because actions run without confirmation.
 NEGATION = re.compile(r"ないで|なくて(?:いい|よい|良い|OK|大丈夫)|なくていい|しなくて|せずに|するな|しないこと|不要|いらない|要らない|禁止|やらないで")
 
 
@@ -984,15 +984,15 @@ def is_negated(utterance: str) -> bool:
 
 
 def normalize_phrase(utterance: str) -> str:
-    """「作りたい」「作ってください」「作る」「作成」→「作って」のように、語尾を て形 にそろえる。"""
+    """Normalize Japanese verb endings to the te-form."""
     text = utterance.strip()
     text = re.sub(_POLITE_TAIL, "", text)
     text = re.sub(rf"({_STEM_ALT}){_WISH_TAIL}$", lambda m: _TE_FORMS[m.group(1)], text)
     text = re.sub(rf"({_DICT_ALT})$", lambda m: _DICT_FORMS[m.group(1)], text)
     text = re.sub(_POLITE_TAIL, "", text)
     text = re.sub(r"(?:新規作成して|作成して|生成して|つくって)$", "作って", text)
-    text = re.sub(r"といて$", "て", text)  # 入れといて → 入れて
-    text = re.sub(r"どいて$", "で", text)  # 読んどいて → 読んで
+    text = re.sub(r"といて$", "て", text)  # Expand a contracted te-form ending.
+    text = re.sub(r"どいて$", "で", text)  # Expand the voiced variant of a contracted te-form ending.
     return text.strip()
 
 
@@ -1006,9 +1006,9 @@ _PARTICLE_EDGE = r"^(?:を|に|で|へ|の|は|も|と|が|から)+|(?:を|に|�
 
 
 def match_new_track_open(text: str) -> tuple[str, str | None, str | None] | None:
-    """「新しいトラックでXを開いて」「Xを新しいトラックで」「トラック作ってX入れて」など、
-    「新しいトラック（または トラック＋作る動詞）」と名前Xが同居する言い方 → (X, 種類, トラック名)。名前の照合はしない。
-    決まり文句を全部消して、残った1かたまりを名前とみなす（引き算方式。語順に依存しない）。"""
+    """Extract (item, track type, track name) from word-order variants that mention item X and a new track.
+    Remove fixed phrases and treat the one remaining segment as the item name, independent of word order.
+    Do not resolve the name here."""
     if is_negated(text):
         return None
     text = normalize_phrase(text)
@@ -1037,14 +1037,14 @@ def match_new_track_open(text: str) -> tuple[str, str | None, str | None] | None
             parts.append(part)
     if len(parts) != 1:
         return None
-    # 残りが「録音を始めて」「曲を」のような文なら、プラグイン名ではない（名前に助詞「を」や動詞の語尾は入らない）
+    # Text equivalent to "start recording" or "the song" is not a plug-in name; names do not contain object particles or verb endings.
     if re.search(r"を|(?:て|で|る|た|だ|う|く|す)$", parts[0]):
         return None
     return parts[0], ("audio" if kind in {"オーディオ", "audio", "音声"} else None), track_name
 
 
-# ---- クリップのノート変形（クオンタイズ・レガート・移調・強弱・ループ倍） ----
-# 実行は Live の中の部品（Remote Script）の clip_notes。対象は「開いているクリップ」か「<トラック>のクリップN」。
+# ---- Clip note transforms: quantize, legato, transpose, velocity, and double loop length. ----
+# Execute through clip_notes in the Remote Script. Target the open clip or clip N on a named track.
 
 @dataclass(frozen=True)
 class ClipNotesRequest:
@@ -1076,7 +1076,7 @@ def _count_value(text: "str | None", default: int = 1) -> int:
 
 
 def _parse_clip_notes_phrase_ja(utterance: str, snapshot: Snapshot) -> "ClipNotesRequest | None":
-    """ノート変形の一言を取り出す。語順は問わず、決め手の語（クオンタイズ・レガート・オクターブ…）で判定する。"""
+    """Extract a note transform regardless of word order, using decisive terms such as quantize, legato, or octave."""
     if is_negated(utterance):
         return None
     text = normalize_phrase(utterance)
@@ -1129,7 +1129,7 @@ def _parse_clip_notes_phrase_ja(utterance: str, snapshot: Snapshot) -> "ClipNote
     wants_transpose = re.search(r"トランスポーズ|移調|transpose", text, re.IGNORECASE) is not None
     if octave or ((semis or wants_transpose) and (slotted or re.search(_NOTE_WORDS, text, re.IGNORECASE))):
         if slotted and semis and not octave and not re.search(_NOTE_WORDS.replace("クリップ|", ""), text, re.IGNORECASE):
-            return None  # 「<トラック>のクリップNを2半音上げて」は従来のクリップのピッチ（定型文）に任せる
+            return None  # Leave "raise clip N on <track> by two semitones" to the existing fixed-form clip pitch handler.
         amount_semis = _count_value(octave.group("count") if octave else None) * 12 if octave else int(semis.group("semis")) if semis else 0
         if amount_semis == 0:
             return None
@@ -1152,7 +1152,7 @@ PLUGIN_ALIASES_PATH = Path(__file__).with_name("plugin_aliases.json")
 
 
 def load_plugin_aliases() -> dict[str, str]:
-    """{"セラム": "Serum 2"} のような利用者ごとの別名。無ければ空。"""
+    """Load user-defined aliases such as a Japanese nickname for "Serum 2", or return an empty mapping."""
     try:
         raw = json.loads(PLUGIN_ALIASES_PATH.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError):
@@ -1161,7 +1161,7 @@ def load_plugin_aliases() -> dict[str, str]:
 
 
 def resolve_plugin_name(text: str, catalog: "tuple[str, ...]") -> str | None:
-    """一覧の中から名前を1つに決める。別名→完全一致→部分一致（複数なら最も短い名前）。決まらなければ None。"""
+    """Resolve one catalog name by alias, exact match, then partial match, choosing the shortest of multiple matches. Return None if unresolved."""
     key = text.strip().strip("「」\"'").casefold()
     squeezed = key.replace(" ", "")
     if not squeezed:
@@ -1187,7 +1187,7 @@ class PluginRequest:
 
 
 def _extract_plugin_request_ja(utterance: str, snapshot: Snapshot) -> PluginRequest | None:
-    """「<トラック>に<X>を挿して」「<X>入りの(MIDI|オーディオ)トラック作って」の形だけを取り出す（名前の照合はしない）。"""
+    """Extract only requests shaped like "insert X on <track>" or "make a MIDI/audio track with X." Do not resolve the name."""
     if is_negated(utterance):
         return None
     text = normalize_phrase(utterance)
@@ -1212,7 +1212,7 @@ def _extract_plugin_request_ja(utterance: str, snapshot: Snapshot) -> PluginRequ
     insert = re.fullmatch(rf"(?:(?P<target>{target})\s*(?:に|へ|で|の)\s*)?(?P<plugin>.+?)\s*{INSERT_VERB}", text, re.IGNORECASE)
     if insert:
         track = _local_track(snapshot, insert.group("target")) if insert.group("target") else None
-        # 「オーディオトラックを追加して」「クリップを開いて」は装置の依頼ではない
+        # Requests to add an audio track or open a clip are not device requests.
         if re.search(r"トラック|クリップ|シーン", insert.group("plugin")):
             return None
         if insert.group("target") is None or track is not None:

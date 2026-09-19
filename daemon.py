@@ -1,5 +1,5 @@
 #!/opt/homebrew/bin/python3.13
-"""Live Jev の常駐プロセス。stdin/stdout は1行1 JSON。"""
+"""Live Jev background service using newline-delimited JSON over stdin and stdout."""
 
 from __future__ import annotations
 
@@ -59,7 +59,7 @@ def read_key(variable: str = "TYPESAFE_API_KEY") -> str | None:
     key = os.environ.get(variable, "").strip()
     if key:
         return key
-    # Finder から開いたアプリにはシェルの環境変数が渡らないので、シェルの設定ファイルの export 行も読む。
+    # Apps launched from Finder do not inherit shell environment variables, so also read export lines from shell configuration files.
     lines: list[str] = []
     for name in (".zshenv", ".zprofile", ".zshrc", ".bash_profile", ".bashrc", ".profile"):
         try:
@@ -359,12 +359,12 @@ BOOL_PAIRS: tuple[tuple[Action, Action], ...] = (
 )
 MONITOR_ACTIONS = {0: Action.MONITOR_IN, 1: Action.MONITOR_AUTO, 2: Action.MONITOR_OFF}
 MAX_CLIP_SLOTS = 64
-REQUIRE_CONFIRM = os.environ.get("LIVE_JEV_CONFIRM", "0") == "1"  # 実行確認は不要。必要なら LIVE_JEV_CONFIRM=1
+REQUIRE_CONFIRM = os.environ.get("LIVE_JEV_CONFIRM", "0") == "1"  # Actions need no confirmation by default. Set LIVE_JEV_CONFIRM=1 to require it.
 PLUGIN_CATALOG_PATH = Path(__file__).with_name("plugins.json")
 PLUGIN_HINT = re.compile(r"トラック|挿|差|入れ|いれ|載せ|のせ|開|立ち上げ|起動|プラグイン|シンセ|音源|エフェクト|読み込|ロード|インサート|使|\b(?:track|insert|add|load|open|put|drop|place|plugin|plug-in|synth|instrument|effect|use|apply|launch)\b", re.IGNORECASE)
 STRONG_NEGATION = re.compile(r"ないで|しなくて|するな|不要|いらない|要らない|禁止|\b(?:don't|do not|never|no need|not necessary)\b", re.IGNORECASE)
-SNAPSHOT_TRUST_SECONDS = 10.0  # この秒数以内に写しを取った/確かめたなら、曲の構成は変わっていないとみなす
-PLUGIN_LOAD_WAIT_SECONDS = 25.0  # Omnisphere・Kontakt など重い音源は読み込みに10秒以上かかる
+SNAPSHOT_TRUST_SECONDS = 10.0  # Assume the song structure is unchanged if the snapshot was taken or checked within this interval.
+PLUGIN_LOAD_WAIT_SECONDS = 25.0  # Large instruments such as Omnisphere and Kontakt can take more than 10 seconds to load.
 
 
 def load_plugin_catalog() -> tuple[str, ...]:
@@ -404,8 +404,8 @@ _DB_UP = re.compile(r"上げ|あげ|大きく|持ち上げ|\b(?:up|raise|boost|i
 
 
 def step_from_words(step: Step, utterance: str) -> Step:
-    """dB の上げ下げの向きは、Jev の答えより一言の中の言葉を優先する。
-    Jev が「3dB下げて」に step を返さなかった回があり、3 を絶対値として +3dB に書いてしまった（実測）。"""
+    """Prefer the utterance's dB direction over Jev's answer.
+    In an observed case, Jev omitted the step for "lower by 3 dB," causing 3 to be treated as an absolute value and written as +3 dB."""
     if _DB_ABSOLUTE.search(utterance):
         return Step.SET
     if _DB_DOWN.search(utterance):
@@ -416,8 +416,8 @@ def step_from_words(step: Step, utterance: str) -> Step:
 
 
 def relative_db_target(value: float, step: Step, current_display: str | None) -> float:
-    """「3dB下げて」は今の値から −3、「3dB上げて」は +3、「−3dBに」は指定値そのもの。
-    上げ下げなのに今の値が読めない（-inf dB など）ときは実行しない。数字を絶対値として書くと無音から大音量になるため。"""
+    """Treat "lower by 3 dB" as current minus 3, "raise by 3 dB" as current plus 3, and "set to -3 dB" as absolute.
+    Do not act on a relative request when the current value is unreadable, such as -inf dB; an absolute write could jump from silence to high volume."""
     if step in {Step.DOWN_SMALL, Step.DOWN_BIG, Step.UP_SMALL, Step.UP_BIG}:
         match = re.search(r"-?\d+(?:\.\d+)?", current_display or "")
         if not match or "inf" in (current_display or "").lower():
@@ -428,7 +428,7 @@ def relative_db_target(value: float, step: Step, current_display: str | None) ->
 
 
 class StaleSnapshot(Exception):
-    """写し（トラック数・名前・装置数）が今の曲と食い違っている。取り直してからやり直す。"""
+    """The snapshot's track count, names, or device counts differ from the current song. Refresh it and retry."""
 
 
 class LiveJevService:
@@ -486,8 +486,8 @@ class LiveJevService:
         with using_language(self.lang):
             if self.key is None:
                 self.key = read_key()
-            # LLM での言い換え（迷ったときの遅い車線）は公開版では使わない。
-            # 試すときだけ LIVE_JEV_LLM=1 で有効にする。無効のときは聞き返しをそのまま返す。
+            # The public build does not use slow LLM rewriting for ambiguous requests.
+            # Enable it only for experiments with LIVE_JEV_LLM=1. Otherwise return the clarification unchanged.
             if self.llm_key is None and os.environ.get("LIVE_JEV_LLM", "0") == "1":
                 self.llm_key = read_key("GEMINI_API_KEY")
             self.live = self.bridge.ping()
@@ -523,7 +523,7 @@ class LiveJevService:
         return {"jev": jev, "llm": llm, "bridge": bridge, "total": round((time.perf_counter() - started) * 1000)}
 
     def process(self, message: Mapping[str, Any]) -> dict[str, Any]:
-        """一言を処理する。曲の構成（トラック数・名前・装置数）が写しと違っていたら写しを取り直して、その一言をもう一度やり直す。"""
+        """Process one utterance. If the song structure differs from the snapshot, refresh it and retry the utterance once."""
         with using_language(self.lang):
             try:
                 return self._process_once(message)
@@ -562,7 +562,7 @@ class LiveJevService:
         if self.snapshot is None:
             return {"id": message_id, "kind": "error", "line": self._m("error.live")}
         if STRONG_NEGATION.search(text.replace("’", "'")):
-            # 打ち消しの一言は Jev にも回さない（確認なしで即実行する道具なので、聞き返しより「何もしない」が安全）
+            # Do not send negated requests to Jev. Actions run without confirmation, so doing nothing is safer than asking a follow-up.
             return {"id": message_id, "kind": "info", "line": render("info.negated", lang=self.lang), "ms": self._ms(time.perf_counter(), 0, 0, 0)}
         if self._snapshot_is_stale():
             raise StaleSnapshot()
@@ -589,8 +589,8 @@ class LiveJevService:
             request = None
         deferred_plugin: PluginRequest | None = None
         if request is not None and request.action is Action.INSERT_PLUGIN and resolve_plugin_name(request.raw_name, self._plugin_names()) is None:
-            # 「メトロノームをつけて」「ループを入れて」のように、挿す動詞は他の操作にも使う。名前が一覧にすぐ当たらないときは
-            # 先にふつうの判定を試し、決まらなかったときだけプラグインとして探す（カタカナ名はそこで Jev が一覧から選ぶ）。
+            # Insertion verbs also describe other actions, such as enabling the metronome or loop.
+            # If the name has no immediate catalog match, try normal parsing first. Search for a plug-in only if that fails; Jev then resolves katakana names against the catalog.
             deferred_plugin, request = request, None
         if request is not None:
             return self._process_plugin_request(request, text, message_id, started)
@@ -745,7 +745,7 @@ class LiveJevService:
         return [replacements.get(option, option) for option in options]
 
     def _selected_track_index(self) -> int | None:
-        """Live の画面で選択中のトラックの index（写しではなく今の値を1命令で読む）。"""
+        """Read the currently selected track index from Live in one command instead of using the snapshot."""
         request = request_id("context")
         try:
             result = self.bridge.run(["--api-session-context", request])
@@ -760,14 +760,14 @@ class LiveJevService:
         return int(match.group(1)) if match else None
 
     def _apply_selected_track(self, result: IntentResult) -> IntentResult:
-        """「選択トラック」の指定と、トラック未指定のときの既定（選択中のトラック）を解決する。"""
+        """Resolve an explicit "selected track" target and default unspecified targets to the selected track."""
         intent = result.intent
         spec = ACTIONS[intent.action]
         wants_selected = intent.track == "selected"
-        # トラック名が言われていない（track_stated が低い）なら、Jev の当て推量の track は使わず選択中のトラックにする。
-        # クリップ・デバイス・センドの頭から逆引きしたトラックはそのまま使う。
-        # 「名前を言った」と見なすのは、Jev がほぼ確信している（0.9以上）か、確からしさ 0.6 以上で言った度合いも 0.5 以上のとき。
-        # 「MIDI」のような一般語の名前は track_stated が低く出るので、確からしさ側でも救う。
+        # When track_stated is low, ignore Jev's guessed track and use the selected track.
+        # Keep tracks derived from clip, device, or send prefixes.
+        # Treat a track name as stated when Jev is at least 0.9 confident, or when confidence is at least 0.6 and track_stated is at least 0.5.
+        # Generic names such as "MIDI" produce low track_stated values, so confidence can still preserve them.
         conf = intent.track_conf if isinstance(intent.track, int) else 0.0
         named = isinstance(intent.track, int) and (conf >= 0.9 or (conf >= 0.6 and intent.track_stated >= 0.5))
         unspecified = (
@@ -1090,7 +1090,7 @@ class LiveJevService:
         return names
 
     def _process_plugin_request(self, request: PluginRequest, text: str, message_id: Any, started: float, jev_ms: int = 0) -> dict[str, Any]:
-        """外部プラグインの依頼（挿す／入りのトラックを作る）を、名前の照合→選択トラックの解決→実行まで進める。"""
+        """Handle an external plug-in request by resolving its name and selected track, then executing it."""
         catalog = self._plugin_names()
         plugin = resolve_plugin_name(request.raw_name, catalog)
         if plugin is None and catalog and self.key:
@@ -1111,7 +1111,7 @@ class LiveJevService:
         return self._execute(result.intent, message_id, jev_ms, 0, started, text, None)
 
     def _short_line(self, line: str) -> str:
-        """結果の文から先頭の「<トラック名>: 」を外す（使う人に不要な情報は出さない。対象は decision.track に残る）。"""
+        """Remove the leading "<track name>: " from result text. The target remains in decision.track, so users do not need it repeated."""
         names = [track.name for track in self.snapshot.tracks if track.name] if self.snapshot else []
         for name in sorted(names + ["マスター", "Master", "Main"], key=len, reverse=True):
             if line.startswith(f"{name}: "):
@@ -1130,7 +1130,7 @@ class LiveJevService:
     }
 
     def _run_clip_notes(self, request: ClipNotesRequest, text: str, message_id: Any, started: float) -> dict[str, Any]:
-        """クリップのノート変形（クオンタイズ・レガート・移調・強弱・ループ倍）。Live の中の部品が1回の取り消しで戻せる形で実行する。"""
+        """Transform clip notes by quantizing, applying legato, transposing, changing velocity, or doubling the loop. The Live component groups it into one undo step."""
         fields: dict[str, Any] = {}
         if request.op == "quantize":
             fields = {"grid": request.grid, "amount": request.amount}
@@ -1142,7 +1142,7 @@ class LiveJevService:
             expected = next((item for item in self.snapshot.tracks if item.index == request.track), None)
             if expected is None:
                 return {"id": message_id, "kind": "error", "line": self._m("error.named_track_missing"), "ms": self._ms(started, 0, 0, 0)}
-            fields["track_name"] = expected.name  # Live 側で名前が違えば書かずに断る（番号ずれで別トラックに書かない）
+            fields["track_name"] = expected.name  # Refuse to write if Live reports a different name, preventing an index shift from changing the wrong track.
         script_started = time.perf_counter()
         try:
             answer = plugin_script.clip_notes(request.op, request.track, request.slot, **fields)
@@ -1171,7 +1171,7 @@ class LiveJevService:
             what = self._m("clip.velocity_value", value=round(request.value)) if request.value is not None else self._m("clip.velocity_factor", value=round((request.factor or 1.0) * 100))
         else:
             what = self._m("clip.double")
-        self.previous = None  # 「元に戻す」は Live の取り消し1回で戻る
+        self.previous = None  # Live's single undo step handles this operation.
         return {
             "id": message_id, "kind": "result", "line": what,
             "decision": {"utterance": text, "rewritten": None, "action": f"clip_{request.op}", "action_label": "ノートの変形" if self.lang == "ja" else "Note transform", "track": answer.get("track") or None,
@@ -1180,8 +1180,8 @@ class LiveJevService:
         }
 
     def _bare_plugin_request(self, text: str, message_id: Any, started: float, jev_ms: int) -> dict[str, Any] | None:
-        """「Serum 2をお願い」「セラムちょうだい」のように動詞が無い頼み方。何をするか決められなかったときだけ、
-        残りの言葉が一覧のプラグイン名（別名・完全一致・部分一致）に当たるかを Jev なしで確かめ、当たれば選択トラックへ挿す。"""
+        """Handle verb-free requests equivalent to "Serum 2, please" only when the action is otherwise unresolved.
+        Match the remaining words to a plug-in alias, exact name, or partial name without Jev, then insert a match on the selected track."""
         from intent import detect_language, normalize_phrase
         if detect_language(text) == "en":
             from intent_en import normalize_english_phrase
@@ -1196,8 +1196,8 @@ class LiveJevService:
         return self._process_plugin_request(PluginRequest(Action.INSERT_PLUGIN, name, "selected", None), text, message_id, started, jev_ms)
 
     def _plugin_fallback(self, text: str, message_id: Any, started: float, jev_ms: int) -> dict[str, Any] | None:
-        """定型文に当たらず Jev が「内蔵デバイス入り」と判定して聞き返す直前の保険。
-        一言全体を Jev に渡して一覧のプラグイン名を1つ選ばせ、当たれば外部プラグインの依頼として進める（Omnisphere など）。"""
+        """Fallback before Jev asks about a suspected built-in-device request.
+        Ask Jev to choose one catalog plug-in from the full utterance, then continue a match such as Omnisphere as an external plug-in request."""
         catalog = self._plugin_names()
         if not catalog or not self.key:
             return None
@@ -1213,7 +1213,7 @@ class LiveJevService:
         return self._process_plugin_request(request, text, message_id, started, jev_ms + picked_ms)
 
     def _pick_plugin_with_jev(self, raw_name: str, catalog: tuple[str, ...]) -> tuple[str | None, int]:
-        """カタカナや略称（セラム・バルハラ）を、一覧の名前に Jev で当てる。250件ずつに分けて最も確からしい1件。"""
+        """Use Jev to match katakana or abbreviations to catalog names in batches of 250, returning the most likely match."""
         started = time.perf_counter()
         best: tuple[float, str] | None = None
         for offset in range(0, len(catalog), 240):
@@ -1240,7 +1240,7 @@ class LiveJevService:
         return None, elapsed
 
     def _plugin_notice(self, message_id: Any, text: str) -> dict[str, Any] | None:
-        """外部プラグインや「リバーブ」のような一般語での挿入依頼は、実行せず案内だけ返す。"""
+        """Return guidance without acting on insertion requests for external plug-ins or generic terms such as "reverb."""
         if not re.search(r"入り|付き|つき|載せ|のせ|挿し|さして|インサート|追加|\b(?:insert|add|load|open|put|drop|throw|place|bring up|fire up|launch|pull up|use|apply|stick|slap)\b", text, re.IGNORECASE):
             return None
         lowered = text.casefold()
@@ -1260,7 +1260,7 @@ class LiveJevService:
         return None
 
     def _undo_button(self, message_id: Any) -> dict[str, Any]:
-        """窓の「元に戻す」。Live Jev が戻せる直前の変更ならそれを戻し、戻せない種類なら Live の取り消し。"""
+        """Handle the window's Undo command. Restore the last change tracked by Live Jev, or use Live's undo for unsupported change types."""
         if self.snapshot is None:
             return {"id": message_id, "kind": "error", "line": self._m("error.live")}
         previous = self.previous
@@ -1268,8 +1268,8 @@ class LiveJevService:
             return self.process({"id": message_id, "text": "戻して"})
         started = time.perf_counter()
         from intent import _local_intent
-        # 「新しいトラック（＋デバイス）」は Live の取り消しが2〜3回ぶんになる（実測。回数は一定しない）。
-        # 回数で決め打ちせず、トラックの本数が操作前に戻るまで取り消す（最大4回）。
+            # Adding a new track and optional device takes two or three Live undo steps in observed runs; the count varies.
+            # Instead of assuming a count, undo up to four times until the track count returns to its previous value.
         target = getattr(self, "_undo_target_tracks", None)
         self._undo_target_tracks = None
         if target is not None:
@@ -1386,7 +1386,7 @@ class LiveJevService:
                         and self._same_value(self._value_before(self.snapshot, intent), expected_after)
                     )
             if intent.action in {Action.UNDO, Action.REDO}:
-                # Live の取り消し/やり直しは何が変わったか分からない。写しを取り直さないと、次の「少し上げて」が古い値から計算される（実測）。
+            # Live's undo/redo does not report what changed. Refresh the snapshot or the next relative adjustment may use a stale value, as observed in testing.
                 try:
                     self.snapshot, read_ms = self.reader.read()
                     bridge_ms += read_ms
@@ -1397,7 +1397,7 @@ class LiveJevService:
                 line += self._m("info.unchanged")
             if intent.action is Action.VOLUME:
                 old_display = before.master_display if intent.track == "master" else next(track.volume_display for track in before.tracks if track.index == intent.track)
-                # 直前の操作が「戻して」だと写しの表示が生の値（0.805391）になっている。利用者に意味が無いので付けない。
+                # After an undo request, the snapshot may contain a raw value such as 0.805391. Omit it because it is not useful to users.
                 if "dB" in str(old_display) or "inf" in str(old_display):
                     line += self._m("info.from_value", value=old_display)
             if write_unknown:
@@ -1432,8 +1432,8 @@ class LiveJevService:
         }
 
     def _snapshot_is_stale(self) -> bool:
-        """写しが古くなっていないかを1命令（装置一覧・約100ms）で確かめる。最後の写し取り/確認から10秒以内なら見ない。
-        別の曲を開いた・トラックを手で足した/消した/改名した・装置を手で足した、を拾うため。"""
+        """Check snapshot freshness with one device-list command, which takes about 100 ms; skip it within 10 seconds of the last snapshot or validation.
+        This detects a different song, manually added, removed, or renamed tracks, and manually added devices."""
         assert self.snapshot is not None
         if time.time() - self.snapshot.taken_at < SNAPSHOT_TRUST_SECONDS:
             return False
@@ -1500,7 +1500,7 @@ class LiveJevService:
         return any(ack.event == event and (prop is None or ack.property == prop) for ack in result.acks)
 
     def _read_until(self, batch: list[str], expected: float | bool | None) -> BridgeResult:
-        """書き込み直後は Live 側の反映前の値が返ることがあるので、期待値になるまで最大350ms読み直す。"""
+        """Live may return the old value immediately after a write, so reread for up to 350 ms until the expected value appears."""
         started = time.monotonic()
         all_acks: list[Ack] = []
         elapsed_ms = 0
@@ -1800,9 +1800,9 @@ class LiveJevService:
     }
 
     def _run_plugin_flow(self, intent: Intent, before: Snapshot) -> int:
-        """既存トラックへ挿す（plugin）か、トラックを足して挿す（plugin_track）。どちらも Live の中の部品が Live と同じ作法で行う:
-        新しいトラックは選択中のトラックの右・既定名のまま（音源を入れると Live がその名前に変える）、
-        エフェクトは選択中の装置の後ろ、音源は既存の音源と入れ替え。部品の返事に装置名があれば、その場で成功とする。"""
+        """Insert a plug-in on an existing track or add a track and insert it, following Live's behavior.
+        New tracks appear right of the selected track with a default name; effects follow the selected device and instruments replace the existing one.
+        If the component returns a device name, treat the operation as successful immediately."""
         started = time.perf_counter()
         plugin = str(intent.plugin)
         try:
@@ -1815,7 +1815,7 @@ class LiveJevService:
         except plugin_script.ScriptError as error:
             if "main_thread_timeout" not in str(error):
                 raise ValueError(self.SCRIPT_LOAD_ERRORS.get(str(error), str(error))) from error
-            answer = {}  # 重い音源は読み込みに時間がかかるだけ。装置が現れるまで下の読み直しで待つ。
+            answer = {}  # Large instruments may simply need more loading time. Keep rereading below until the device appears.
         track_index = answer.get("track_index")
         loaded = [str(name) for name in answer.get("devices_after") or []]
         deadline = time.monotonic() + PLUGIN_LOAD_WAIT_SECONDS
@@ -1842,7 +1842,7 @@ class LiveJevService:
         return round((time.perf_counter() - started) * 1000)
 
     def _run_add_track_via_script(self, intent: Intent) -> int:
-        """トラック追加（と内蔵デバイス入り）を Live の中の部品で行う。位置と名前は Live の作法どおり。"""
+        """Add a track and optional built-in device through the component inside Live, following Live's positioning and naming behavior."""
         started = time.perf_counter()
         audio = intent.action is Action.ADD_AUDIO_TRACK or intent.text == "audio"
         name = None if intent.text == "audio" else (intent.text or None)
@@ -1855,7 +1855,7 @@ class LiveJevService:
         return round((time.perf_counter() - started) * 1000)
 
     def _rollback_added_track(self) -> None:
-        """「トラックを足してからプラグイン」の途中で失敗したとき、足したトラックを Live の取り消しで消す。"""
+        """If adding a plug-in after a new track fails midway, remove the added track with Live's undo."""
         try:
             self.bridge.run(["--write", "--api-call", "live_set", "undo", "[]", request_id("undo")])
             self.snapshot, _ = self.reader.read()

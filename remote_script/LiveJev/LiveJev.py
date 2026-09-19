@@ -1,18 +1,18 @@
 # Live Jev ⇄ Ableton Live（Remote Script）。
 #
-# 目的: Max for Live の橋渡しからは届かない「ブラウザ」（プラグイン一覧と読み込み）を
-# Live の中の Python から扱う。受ける命令はこの3つだけ。
+# Purpose: access the browser for plug-in listing and loading from Python inside Live,
+# because the Max for Live bridge cannot reach it. Only the following commands are accepted.
 #
 #   ping          → pong
-#   list_plugins  → ブラウザの Plug-ins / Instruments / Audio Effects / MIDI Effects の一覧
-#   load          → 指定トラックを選択状態にして、名前が一致する項目を1つ読み込む
-#   add_track     → 選択中のトラックの右に MIDI/オーディオトラックを1本足す（Live の「トラックを挿入」と同じ位置）。
-#                   名前は付けない（Live の既定名のまま＝音源を入れるとその名前に変わる）。device があれば続けて読み込む。1回の取り消しで戻る
-#   clip_notes    → 開いているクリップ（または指定スロット）のノートを変形する
-#                   （quantize / legato / transpose / velocity / duplicate_loop）。1回の取り消しで戻る
+#   list_plugins  -> list browser entries under Plug-ins / Instruments / Audio Effects / MIDI Effects
+#   load          -> select the requested track and load one item with an exact name match
+#   add_track     -> add one MIDI/audio track to the right of the selected track, matching Live's Insert Track position
+#                    Leave the default name unchanged, so loading an instrument can rename it. Load device if provided. One undo reverts it.
+#   clip_notes    -> transform notes in the open clip or specified slot
+#                    (quantize / legato / transpose / velocity / duplicate_loop). One undo reverts it.
 #
-# 127.0.0.1:9140 で JSON 1行ずつ（TCP、1接続1命令と常時接続の両方）。他の Remote Script と同じ型。
-# Live のログ（~/Library/Preferences/Ableton/Live 12.x/Log.txt）に "LiveJev:" で出す。
+# Newline-delimited JSON over TCP at 127.0.0.1:9140, supporting both one command per connection and persistent connections. Follows other Remote Scripts.
+# Write entries prefixed with "LiveJev:" to Live's log at ~/Library/Preferences/Ableton/Live 12.x/Log.txt.
 
 import json
 import math
@@ -32,8 +32,8 @@ SECTIONS = ("plugins", "instruments", "audio_effects", "midi_effects")
 
 
 def _safe(read, default):
-    # Live の項目は「持っていない種類のトラック」で AttributeError ではなく RuntimeError を投げる
-    # （マスターの crossfade_assign、グループトラックの arm、畳めないトラックの fold_state など）。
+# Live properties raise RuntimeError, not AttributeError, for track types that do not support them,
+# such as crossfade_assign on the master, arm on group tracks, and fold_state on tracks that cannot fold.
     try:
         return read()
     except Exception:
@@ -51,7 +51,7 @@ class LiveJev(ControlSurface):
         self._start_polling()
         self.log_message("LiveJev: started, listening on port %d" % SOCKET_PORT)
 
-    # ---- 通信の待受 --------------------------------------------------------------
+# ---- Network listener ---------------------------------------------------------
 
     def _start_polling(self):
         self._running = True
@@ -517,7 +517,7 @@ class LiveJev(ControlSurface):
             except StopIteration as done:
                 return done.value
 
-    # ---- ブラウザ ----------------------------------------------------------------
+# ---- Browser -----------------------------------------------------------------
 
     def _browser(self):
         return Live.Application.get_application().browser
@@ -613,11 +613,11 @@ class LiveJev(ControlSurface):
         if item is None:
             return {"ok": False, "error": "browser_item_missing", "name": entry["name"]}
         browser = self._browser()
-        # ホットスワップ中（装置の Q ボタン）に load_item すると、その装置が置き換わってしまう。置き換えはしない。
+    # Calling load_item during hot-swap, opened with a device's Q button, replaces that device. Never replace it.
         hotswap = getattr(browser, "hotswap_target", None)
         if hotswap is not None:
             return {"ok": False, "error": "hotswap_active", "name": entry["name"]}
-        # 挿入位置は Live に任せる（ブラウザでダブルクリックしたときと同じ: エフェクトは選択中の装置の後ろ、音源は既存の音源と入れ替え）。
+    # Let Live choose the insertion point, as it does on a browser double-click: effects follow the selected device, and instruments replace the existing instrument.
         target = song.view.selected_track
         before = [str(d.name) for d in target.devices]
         browser.load_item(item)
@@ -662,9 +662,9 @@ class LiveJev(ControlSurface):
         finally:
             song.end_undo_step()
 
-    # ---- クリップのノート ----------------------------------------------------------
+# ---- Clip notes --------------------------------------------------------------
 
-    # Live の RecordingQuantization と同じ並び（clip.quantize の第1引数）
+# Same order as Live's RecordingQuantization, used as the first clip.quantize argument.
     GRIDS = {"1/4": 1, "1/8": 2, "1/8t": 3, "1/8+t": 4, "1/16": 5, "1/16t": 6, "1/16+t": 7, "1/32": 8}
 
     def _target_clip(self, track_index, slot_index):
