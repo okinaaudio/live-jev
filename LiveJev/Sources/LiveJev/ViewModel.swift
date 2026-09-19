@@ -17,6 +17,9 @@ struct ResultItem {
 
 @MainActor
 final class ViewModel {
+    var onSetupMessage: ((DaemonMessage) -> Void)?
+    var onSetupConnection: ((String?) -> Void)?
+
     var onChange: (() -> Void)?
 
     private(set) var isLiveConnected = false
@@ -46,6 +49,7 @@ final class ViewModel {
         }
         client.onConnectionChange = { [weak self] connected, line in
             guard let self else { return }
+            self.onSetupConnection?(line)
             self.isLiveConnected = connected
             if let line {
                 self.statusLine = line
@@ -88,6 +92,14 @@ final class ViewModel {
         statusLine = text(.refreshing)
         onChange?()
         client.send(.refresh(id: makeID()))
+    }
+
+    func pollSetupStatus() {
+        client.send(.status(id: "setup-\(makeID())"))
+    }
+
+    func restartDaemon() {
+        client.restart()
     }
 
     func checkLiveStatus() {
@@ -135,6 +147,7 @@ final class ViewModel {
     }
 
     private func receive(_ message: DaemonMessage) {
+        onSetupMessage?(message)
         switch message {
         case let .status(status):
             isLiveConnected = status.live
@@ -163,6 +176,8 @@ final class ViewModel {
             }
             addResult(kind: .info, requestID: message.id, line: message.line, milliseconds: message.ms?.total)
         case let .error(message):
+            // Setup polling failures belong in Setup, not in the pill's command history.
+            if message.id?.hasPrefix("setup-") == true { return }
             _ = finishPendingUndo(id: message.id)
             addResult(kind: .error, requestID: message.id, line: message.line, milliseconds: message.ms?.total)
         }

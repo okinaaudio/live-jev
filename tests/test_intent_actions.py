@@ -145,7 +145,12 @@ class IntentAndActionsTests(unittest.TestCase):
                     service = LiveJevService(bridge=bridge, snapshot=self.snapshot, key="x", requester=lambda _p, _k: mocked)
                     with mock.patch("daemon.request_id", side_effect=lambda kind: kind):
                         self.assertEqual(service.process({"text": utterance})["kind"], "result")
-                    self.assertEqual(bridge.calls, expected_arguments)
+                    # The search probes str_for_value only; the fader is written exactly once, after the last probe.
+                    writes = [index for index, call in enumerate(bridge.calls) if "--api-parameter-set" in call]
+                    probes = [index for index, call in enumerate(bridge.calls) if "str_for_value" in call]
+                    self.assertEqual(len(writes), 1, bridge.calls)
+                    self.assertGreater(writes[0], max(probes))
+                    self.assertAlmostEqual(bridge.value, 0.95, places=2)  # the fake display has 0.1 dB resolution
                     continue
                 if expected_action is Action.NONE:
                     self.assertGreater(result.intent.needs_generation, 0.5)
@@ -291,6 +296,25 @@ class IntentAndActionsTests(unittest.TestCase):
 
     def test_registry_covers_every_action(self) -> None:
         self.assertEqual(set(ACTIONS), set(Action))
+
+    def test_literal_track_names_win_over_multi_track_syntax(self) -> None:
+        names = ("Pad", "Bass", "Bass以外", "Bass only", "All Drums", "1 to 3", "Everything But The Girl")
+        base = self.snapshot.tracks[0]
+        tracks = tuple(replace(base, index=index, name=name, path=f"live_set tracks {index}") for index, name in enumerate(names))
+        snapshot = replace(self.snapshot, tracks=tracks)
+        cases = (
+            ("Bass以外をミュート", 2),
+            ("solo Bass only", 3),
+            ("mute All Drums", 4),
+            ("mute 1 to 3", 5),
+            ("mute Everything But The Girl", 6),
+        )
+        for text, expected in cases:
+            with self.subTest(text=text):
+                intent = parse_local(text, snapshot)
+                self.assertIsNotNone(intent)
+                self.assertEqual(intent.track, expected)
+                self.assertEqual(intent.tracks, ())
 
     def test_get_that_build_commands_would_send_first_is_a_separate_call(self) -> None:
         mute = interpret_response(self.snapshot, "ドラムをミュート", response("mute", "t2")).intent

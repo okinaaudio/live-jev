@@ -86,6 +86,10 @@ class TargetOrigin(Enum):
     OWNER = "owner"
     PREVIOUS = "previous"
     MASTER = "master"
+    RANGE = "range"
+    ALL = "all"
+    EXCEPT = "except"
+    ONLY = "only"
 
 
 @dataclass(frozen=True)
@@ -128,6 +132,7 @@ class Intent:
     utterance: str = ""
     clip_name: str | None = None
     clip_path: str | None = None
+    tracks: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -591,6 +596,7 @@ def _local_intent(
     device_name: str | None = None,
     target_origin: TargetOrigin | None = None,
     utterance: str = "",
+    tracks: tuple[int, ...] = (),
 ) -> Intent:
     origin = target_origin or (TargetOrigin.MASTER if track == "master" else TargetOrigin.SELECTED if track == "selected" else TargetOrigin.NAMED if isinstance(track, int) else TargetOrigin.NONE)
     evidence = (1.0 if origin in {TargetOrigin.NAMED, TargetOrigin.MASTER} else 0.0) if track_stated is None else track_stated
@@ -623,10 +629,94 @@ def _local_intent(
         # "this track" / "it" points at the selection without naming anything, so it must pass the gate as SELECTED.
         named_evidence=0.0 if track == "selected" else evidence,
         utterance=utterance,
+        tracks=tracks,
     )
 
 
 SELECTED_WORDS = re.compile(r"^(?:選択(?:中の|した)?トラック|今のトラック|このトラック|現在のトラック)$")
+MULTI_TOGGLE_ACTIONS = frozenset({Action.MUTE, Action.UNMUTE, Action.SOLO, Action.UNSOLO, Action.ARM, Action.DISARM})
+MULTI_TARGET_ORIGINS = frozenset({TargetOrigin.RANGE, TargetOrigin.ALL, TargetOrigin.EXCEPT, TargetOrigin.ONLY})
+
+
+def eligible_track_indices(snapshot: Snapshot) -> tuple[int, ...]:
+    return tuple(track.index for track in snapshot.tracks if not is_bridge_track(track))
+
+
+def _track_aliases(snapshot: Snapshot) -> dict[str, int]:
+    resolved: dict[str, int] = {}
+    aliases = load_aliases()
+    for track in snapshot.tracks:
+        if is_bridge_track(track):
+            continue
+        resolved[track.name.casefold()] = track.index
+        for alias in aliases.get(track.name, ()):
+            resolved[alias.casefold()] = track.index
+    return resolved
+
+
+def resolve_multi_endpoint(snapshot: Snapshot, value: str) -> int | None:
+    token = value.strip().strip("「」\"'")
+    numbered = re.fullmatch(r"(?:トラック\s*)?(\d+)(?:\s*番目(?:のトラック)?|\s*番トラック)?", token, re.IGNORECASE)
+    if numbered:
+        index = int(numbered.group(1)) - 1
+        return index if index in eligible_track_indices(snapshot) else None
+    return _track_aliases(snapshot).get(token.casefold())
+
+
+def _multi_action_ja(value: str) -> Action | None:
+    compact = re.sub(r"\s+", "", value)
+    if re.search(r"ミュート(?:を)?(?:全部)?(?:解除|外し)", compact):
+        return Action.UNMUTE
+    if re.search(r"ソロ(?:を)?(?:全部)?(?:解除|外し)", compact):
+        return Action.UNSOLO
+    if re.search(r"(?:アーム|録音待機)(?:を)?(?:全部)?(?:解除|外し)", compact):
+        return Action.DISARM
+    pairs = (
+        (Action.UNMUTE, ("ミュート解除", "ミュートを外し", "ミュート外し")),
+        (Action.UNSOLO, ("ソロ解除", "ソロを外し", "ソロ外し")),
+        (Action.DISARM, ("アーム解除", "アームを外し", "アーム外し", "録音待機解除")),
+        (Action.MUTE, ("ミュート",)),
+        (Action.SOLO, ("ソロ",)),
+        (Action.ARM, ("アーム", "録音待機")),
+    )
+    return next((action for action, words in pairs if any(word in compact for word in words)), None)
+
+
+def _parse_multi_ja(text: str, snapshot: Snapshot) -> Intent | None:
+    action = _multi_action_ja(text)
+    if action is None:
+        return None
+    literal = next((track for track in sorted(snapshot.tracks, key=lambda item: len(item.name), reverse=True) if track.name and text.startswith(track.name)), None)
+    if literal is not None and re.fullmatch(re.escape(literal.name) + r"を?(?:ミュート|ソロ|アーム|録音待機)(?:解除)?(?:して|に)?", text):
+        return None
+    eligible = eligible_track_indices(snapshot)
+    range_match = re.fullmatch(r"(?:(?:トラック)\s*)?(?P<start>.+?)\s*(?:から|[~〜～])\s*(?P<end>.+?)(?:\s*まで)?\s*(?:を)?\s*(?:ミュート(?:解除)?|ソロ(?:解除)?|アーム(?:解除)?|録音待機(?:解除)?)(?:して|に)?", text, re.IGNORECASE)
+    if range_match:
+        start = resolve_multi_endpoint(snapshot, range_match.group("start"))
+        end = resolve_multi_endpoint(snapshot, range_match.group("end"))
+        tracks = () if start is None or end is None else tuple(index for index in eligible if min(start, end) <= index <= max(start, end))
+        return _local_intent(action, tracks=tracks, target_origin=TargetOrigin.RANGE, track_stated=1.0)
+    except_match = re.fullmatch(r"(?P<target>.+?)以外(?:を)?(?:全部)?\s*(?:ミュート|ソロ|アーム|録音待機)(?:解除)?(?:して|に)?", text)
+    if except_match:
+        raw = except_match.group("target").strip()
+        selected = raw in {"これ", "このトラック", "選択中", "選択中のトラック"}
+        excluded = "selected" if selected else resolve_multi_endpoint(snapshot, raw)
+        tracks = () if not isinstance(excluded, int) else tuple(index for index in eligible if index != excluded)
+        return _local_intent(action, track=excluded if selected else None, tracks=tracks, target_origin=TargetOrigin.EXCEPT, track_stated=0.0 if selected else 1.0)
+    only_match = re.fullmatch(r"(?P<target>.+?)だけ\s*(?:を)?\s*(?:ソロ|アーム|録音待機)(?:して|に)?", text)
+    if only_match and action in {Action.SOLO, Action.ARM}:
+        raw = only_match.group("target").strip()
+        selected = raw in {"これ", "このトラック", "選択中", "選択中のトラック"}
+        target = "selected" if selected else resolve_multi_endpoint(snapshot, raw)
+        return _local_intent(action, track=target if selected else None, tracks=(target,) if isinstance(target, int) else (), target_origin=TargetOrigin.ONLY, track_stated=0.0 if selected else 1.0)
+    all_match = re.fullmatch(
+        r"(?:(?:全部|全トラック(?:を)?|すべての?)(?:の)?\s*(?:ミュート|ソロ|アーム|録音待機)(?:を)?(?:全部)?(?:解除|外して|外し)?(?:して|に)?|"
+        r"(?:ミュート|ソロ|アーム|録音待機)(?:を)?全部(?:解除|外して|外し))",
+        text,
+    )
+    if all_match:
+        return _local_intent(action, tracks=eligible, target_origin=TargetOrigin.ALL, track_stated=1.0)
+    return None
 
 
 def _local_track(snapshot: Snapshot, text: str) -> "int | None | Literal['selected']":
@@ -706,7 +796,7 @@ def _parse_local_ja(utterance: str, snapshot: Snapshot) -> Intent | None:
         return _local_intent(Action.STOP)
     if re.fullmatch(r"(?:戻して|元に戻して|取り消し(?:て)?)", text):
         return _local_intent(Action.NONE, refers_previous=1.0)
-    if re.fullmatch(r"(?:もう少し|もうちょい)", text):
+    if re.fullmatch(r"(?:もう少し|もうちょい|もう一回|もう一度)", text):
         return _local_intent(Action.NONE, refers_previous=1.0)
 
     with_device = re.fullmatch(
@@ -754,6 +844,10 @@ def _parse_local_ja(utterance: str, snapshot: Snapshot) -> Intent | None:
     if master_volume:
         step = Step.DOWN_SMALL if master_volume.group("direction") in {"下げ", "さげ"} else Step.UP_SMALL
         return _local_intent(Action.VOLUME, track="master", step=step)
+
+    multi = _parse_multi_ja(text, snapshot)
+    if multi is not None:
+        return multi
 
     named_tracks = [track for track in snapshot.tracks if not is_bridge_track(track)]
     target_pattern = (
@@ -893,6 +987,10 @@ def _parse_local_ja(utterance: str, snapshot: Snapshot) -> Intent | None:
     unknown_volume = re.fullmatch(r"(?P<target>.+?)(?:の音量)?(?:を)?\s*(?:少し|ちょっと|ちょい)?\s*(?P<direction>上げ|あげ|下げ|さげ)(?:て)?", text)
     if unknown_volume:
         target_text = unknown_volume.group("target").strip()
+        # "1-MIDIを3dB下げて" lands here with the amount inside the target text; that is a value phrase for Jev,
+        # not an unknown track name, and refusing it locally also threw the amount away.
+        if re.search(r"\d\s*(?:dB|デシベル|%|％)", target_text, re.IGNORECASE):
+            return None
         track = _local_track(snapshot, target_text)
         if track is None and not any(item.name and item.name.casefold() in target_text.casefold() for item in named_tracks):
             return None
@@ -912,6 +1010,47 @@ def parse_local(utterance: str, snapshot: Snapshot) -> Intent | None:
         from intent_en import parse_local_en
         parsed = parse_local_en(utterance, snapshot)
     return replace(parsed, utterance=utterance) if parsed is not None else None
+
+
+def split_compound(text: str, snapshot: Snapshot) -> list[str]:
+    """Split a command without cutting quoted text or known Live object names."""
+    protected: list[tuple[int, int]] = []
+    for match in re.finditer(r'"[^"\n]*"|\'[^\'\n]*\'', text):
+        protected.append(match.span())
+    names = [track.name for track in snapshot.tracks if track.name]
+    names += [device.name for track in snapshot.tracks for device in track.devices if device.name]
+    for name in sorted(names, key=len, reverse=True):
+        for match in re.finditer(re.escape(name), text, re.IGNORECASE):
+            protected.append(match.span())
+    rename = re.search(r"(?:名前|トラック名).+?(?:にして|に変えて|改名|リネーム)|\brename\b.+?\bto\b.+$", text, re.IGNORECASE)
+    if rename:
+        protected.append(rename.span())
+
+    def covered(start: int, end: int) -> bool:
+        return any(start >= left and end <= right for left, right in protected)
+
+    separator = re.compile(
+        # Longest connectors first: a bare "," would otherwise win over ", then" and leave "then" at the head of the next clause.
+        # Punctuation between digits is a decimal point ("-6.5 dB"), not a boundary.
+        r"(?:してから|して、|して|それから|そして|それと|ついでに|あと|\s*[,;]\s*(?:and\s+)?(?:then|also)\s+|\s*,\s*and\s+|\s+and\s+then\s+|\s+and\s+also\s+|\s+then\s+|\s+and\s+|(?<!\d)[,.;](?!\d)|[、。])",
+        re.IGNORECASE,
+    )
+    operation = re.compile(r"\b(?:mute|unmute|solo|unsolo|arm|disarm|pan|lower|raise|increase|decrease|rename|play|stop)\b|(?:ミュート|ソロ|アーム|下げ|上げ|改名|再生|停止|止め)", re.IGNORECASE)
+    boundaries = [match for match in separator.finditer(text) if not covered(*match.span())]
+    if not boundaries:
+        return [text.strip()]
+    clauses: list[str] = []
+    start = 0
+    for boundary in boundaries:
+        left = text[start:boundary.start()].strip()
+        right = text[boundary.end():].strip()
+        if left and right and operation.search(left) and operation.search(right):
+            clauses.append(left)
+            start = boundary.end()
+    tail = text[start:].strip()
+    if clauses and tail:
+        clauses.append(tail)
+    return clauses if 1 < len(clauses) <= 4 else ([] if len(clauses) > 4 else [text.strip()])
 
 
 def _score(answer: Any, field: str) -> float:

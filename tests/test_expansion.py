@@ -19,24 +19,39 @@ class RecordingBridge:
 
     def __init__(self) -> None:
         self.calls: list[list[str]] = []
+        self.values = {}
+        self.names = {"live_set tracks 0": "Pad", "live_set tracks 1": "Bass", "live_set tracks 2": "Drums",
+                      "live_set tracks 0 devices 0": "Reverb", "live_set tracks 1 devices 0": "Reverb"}
 
     def run(self, arguments):
         arguments = list(arguments)
         self.calls.append(arguments)
-        if "--api-set" in arguments or "--api-call" in arguments or "--tempo" in arguments:
+        if "--api-set" in arguments:
+            at = arguments.index("--api-set")
+            path, prop, raw = arguments[at + 1:at + 4]
+            self.values[(path, prop)] = float(raw) if prop in {"current_song_time", "gain"} else bool(int(float(raw)))
+            return BridgeResult((), 1, 0, False)
+        if "--api-parameter-set" in arguments:
+            at = arguments.index("--api-parameter-set")
+            path, raw = arguments[at + 1:at + 3]
+            self.values[(path, "value")] = float(raw)
+            return BridgeResult((), 1, 0, False)
+        if "--rename-track-index" in arguments:
+            at = arguments.index("--rename-track-index")
+            self.names[f"live_set tracks {arguments[at + 1]}"] = arguments[at + 3]
+            return BridgeResult((), 1, 0, False)
+        if "--api-call" in arguments or "--tempo" in arguments:
             return BridgeResult((), 1, 0, False)
         at = arguments.index("--api-get")
         path, prop, request_id = arguments[at + 1], arguments[at + 2], arguments[at + 3]
-        names = {"live_set tracks 0": "Pad", "live_set tracks 1": "Bass", "live_set tracks 2": "Drums",
-                 "live_set tracks 0 devices 0": "Reverb", "live_set tracks 1 devices 0": "Reverb"}
         if prop == "name":
-            payload = names[path]
+            payload = self.names[path]
         elif prop == "current_song_time":
             payload = 64.0
         elif prop == "current_monitoring_state":
             payload = 0
         else:
-            payload = 1
+            payload = self.values.get((path, prop), False)
         return BridgeResult((Ack("api_get", request_id, payload, path, prop),), 1, 0, False)
 
 
@@ -81,6 +96,60 @@ class LocalPhraseTests(unittest.TestCase):
         self.assertEqual(parse_number("17小節から", Action.JUMP_TO_BAR), Number(17.0, "raw"))
         self.assertEqual(parse_number("頭から", Action.JUMP_TO_BAR), Number(1.0, "raw"))
         self.assertIsNone(parse_number("-6dBに", Action.JUMP_TO_BAR))
+
+    def test_multi_track_range_all_except_and_only_phrases(self) -> None:
+        from intent import TargetOrigin
+
+        base = _snapshot_with_song()
+        names = ("Kick", "Pad", "Keys", "Vox", "FX", "Bass")
+        tracks = tuple(
+            replace(base.tracks[min(index, 2)], index=index, name=name, path=f"live_set tracks {index}")
+            for index, name in enumerate(names)
+        )
+        snapshot = replace(base, tracks=tracks)
+        cases = {
+            "3から6までミュート": (Action.MUTE, (2, 3, 4, 5), TargetOrigin.RANGE),
+            "トラック3から6をソロ": (Action.SOLO, (2, 3, 4, 5), TargetOrigin.RANGE),
+            "KickからBassまでミュート": (Action.MUTE, (0, 1, 2, 3, 4, 5), TargetOrigin.RANGE),
+            "全部ミュート解除": (Action.UNMUTE, (0, 1, 2, 3, 4, 5), TargetOrigin.ALL),
+            "ソロを全部外して": (Action.UNSOLO, (0, 1, 2, 3, 4, 5), TargetOrigin.ALL),
+            "Bass以外全部ミュート": (Action.MUTE, (0, 1, 2, 3, 4), TargetOrigin.EXCEPT),
+            "Bassだけソロ": (Action.SOLO, (5,), TargetOrigin.ONLY),
+            "mute tracks 3 to 6": (Action.MUTE, (2, 3, 4, 5), TargetOrigin.RANGE),
+            "mute Kick through Bass": (Action.MUTE, (0, 1, 2, 3, 4, 5), TargetOrigin.RANGE),
+            "unmute everything": (Action.UNMUTE, (0, 1, 2, 3, 4, 5), TargetOrigin.ALL),
+            "clear all solos": (Action.UNSOLO, (0, 1, 2, 3, 4, 5), TargetOrigin.ALL),
+            "solo everything but Bass": (Action.SOLO, (0, 1, 2, 3, 4), TargetOrigin.EXCEPT),
+            "solo only Bass": (Action.SOLO, (5,), TargetOrigin.ONLY),
+        }
+        for text, expected in cases.items():
+            with self.subTest(text=text):
+                intent = parse_local(text, snapshot)
+                self.assertIsNotNone(intent)
+                self.assertEqual((intent.action, intent.tracks, intent.target_origin), expected)
+
+        for text in ("全部止めて", "stop all clips"):
+            with self.subTest(text=text):
+                self.assertIs(parse_local(text, snapshot).action, Action.STOP_ALL_CLIPS)
+        self.assertEqual(parse_local("全体を下げて", snapshot).track, "master")
+
+    def test_compound_split_prefers_long_connectors_and_keeps_decimals(self) -> None:
+        from intent import split_compound
+        snapshot = _snapshot_with_song()
+        self.assertEqual(split_compound("mute Pad, then solo Drums and arm Bass", snapshot), ["mute Pad", "solo Drums", "arm Bass"])
+        self.assertEqual(split_compound("mute Pad; and then solo Drums", snapshot), ["mute Pad", "solo Drums"])
+        self.assertEqual(split_compound("lower Pad by 2.5 dB and mute Bass", snapshot), ["lower Pad by 2.5 dB", "mute Bass"])
+        self.assertEqual(split_compound("Padを2.5dB下げて", snapshot), ["Padを2.5dB下げて"])
+
+    def test_compound_split_masks_names_quotes_and_rename_destinations(self) -> None:
+        from intent import split_compound
+
+        base = _snapshot_with_song()
+        snapshot = replace(base, tracks=(replace(base.tracks[0], name="Drum and Bass"),) + base.tracks[1:])
+        self.assertEqual(split_compound("mute Pad and solo Bass", base), ["mute Pad", "solo Bass"])
+        self.assertEqual(split_compound("PadをミュートしてBassをソロ", base), ["Padをミュート", "Bassをソロ"])
+        self.assertEqual(split_compound("mute Drum and Bass", snapshot), ["mute Drum and Bass"])
+        self.assertEqual(split_compound("rename Bass to Rock and Roll", base), ["rename Bass to Rock and Roll"])
 
 
 class ApplyAndAllowlistTests(unittest.TestCase):
@@ -647,11 +716,20 @@ class SelectedTrackTests(unittest.TestCase):
             if "--api-mixer-status" in arguments:
                 self.calls.append(arguments)
                 target, request = arguments[-2], arguments[-1]
-                payload = {"parameters": {"volume": {"path": f"live_set tracks {target} mixer_device volume", "value": 0.55, "display": "-8.0 dB"}, "panning": {"path": f"live_set tracks {target} mixer_device panning", "value": 0.0, "display": "C"}}}
+                prefix = "live_set master_track" if target == "master" else f"live_set tracks {target}"
+                volume_path = f"{prefix} mixer_device volume"
+                pan_path = f"{prefix} mixer_device panning"
+                volume = self.values.get((volume_path, "value"), 0.75 if target == "master" else 0.55)
+                pan = self.values.get((pan_path, "value"), 0.0)
+                payload = {"parameters": {"volume": {"path": volume_path, "value": volume, "display": f"{volume:g}"}, "panning": {"path": pan_path, "value": pan, "display": f"{pan:g}"}}}
                 return BridgeResult((Ack("api_mixer_status", request, payload),), 1, 0, False)
-            if "--api-get" not in arguments:
+            if "--api-device-parameters" in arguments:
                 self.calls.append(arguments)
-                return BridgeResult((), 1, 0, False)
+                at = arguments.index("--api-device-parameters")
+                path, request = arguments[at + 1:at + 3]
+                parameter_path = f"{path} parameters 0"
+                value = self.values.get((parameter_path, "value"), 1.0)
+                return BridgeResult((Ack("api_device_parameters", request, {"parameters": [{"path": parameter_path, "value": value}]}, path),), 1, 0, False)
             return super().run(arguments)
 
     def _service(self, requester, snapshot=None, **kwargs):
@@ -783,6 +861,66 @@ class SelectedTrackTests(unittest.TestCase):
             bridge, service = self._service(lambda *_: (_ for _ in ()).throw(AssertionError("Jev")))
             answer = service.process({"id": "1", "text": text})
             self.assertEqual((answer["kind"], answer["decision"]["track"]), ("result", "Bass"), text)
+
+    def test_named_track_with_db_amount_is_not_refused_locally(self) -> None:
+        snapshot = _snapshot_with_song()
+        for text in ("Bassを3dB下げて", "Bassの音量を3dB上げて", "Padを2.5デシベル下げて"):
+            self.assertIsNone(parse_local(text, snapshot), text)
+        named = parse_local("Bassを少し下げて", snapshot)
+        self.assertEqual((named.action, named.track), (Action.VOLUME, 1))
+
+    def test_every_undo_phrasing_restores_a_chain_without_live_undo(self) -> None:
+        from tests.support import StatefulLive
+        for phrase in ("undo that", "undo", "take that back", "元に戻して", "取り消して"):
+            live = StatefulLive()
+            service = LiveJevService(bridge=live, snapshot=_snapshot_with_song(), key="x", llm_key=None,
+                                     requester=lambda *_: (_ for _ in ()).throw(AssertionError("Jev")))
+            self.assertEqual(service.process({"id": "1", "text": "mute Pad and solo Drums"})["kind"], "result", phrase)
+            self.assertEqual((live.flags("mute")["Pad"], live.flags("solo")["Drums"]), (True, True), phrase)
+            live.calls.clear()
+            answer = service.process({"id": "2", "text": phrase})
+            self.assertEqual(answer["kind"], "result", (phrase, answer))
+            self.assertFalse(any("--api-call" in call for call in live.calls), phrase)
+            self.assertFalse(any(live.flags("mute").values()) or any(live.flags("solo").values()), phrase)
+
+    def test_stateful_chain_failures_leave_nothing_behind(self) -> None:
+        from bridge_client import BridgeError
+        from tests.support import StatefulLive
+
+        def build():
+            live = StatefulLive()
+            service = LiveJevService(bridge=live, snapshot=_snapshot_with_song(), key="x", llm_key=None,
+                                     requester=lambda *_: (_ for _ in ()).throw(AssertionError("Jev")))
+            return live, service
+
+        live, service = build()
+        plain_run = live.run
+
+        def drift(arguments):
+            if live.state[(0, "mute")]:
+                live.names[1] = "Bass2"
+            return plain_run(arguments)
+
+        live.run = drift
+        answer = service.process({"id": "1", "text": "mute Pad and solo Bass"})
+        self.assertNotEqual(answer["kind"], "result", answer)
+        self.assertFalse(any(live.flags("mute").values()) or any(live.flags("solo").values()), answer)
+
+        live, service = build()
+        service.process({"id": "0", "text": "solo Pad"})
+        self.assertEqual(service.process({"id": "1", "text": "unmute all and mute Bass"})["kind"], "result")
+        service.process({"id": "2", "text": "元に戻して"})
+        self.assertEqual((live.flags("solo")["Pad"], live.flags("mute")["Bass"]), (True, False), "undoing the chain must not undo the earlier solo")
+
+        live, service = build()
+        live.state[(0, "mute")] = True
+        service.process({"id": "1", "text": "unmute all"})
+        self.assertFalse(any(live.flags("mute").values()), "the live value, not the stale snapshot, decides what to write")
+
+        live, service = build()
+        live.state[(1, "mute")] = True
+        service.process({"id": "1", "text": "solo Pad and unmute"})
+        self.assertEqual((live.flags("solo")["Pad"], live.flags("mute")["Bass"]), (True, True), "the bare second clause inherits Pad")
 
     def test_missing_name_from_jev_never_defaults_to_selected(self) -> None:
         from tests.support import response
@@ -916,12 +1054,63 @@ class SelectedTrackTests(unittest.TestCase):
         self.assertEqual(gain.number, Number(50.0, "percent"))
         self.assertEqual(pan.number, Number(-20.0, "percent"))
 
-    def test_local_compounds_do_nothing_but_and_in_name_is_safe(self) -> None:
+    def test_local_compounds_run_as_chains_and_and_in_name_is_safe(self) -> None:
+        class ChainBridge(self.SelectedBridge):
+            def __init__(self, snapshot):
+                super().__init__()
+                self.names = {track.path: track.name for track in snapshot.tracks}
+
+            def run(self, arguments):
+                arguments = list(arguments)
+                if "--api-get" in arguments and all(arguments[offset + 2] == "name" for offset, item in enumerate(arguments) if item == "--api-get"):
+                    self.calls.append(arguments)
+                    acks = []
+                    for offset, item in enumerate(arguments):
+                        if item == "--api-get":
+                            path, prop, request = arguments[offset + 1:offset + 4]
+                            acks.append(Ack("api_get", request, self.names[path], path, prop))
+                    return BridgeResult(tuple(acks), 1, 0, False)
+                return super().run(arguments)
+
+        def service_for(snapshot=None):
+            snapshot = snapshot or _snapshot_with_song()
+            bridge = ChainBridge(snapshot)
+            calls = []
+
+            def requester(*args):
+                from tests.support import response
+                calls.append(args)
+                return response("none", action_conf=0.1)
+
+            service = LiveJevService(
+                bridge=bridge, snapshot=snapshot, key="x", requester=requester,
+                llm_key=None, rewriter=lambda *_: (_ for _ in ()).throw(AssertionError("LLM")),
+            )
+            return bridge, service, calls
+
         for text in ("mute Pad and solo Bass", "PadをミュートしてBassをソロ"):
-            bridge, service = self._service(lambda *_: (_ for _ in ()).throw(AssertionError("Jev")))
-            answer = service.process({"id": "compound", "text": text})
-            self.assertEqual(answer["kind"], "info")
-            self.assertFalse(any("--write" in call for call in bridge.calls))
+            with self.subTest(text=text):
+                bridge, service, jev_calls = service_for()
+                answer = service.process({"id": "compound", "text": text})
+                self.assertEqual(answer["kind"], "result", answer)
+                writes = [call for call in bridge.calls if "--write" in call]
+                self.assertEqual([(call[2], call[3]) for call in writes], [("live_set tracks 0", "mute"), ("live_set tracks 1", "solo")])
+                self.assertEqual(jev_calls, [])
+
+        named = replace(_snapshot_with_song(), tracks=(replace(_snapshot_with_song().tracks[0], name="Drum and Bass"),) + _snapshot_with_song().tracks[1:])
+        bridge, service, jev_calls = service_for(named)
+        answer = service.process({"id": "named", "text": "mute Drum and Bass"})
+        self.assertEqual(answer["kind"], "result", answer)
+        self.assertEqual(len([call for call in bridge.calls if "--write" in call]), 1)
+        self.assertEqual(jev_calls, [])
+
+        for text in ("mute Pad and solo Ghost", "PadをミュートしてGhostをソロ"):
+            with self.subTest(text=text):
+                bridge, service, _jev_calls = service_for()
+                answer = service.process({"id": "missing", "text": text})
+                self.assertIn(answer["kind"], {"info", "error"})
+                self.assertIn("Ghost", answer["line"])
+                self.assertFalse(any("--write" in call for call in bridge.calls))
 
     def test_device_toggle_resolves_after_selected_track(self) -> None:
         from snapshot import Device, Param

@@ -55,6 +55,8 @@ open ~/Applications/Live\ Jev.app
 ```
 A waveform icon appears in the menu bar. There is no Dock icon.
 
+On first launch a **Setup** window opens. It checks the three things above for you: the Remote Script (and can install or update it), the connection to Live, and the API key. You can paste the key there instead of step 4; it is stored in your macOS Keychain and handed to the background service when it starts. Reopen the window any time from the menu bar icon → **Setup…**.
+
 ## 6. Use it
 Bring Live to the front and press **⌘⇧Space** → type “mute” → Enter. The bar disappears at once and Live stays in front. It only comes back when it needs to ask you something. To undo the last successful command, including a success with a hidden result row, summon the bar and press ⌘Z.
 
@@ -72,6 +74,7 @@ Check from Terminal (mutes the selected track, then unmutes it):
 | `build-app.sh` says `/opt/homebrew/bin/python3.13` is missing | `brew install python@3.13` |
 | Nothing happens on ⌘⇧Space | Menu bar waveform icon → Show. Check that no other app uses the same shortcut |
 | The app keeps saying “Starting background service…” | The cloned folder was moved or deleted (see step 1). Put it back, or repeat step 5 |
+| “Python was not found” in `~/Library/Logs/LiveJev.log` | The app looks for Python in this order: `LIVE_JEV_PYTHON`, a Python bundled inside the app, `/opt/homebrew/bin/python3.13`, `/opt/homebrew/bin/python3`, `/usr/local/bin/python3`, `/usr/bin/python3` |
 | A plug-in name is not understood | Does the plug-in show up in Live’s browser? You can pin a nickname in `plugin_aliases.json`, for example `{"valhalla": "ValhallaVintageVerb"}` |
 
 ## Uninstall

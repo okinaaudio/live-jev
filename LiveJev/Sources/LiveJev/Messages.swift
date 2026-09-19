@@ -19,6 +19,7 @@ enum AppLanguage: String, CaseIterable {
 
 enum AppText {
     enum Key {
+        case setup, setupTitle, installScript, selectLive, selectLiveHelp, addKey, keyHelp, shellKey, tryIt, tryHelp, install, update, chooseLibrary, saveKey, removeKey, getKey, done, finishLater, installed, olderScript, differentScript, missingScript, scriptProblem, installFailed, keyProblem, pending, ready, problem
         case show, launchAtLogin, version, quit, showDetails, language, automatic, japanese, english
         case edit, undo, redo, cut, copy, paste, selectAll
         case daemonStarting, refreshing, checkingLive, daemonUnavailable, daemonSendFailed
@@ -29,6 +30,34 @@ enum AppText {
     static func text(_ key: Key, language: InterfaceLanguage) -> String {
         let pair: (ja: String, en: String)
         switch key {
+        case .setup: pair = ("セットアップ…", "Setup…")
+        case .setupTitle: pair = ("Live Jevのセットアップ", "Set up Live Jev")
+        case .installScript: pair = ("Live操作スクリプトをインストール", "Install the Live control script")
+        case .selectLive: pair = ("LiveでLiveJevを選択", "Select LiveJev in Live")
+        case .selectLiveHelp: pair = ("Live → 設定 → Link, Tempo & MIDI → コントロールサーフェス → LiveJev。インストール後にLiveを一度再起動してください。", "Live → Settings → Link, Tempo & MIDI → Control Surface → LiveJev. Restart Live once after installing.")
+        case .addKey: pair = ("TypeSafe APIキーを追加", "Add your TypeSafe API key")
+        case .keyHelp: pair = ("キーはmacOSのキーチェーンに保存します。", "Your key is stored in the macOS Keychain.")
+        case .shellKey: pair = ("シェル設定のキーを使用中", "Using the key from your shell profile")
+        case .tryIt: pair = ("接続を試す", "Try it")
+        case .tryHelp: pair = ("Liveのトラック数とテンポを確認します。", "Check Live's tracks and tempo.")
+        case .install: pair = ("インストール", "Install")
+        case .update: pair = ("更新", "Update")
+        case .chooseLibrary: pair = ("ユーザーライブラリを選択…", "Choose User Library…")
+        case .saveKey: pair = ("保存", "Save")
+        case .removeKey: pair = ("削除", "Remove")
+        case .getKey: pair = ("キーを取得", "Get a key")
+        case .done: pair = ("完了", "Done")
+        case .finishLater: pair = ("あとで設定", "Finish later")
+        case .installed: pair = ("同じバージョンがインストール済み", "Installed · same version")
+        case .olderScript: pair = ("古いバージョンがインストール済み", "Older version installed")
+        case .differentScript: pair = ("別のバージョンがインストール済み", "Different version installed")
+        case .missingScript: pair = ("未インストール", "Not installed")
+        case .scriptProblem: pair = ("スクリプトのバージョンを確認できません。", "Could not read the script version.")
+        case .installFailed: pair = ("インストールできません。保存先とアクセス権を確認してください。", "Could not install. Check the destination and permissions.")
+        case .keyProblem: pair = ("キーチェーンにアクセスできません。", "Could not access the Keychain.")
+        case .pending: pair = ("未確認", "Pending")
+        case .ready: pair = ("確認済み", "Ready")
+        case .problem: pair = ("要確認", "Needs attention")
         case .show: pair = ("呼び出す（⌘⇧Space）", "Show (⌘⇧Space)")
         case .launchAtLogin: pair = ("ログイン時に起動", "Launch at Login")
         case .version: pair = ("バージョン", "Version")

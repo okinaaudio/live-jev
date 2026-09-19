@@ -15,6 +15,8 @@ English and Japanese are both supported, with many ways to say the same thing.
 - **Notes** — quantize (1/4 to 1/32, triplets, strength), legato, transpose by octaves or semitones, velocity, double the loop.
 - **Devices** — insert plug-ins and Live’s own devices (“new track with Omnisphere”, “add EQ Eight”), turn devices on and off. Candidates come from *your* Live browser, so whatever you own just works. New tracks land where Live would put them and get Live’s default names.
 - **Tracks** — add and rename.
+- **Several tracks at once** — mute, solo or arm a range, everything, or everything but one (“mute tracks 3 to 6”, “unsolo all”, “mute everything except Drums”, “solo only Bass”).
+- **Chains** — up to four commands in one sentence, in order (“mute Pad and lower Bass by 3 dB”, “mute Pad, then solo Drums and arm Bass”). Every part is checked first; if one part is unclear, nothing runs. If a later part fails, the earlier ones are put back. Works in Japanese too.
 - Everything can be **undone** (the arrow in the bar, or ⌘Z).
 
 ## How it works
@@ -56,7 +58,7 @@ bash scripts/build-app.sh
 
 Then, in Live: Settings → **Link, Tempo & MIDI** → **Control Surface** → choose **LiveJev** in a free slot → restart Live. Open `~/Applications/Live Jev.app` (a waveform icon appears in the menu bar; there is no Dock icon), bring Live to the front, and press **⌘⇧Space**.
 
-The menu bar icon lets you switch the language (Automatic / Japanese / English) and launch at login.
+The first launch opens a **Setup** window that checks the Remote Script, the connection to Live and your API key, and can store the key in the macOS Keychain. The menu bar icon lets you reopen it, switch the language (Automatic / Japanese / English) and launch at login.
 
 ### About your plug-ins
 - **There is nothing to import.** Live Jev reads the plug-in list from your own Live browser (Plug-ins, Instruments, Audio Effects, MIDI Effects) the first time you ask for a plug-in, in under a second, and remembers it. Only what you own becomes a candidate.
@@ -74,7 +76,8 @@ The menu bar icon lets you switch the language (Automatic / Japanese / English) 
 ## Safety
 - Only an allow-list of operations can be sent to Live. Deleting tracks or clips and free-form note writing are not possible.
 - “Don’t …” is never executed. If you name a track that does not exist, nothing is written — it never falls back to another track. If you name no track, the selected track is used.
-- Two requests in one sentence (“mute Pad and solo Bass”) are declined rather than half-executed. Send them one at a time.
+- A sentence with several commands is never half-executed: every part is checked before anything is written, and a failure puts the earlier parts back.
+- Undo restores the values Live Jev read just before it wrote. It does not rely on Live’s own undo history, which does not record mute, solo or arm.
 - A question from Live Jev (“Which track?”) expires after about 20 seconds, so an old question can never swallow your next command.
 - Your API key is read from the environment (or your shell profile) at run time and is never written to a file.
 
@@ -83,6 +86,9 @@ The menu bar icon lets you switch the language (Automatic / Japanese / English) 
 /opt/homebrew/bin/python3.13 -m unittest discover -s tests
 bash scripts/build-app.sh
 ```
+- **Real-Live regression:** open an empty Live set, add a MIDI track named `LJ-TEST` plus two more tracks and a return, select one of them, then run `python3 scripts/live_regression.py --check` (read-only) and `python3 scripts/live_regression.py`. It refuses to send anything to a set without the marker track, restores every change, and compares the set before and after.
+- **Signed, self-contained build:** `scripts/release.sh` bundles a standalone Python, signs with your Developer ID, scans the bundle for private paths, and notarizes a `.dmg`. See [RELEASING.md](RELEASING.md).
+
 An optional LLM rewrite lane (`llm_rewrite.py`) is still in the code but off by default (`LIVE_JEV_LLM=1` to try it).
 
 ## License
