@@ -476,7 +476,9 @@ def _parse_local_en(utterance: str, snapshot: Snapshot) -> Intent | None:
                 step=Step.DOWN_SMALL if re.search(r"\bleft\b", text) else Step.UP_SMALL,
             )
         else:
-            pan = re.search(r"(?:left\s*(\d+(?:\.\d+)?)|(\d+(?:\.\d+)?)\s*left|right\s*(\d+(?:\.\d+)?)|(\d+(?:\.\d+)?)\s*right)", text)
+            # Accept the words people put between the side and the amount: "left by 20", "20% left", "20 percent to the left".
+            amount, gap = r"(\d+(?:\.\d+)?)", r"\s*(?:%|percent)?\s*(?:to\s+the\s+)?"
+            pan = re.search(rf"(?:left\s*(?:by|to)?\s*{amount}|{amount}{gap}left|right\s*(?:by|to)?\s*{amount}|{amount}{gap}right)", text)
             if pan:
                 groups = pan.groups()
                 value = float(next(item for item in groups if item is not None))
@@ -507,8 +509,10 @@ _TRACK_DEFAULT_ACTIONS = {
 
 def _has_unresolved_target_words(text: str, intent: Intent, snapshot: Snapshot) -> bool:
     # Identifiers go first: once "send" is removed as a word, the "b" of "send B" would read as a leftover name.
-    residual = re.sub(r"(?:[-+]\s*\d+(?:\.\d+)?|\d+(?:\.\d+)?\s*(?:%|db|bpm|st|semitones?)|\b(?:to|by|at|of)\s+\d+(?:\.\d+)?)", " ", text, flags=re.IGNORECASE)
+    residual = re.sub(r"(?:[-+]\s*\d+(?:\.\d+)?|\d+(?:\.\d+)?\s*(?:%|percent|db|decibels?|bpm|st|semitones?)|\b(?:to|by|at|of)\s+\d+(?:\.\d+)?)", " ", text, flags=re.IGNORECASE)
     residual = re.sub(r"\bsend\s+(?:[a-z]|\d+)\b", " ", residual, flags=re.IGNORECASE)
+    # A bare number next to a pan side is an amount ("pan left 20", "20 to the left"), not a track called "20".
+    residual = re.sub(r"\b(?:left|right)\s+\d+(?:\.\d+)?|\d+(?:\.\d+)?\s+(?:to\s+the\s+)?(?:left|right)\b", " ", residual, flags=re.IGNORECASE)
     residual = re.sub(r"\b(?:master(?:\s+track)?|main(?:\s+(?:track|out))?|whole\s+mix|the\s+mix|everything)\b", " ", residual, flags=re.IGNORECASE)
     for phrase in sorted(
         {phrase for phrases in ENGLISH_PHRASES.values() for phrase in phrases}, key=len, reverse=True
@@ -533,7 +537,7 @@ def _has_unresolved_target_words(text: str, intent: Intent, snapshot: Snapshot) 
     )
     residual = re.sub(r"\b(?:track|clip|slot|scene|bar)\s*\d+\b", " ", residual, flags=re.IGNORECASE)
     residual = re.sub(r"\bsend\s+(?:[a-z]|\d+)\b", " ", residual, flags=re.IGNORECASE)
-    residual = re.sub(r"(?:(?<!\w)[-+]\s*\d+(?:\.\d+)?|\d+(?:\.\d+)?\s*(?:%|db|bpm|st|semitones?)|\b(?:to|by|at|of)\s+\d+(?:\.\d+)?)", " ", residual, flags=re.IGNORECASE)
+    residual = re.sub(r"(?:(?<!\w)[-+]\s*\d+(?:\.\d+)?|\d+(?:\.\d+)?\s*(?:%|percent|db|decibels?|bpm|st|semitones?)|\b(?:to|by|at|of)\s+\d+(?:\.\d+)?)", " ", residual, flags=re.IGNORECASE)
     residual = re.sub(r"\b(?:the|a|an|by|to|on|in|of|for|my|channel|it|this|that|selected|current|and|now|please|more)\b", " ", residual, flags=re.IGNORECASE)
     words = re.findall(r"[a-z][a-z'-]*", residual.casefold())
     return bool(words or re.search(r"\d", residual))

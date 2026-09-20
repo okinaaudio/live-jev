@@ -323,6 +323,13 @@ def build_cases(context: SafetyContext, baseline: Snapshot) -> List[Case]:
         Case(sn + "以外をミュート", "ja", frozenset({"result", "ask", "info", "error"}), _all_muted(s), all_mute_restore, optional=True),
         Case("mute all", "en", frozenset({"result", "ask", "info", "error"}), _all_muted(), all_mute_restore, optional=True),
     ])
+    # Issue #8: the side word stood away from the number and the pan went to the opposite side.
+    cases.extend([
+        Case("pan left by 20", "en", assertion=_pan(s, lambda value: value < -0.05, "left"), restore_utterances=pan_restore),
+        Case("pan 20 percent left", "en", assertion=_pan(s, lambda value: value < -0.05, "left"), restore_utterances=pan_restore),
+        Case("pan right by 15", "en", assertion=_pan(s, lambda value: value > 0.05, "right"), restore_utterances=pan_restore),
+        Case("パンを左に30", "ja", assertion=_pan(s, lambda value: value < -0.05, "left"), restore_utterances=pan_restore),
+    ])
     o_mute_restore = _boolean_restore(on, "ja", "mute", bool(other["mute"]))
     unchanged_after_undo = (o_mute_restore,) + ((o_volume,) if o_volume else ())
     cases.extend([

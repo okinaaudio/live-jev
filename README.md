@@ -36,7 +36,7 @@ English and Japanese are both supported, with many ways to say the same thing.
 - Only for building from source: [Homebrew](https://brew.sh) and the Xcode Command Line Tools (`xcode-select --install`)
 
 ### Download (the easy way)
-1. Download **LiveJev-1.00.dmg** from the [latest release](https://github.com/okinaaudio/live-jev/releases/latest), open it, and drag **Live Jev** to Applications. The app is signed and notarized, and Python is bundled — no Homebrew or Terminal needed.
+1. Download the **LiveJev dmg** from the [latest release](https://github.com/okinaaudio/live-jev/releases/latest), open it, and drag **Live Jev** to Applications. The app is signed and notarized, and Python is bundled — no Homebrew or Terminal needed.
 2. Open Live Jev. A waveform icon appears in the menu bar and a **Setup** window opens. Click **Install** to copy the control script.
 3. In Live: Settings → **Link, Tempo & MIDI** → **Control Surface** → choose **LiveJev** in a free slot → restart Live.
 4. Back in Setup, paste your TypeSafe API key and click **Save** (it is stored in your macOS Keychain), then **Try it**.

@@ -546,7 +546,7 @@ def parse_number(utterance: str, action: Action) -> Number | None:
         bar = re.search(r"(\d+)\s*小節", utterance)
         return Number(float(bar.group(1)), "raw") if bar else None
     if action is Action.PAN:
-        if re.search(r"真ん中|センター", utterance):
+        if re.search(r"真ん中|センター|中央|\b(?:center|centre|middle)\b", utterance, re.IGNORECASE):
             return Number(0.0, "pan")
         pan = PAN_RE.search(utterance)
         if pan:
@@ -562,6 +562,19 @@ def parse_number(utterance: str, action: Action) -> Number | None:
     match = NUMBER_RE.search(utterance)
     if not match:
         return None
+    if action is Action.PAN:
+        # "pan left by 20" and "pan 20% left" keep the side away from the number, so PAN_RE misses them and the bare
+        # number used to be read as a position to the RIGHT (reported as issue #8). The side word decides the sign.
+        left = re.search(r"左|ひだり|レフト|\bleft\b", utterance, re.IGNORECASE)
+        right = re.search(r"右|みぎ|ライト|\bright\b", utterance, re.IGNORECASE)
+        if left and right:
+            return None
+        if left or right:
+            if re.match(r"\s*(?:dB|デシベル|bpm|raw)", utterance[match.end("number"):], re.IGNORECASE):
+                return None
+            magnitude = abs(_numeric_value(match.group("number")))
+            percent = (match.group("unit") or "") in {"%", "％"} or re.search(r"\bpercent\b|パーセント", utterance, re.IGNORECASE)
+            return Number(-magnitude if left else magnitude, "percent" if percent else "pan")
     value = _numeric_value(match.group("number"))
     unit_text = match.group("unit")
     normalized = (unit_text or "").lower()
