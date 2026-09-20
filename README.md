@@ -29,21 +29,12 @@ English and Japanese are both supported, with many ways to say the same thing.
 **Before you start**
 - Live Jev needs **your own API key for TypeSafe’s Jev model**. Sign in at <https://console.typesafe.ai/> to create one; the docs are at <https://docs.typesafe.ai/>. It is a paid API — TypeSafe’s site listed $42 per billion input tokens in September 2026 (one command is a few hundred tokens). Check their site for current pricing.
 - Live needs a one-time setup: a small **Remote Script** is copied into Live’s User Library and selected in Live’s settings. Nothing needs to be added to your sets.
+- Live Jev is distributed as source. You build the app on your own Mac with a few Terminal commands, so you can read and change everything it does.
 
 ### Requirements
 - Apple Silicon Mac (M1 or later), macOS 14 or later, Ableton Live 12 (Suite not required)
+- [Homebrew](https://brew.sh) and the Xcode Command Line Tools (`xcode-select --install`)
 - A TypeSafe API key
-- Only for building from source: [Homebrew](https://brew.sh) and the Xcode Command Line Tools (`xcode-select --install`)
-
-### Download (the easy way)
-1. Download the **LiveJev dmg** from the [latest release](https://github.com/okinaaudio/live-jev/releases/latest), open it, and drag **Live Jev** to Applications. The app is signed and notarized, and Python is bundled — no Homebrew or Terminal needed.
-2. Open Live Jev. A waveform icon appears in the menu bar and a **Setup** window opens. Click **Install** to copy the control script.
-3. In Live: Settings → **Link, Tempo & MIDI** → **Control Surface** → choose **LiveJev** in a free slot → restart Live.
-4. Back in Setup, paste your TypeSafe API key and click **Save** (it is stored in your macOS Keychain), then **Try it**.
-5. Bring Live to the front and press **⌘⇧Space**.
-
-### Build from source
-Use this if you want to change the code.
 
 **The step-by-step guide, with a check for every step, is in [INSTALL.md](INSTALL.md).** You can also hand that file to an AI coding assistant and ask it to set things up for you.
 
@@ -90,13 +81,22 @@ The first launch opens a **Setup** window that checks the Remote Script, the con
 - A question from Live Jev (“Which track?”) expires after about 20 seconds, so an old question can never swallow your next command.
 - Your API key is read from the environment (or your shell profile) at run time and is never written to a file.
 
+## Make it yours
+Everything is plain Python and Swift, and you build it yourself, so changing it is expected.
+- **Nicknames for your plug-ins** — `plugin_aliases.json` next to `daemon.py`, for example `{"valhalla": "ValhallaVintageVerb"}`.
+- **Nicknames for your tracks** — `aliases.json` next to `daemon.py`, for example `{"Lead Vox": ["vocals", "the singer"]}`. Live Jev passes them to Jev together with the track names.
+- **More ways to say something** — English wording lives in the `ENGLISH_PHRASES` table at the top of `intent_en.py`; Japanese wording lives in the patterns in `intent.py`. Anything the local patterns do not catch goes to Jev.
+- **The text of replies** — `messages.py`, one entry per message with `ja` and `en`.
+- **New operations** — add the action to `actions.py` and to the allow-list in `bridge_client.py` (and `remote_script/LiveJev/lom_protocol.py` if Live needs a new call). Only allow-listed operations can ever reach Live.
+- **Check your change** — run the unit tests, then the real-Live regression below. Python changes take effect when you quit and reopen the app; Swift changes need `bash scripts/build-app.sh`; Remote Script changes need a Live restart.
+
 ## Development
 ```bash
 /opt/homebrew/bin/python3.13 -m unittest discover -s tests
 bash scripts/build-app.sh
 ```
 - **Real-Live regression:** open an empty Live set, add a MIDI track named `LJ-TEST` plus two more tracks and a return, select one of them, then run `python3 scripts/live_regression.py --check` (read-only) and `python3 scripts/live_regression.py`. It refuses to send anything to a set without the marker track, restores every change, and compares the set before and after.
-- **Signed, self-contained build:** `scripts/release.sh` bundles a standalone Python, signs with your Developer ID, scans the bundle for private paths, and notarizes a `.dmg`. See [RELEASING.md](RELEASING.md).
+- **Your own signed build:** no binaries are published here. If you want a self-contained app for your own use or your team, `scripts/release.sh` bundles a standalone Python, signs with *your* Developer ID, scans the bundle for private paths, and notarizes a `.dmg`. See [RELEASING.md](RELEASING.md).
 
 An optional LLM rewrite lane (`llm_rewrite.py`) is still in the code but off by default (`LIVE_JEV_LLM=1` to try it).
 
