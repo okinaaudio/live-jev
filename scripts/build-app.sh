@@ -9,7 +9,10 @@ PKG_DIR="$SAY_DIR/LiveJev"
 BUILD_DIR="$HOME/dev/live-jev-build"
 APP_NAME="Live Jev.app"
 OLD_APP_NAME="LiveSay.app"  # Previous name. Move any copy left in ~/Applications aside.
-APP_DIR="$BUILD_DIR/$APP_NAME"
+# Spotlight and Launchpad skip folders whose name ends in .noindex, so the staged copy and the previous version
+# do not show up as extra "Live Jev" apps next to the installed one.
+STAGE_DIR="$BUILD_DIR/stage.noindex"
+APP_DIR="$STAGE_DIR/$APP_NAME"
 PYTHON="/opt/homebrew/bin/python3.13"
 INSTALL_DIR="$HOME/Applications"
 INSTALL=1
@@ -39,7 +42,7 @@ iconutil -c icns "$ICONSET" -o "$BUILD_DIR/AppIcon.icns" || fail "iconutil faile
 
 say "3/5 Assembling the .app"
 rm -rf "$APP_DIR"
-mkdir -p "$APP_DIR/Contents/MacOS" "$APP_DIR/Contents/Resources"
+mkdir -p "$STAGE_DIR" "$APP_DIR/Contents/MacOS" "$APP_DIR/Contents/Resources"
 cp "$BIN" "$APP_DIR/Contents/MacOS/LiveJev"
 cp "$PKG_DIR/Info.plist" "$APP_DIR/Contents/Info.plist"
 cp "$BUILD_DIR/AppIcon.icns" "$APP_DIR/Contents/Resources/AppIcon.icns"
@@ -55,14 +58,15 @@ if [[ "$INSTALL" -eq 1 ]]; then
   mkdir -p "$INSTALL_DIR"
   if [[ -d "$INSTALL_DIR/$OLD_APP_NAME" ]]; then
     rm -rf "$BUILD_DIR/$OLD_APP_NAME.old"
-    mv "$INSTALL_DIR/$OLD_APP_NAME" "$BUILD_DIR/$OLD_APP_NAME.old"
+    mv "$INSTALL_DIR/$OLD_APP_NAME" "$STAGE_DIR/$OLD_APP_NAME.old"
   fi
   if [[ -d "$INSTALL_DIR/$APP_NAME" ]]; then
-    rm -rf "$BUILD_DIR/$APP_NAME.bak"
-    mv "$INSTALL_DIR/$APP_NAME" "$BUILD_DIR/$APP_NAME.bak"
+    rm -rf "$STAGE_DIR/previous"
+    mkdir -p "$STAGE_DIR/previous"
+    mv "$INSTALL_DIR/$APP_NAME" "$STAGE_DIR/previous/$APP_NAME"
   fi
   cp -R "$APP_DIR" "$INSTALL_DIR/$APP_NAME"
-  say "Done: $INSTALL_DIR/$APP_NAME (previous version: $BUILD_DIR/$APP_NAME.bak)"
+  say "Done: $INSTALL_DIR/$APP_NAME (previous version: $STAGE_DIR/previous/$APP_NAME)"
 else
   say "5/5 Skipping installation. Built at: $APP_DIR"
 fi

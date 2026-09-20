@@ -3,7 +3,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-WORK_DIR="$HOME/dev/live-jev-build/release"
+WORK_DIR="$HOME/dev/live-jev-build/release.noindex"
 BUILD_DIR="$WORK_DIR/swift-build"
 SOURCE_COPY="$WORK_DIR/LiveJev-release-source"
 APP_NAME="Live Jev.app"
