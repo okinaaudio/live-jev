@@ -28,15 +28,24 @@ English and Japanese are both supported, with many ways to say the same thing.
 
 **Before you start**
 - Live Jev needs **your own API key for TypeSafe’s Jev model**. Sign in at <https://console.typesafe.ai/> to create one; the docs are at <https://docs.typesafe.ai/>. It is a paid API — TypeSafe’s site listed $42 per billion input tokens in September 2026 (one command is a few hundred tokens). Check their site for current pricing.
-- Live needs a one-time setup: copy a small **Remote Script** and select it in Live’s settings. Nothing needs to be added to your sets.
-- There is no installer yet, so you will type a few commands in Terminal.
-
-**The step-by-step guide, with a check for every step, is in [INSTALL.md](INSTALL.md).** You can also hand that file to an AI coding assistant and ask it to set things up for you.
+- Live needs a one-time setup: a small **Remote Script** is copied into Live’s User Library and selected in Live’s settings. Nothing needs to be added to your sets.
 
 ### Requirements
 - Apple Silicon Mac (M1 or later), macOS 14 or later, Ableton Live 12 (Suite not required)
-- [Homebrew](https://brew.sh) and the Xcode Command Line Tools (`xcode-select --install`)
 - A TypeSafe API key
+- Only for building from source: [Homebrew](https://brew.sh) and the Xcode Command Line Tools (`xcode-select --install`)
+
+### Download (the easy way)
+1. Download the **LiveJev dmg** from the [latest release](https://github.com/okinaaudio/live-jev/releases/latest), open it, and drag **Live Jev** to Applications. The app is signed and notarized, and Python is bundled — no Homebrew or Terminal needed.
+2. Open Live Jev. A waveform icon appears in the menu bar and a **Setup** window opens. Click **Install** to copy the control script.
+3. In Live: Settings → **Link, Tempo & MIDI** → **Control Surface** → choose **LiveJev** in a free slot → restart Live.
+4. Back in Setup, paste your TypeSafe API key and click **Save** (it is stored in your macOS Keychain), then **Try it**.
+5. Bring Live to the front and press **⌘⇧Space**.
+
+### Build from source
+Use this if you want to change the code.
+
+**The step-by-step guide, with a check for every step, is in [INSTALL.md](INSTALL.md).** You can also hand that file to an AI coding assistant and ask it to set things up for you.
 
 ### Quick start
 ```bash

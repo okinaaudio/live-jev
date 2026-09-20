@@ -922,6 +922,26 @@ class SelectedTrackTests(unittest.TestCase):
         service.process({"id": "1", "text": "solo Pad and unmute"})
         self.assertEqual((live.flags("solo")["Pad"], live.flags("mute")["Bass"]), (True, True), "the bare second clause inherits Pad")
 
+    def test_pan_side_word_decides_the_sign_wherever_it_stands(self) -> None:
+        from intent import parse_number
+        snapshot = _snapshot_with_song()
+        for text, value, unit in (
+            ("pan left by 20", -20.0, "pan"), ("pan 20% left", -20.0, "percent"), ("pan Bass 20 percent left", -20.0, "percent"),
+            ("pan right by 20", 20.0, "pan"), ("pan it 30 percent to the right", 30.0, "percent"), ("pan Bass left by 30%", -30.0, "percent"),
+        ):
+            parsed = parse_local(text, snapshot)
+            self.assertEqual((parsed.action, parsed.step, parsed.number), (Action.PAN, Step.SET, Number(value, unit)), text)
+        for text, value in (("pan left by 20", -20.0), ("パンを左に20", -20.0), ("右へ30振って", 30.0), ("20だけ左に寄せて", -20.0), ("pan 15 to the left please", -15.0)):
+            self.assertEqual(parse_number(text, Action.PAN).value, value, text)
+        for text in ("pan 20 percent left", "pan 20 percent to the left", "pan left 20", "pan 20 left", "lower it by 3 decibels"):
+            bridge, service = self._service(lambda *_: (_ for _ in ()).throw(AssertionError("Jev")))
+            answer = service.process({"id": "1", "text": text})
+            self.assertNotEqual(answer.get("line"), "指定したトラックが見つかりません", text)
+        bridge, service = self._service(lambda *_: (_ for _ in ()).throw(AssertionError("Jev")))
+        self.assertEqual(service.process({"id": "1", "text": "pan 909 left 20"})["kind"], "error")
+        self.assertIsNone(parse_number("left 20 or right 20", Action.PAN))
+        self.assertEqual(parse_number("pan to the center", Action.PAN), Number(0.0, "pan"))
+
     def test_missing_name_from_jev_never_defaults_to_selected(self) -> None:
         from tests.support import response
         answers = self._stated(response("mute", "none", track_conf=0.83), 0.77)

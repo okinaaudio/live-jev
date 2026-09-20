@@ -2,6 +2,8 @@
 
 Written for people and for AI coding assistants (Claude Code, Codex, Cursor and the like). Every step has a check.
 
+**Just want to use it?** Download the notarized app from the [latest release](https://github.com/okinaaudio/live-jev/releases/latest) and follow its Setup window; you only need step 3 below (selecting LiveJev in Live). The rest of this guide builds the app from source.
+
 ## 0. Prerequisites
 | You need | Check | If missing |
 | --- | --- | --- |
