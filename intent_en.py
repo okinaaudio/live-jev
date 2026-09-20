@@ -20,6 +20,8 @@ from intent import (
     _local_intent,
     resolve_native_device,
     parse_number,
+    eligible_track_indices,
+    resolve_multi_endpoint,
 )
 
 
@@ -263,7 +265,7 @@ def _parse_local_en(utterance: str, snapshot: Snapshot) -> Intent | None:
         return None
     text = normalize_english_phrase(utterance)
     _unused, original_track_name = _named_track(utterance.strip())
-    if text in {"more", "a bit more", "a little more", "a touch more", "do it again"}:
+    if text in {"more", "a bit more", "a little more", "a touch more", "do it again", "again"}:
         return _local_intent(Action.NONE, refers_previous=1.0)
 
     exact: tuple[tuple[str, Action], ...] = (
@@ -286,6 +288,50 @@ def _parse_local_en(utterance: str, snapshot: Snapshot) -> Intent | None:
     for pattern, action in exact:
         if re.fullmatch(pattern, text, re.IGNORECASE):
             return _local_intent(action)
+
+    multi_patterns = (
+        (r"\bunmute\b", Action.UNMUTE), (r"\bmute\b", Action.MUTE),
+        (r"\bunsolo\b|\bclear\s+all\s+solos?\b", Action.UNSOLO), (r"\bsolo\b", Action.SOLO),
+        (r"\bdisarm\b", Action.DISARM), (r"\barm\b", Action.ARM),
+    )
+    multi_action = next((action for pattern, action in multi_patterns if re.search(pattern, text)), None)
+    eligible = eligible_track_indices(snapshot)
+    if multi_action is not None:
+        action_word = r"(?:mute|unmute|solo|unsolo|arm|disarm)"
+        literal = next((track for track in snapshot.tracks if re.fullmatch(action_word + r"\s+" + re.escape(track.name), text, re.IGNORECASE)), None)
+        if literal is not None:
+            return _local_intent(multi_action, track=literal.index, target_origin=TargetOrigin.NAMED, track_stated=1.0)
+        range_match = re.fullmatch(
+            r"(?:solo|arm)\s+from\s+(?P<start2>.+?)\s+to\s+(?P<end2>.+?)|"
+            r"(?:mute|unmute|solo|unsolo|arm|disarm)\s+(?:tracks?\s+)?(?P<start>.+?)\s+(?:to|through)\s+(?P<end>.+?)",
+            text,
+            re.IGNORECASE,
+        )
+        if range_match:
+            start = resolve_multi_endpoint(snapshot, range_match.group("start") or range_match.group("start2"))
+            end = resolve_multi_endpoint(snapshot, range_match.group("end") or range_match.group("end2"))
+            tracks = () if start is None or end is None else tuple(index for index in eligible if min(start, end) <= index <= max(start, end))
+            return _local_intent(multi_action, tracks=tracks, target_origin=TargetOrigin.RANGE, track_stated=1.0)
+        except_match = re.fullmatch(r"(?:mute|solo|arm)\s+(?:everything|all(?:\s+tracks?)?)\s+(?:except|but)\s+(?P<target>.+)", text, re.IGNORECASE)
+        if except_match:
+            raw = re.sub(r"^(?:the\s+)?", "", except_match.group("target")).strip()
+            selected = raw in {"this", "this track", "selected", "selected track", "the selected track"}
+            excluded = "selected" if selected else resolve_multi_endpoint(snapshot, raw)
+            tracks = () if not isinstance(excluded, int) else tuple(index for index in eligible if index != excluded)
+            return _local_intent(multi_action, track=excluded if selected else None, tracks=tracks, target_origin=TargetOrigin.EXCEPT, track_stated=0.0 if selected else 1.0)
+        only_match = re.fullmatch(r"(?:solo|arm)\s+(?:only|just)\s+(?P<target>.+)", text, re.IGNORECASE)
+        if only_match and multi_action in {Action.SOLO, Action.ARM}:
+            raw = re.sub(r"^(?:the\s+)?", "", only_match.group("target")).strip()
+            selected = raw in {"this", "this track", "selected", "selected track"}
+            target = "selected" if selected else resolve_multi_endpoint(snapshot, raw)
+            return _local_intent(multi_action, track=target if selected else None, tracks=(target,) if isinstance(target, int) else (), target_origin=TargetOrigin.ONLY, track_stated=0.0 if selected else 1.0)
+        all_match = re.fullmatch(
+            r"(?:mute|unmute|solo|unsolo|arm|disarm)\s+(?:all(?:\s+tracks?)?|everything)|clear\s+all\s+solos?|disarm\s+all",
+            text,
+            re.IGNORECASE,
+        )
+        if all_match:
+            return _local_intent(multi_action, tracks=eligible, target_origin=TargetOrigin.ALL, track_stated=1.0)
 
     tempo = re.fullmatch(r"(?:(?:set|change)\s+)?tempo(?:\s+to|\s+at)?\s+(-?\d+(?:\.\d+)?)\s*(?:bpm)?|(-?\d+(?:\.\d+)?)\s*bpm", text)
     if tempo:
@@ -495,9 +541,16 @@ def _has_unresolved_target_words(text: str, intent: Intent, snapshot: Snapshot) 
 
 def parse_local_en(utterance: str, snapshot: Snapshot) -> Intent | None:
     intent = _parse_local_en(utterance, snapshot)
+    normalized = normalize_english_phrase(utterance)
+    exact_named_toggle = intent is not None and intent.target_origin is TargetOrigin.NAMED and any(
+        re.fullmatch(r"(?:mute|unmute|solo|unsolo|arm|disarm)\s+" + re.escape(track.name), normalized, re.IGNORECASE)
+        for track in snapshot.tracks if track.name
+    )
+    if intent is not None and (exact_named_toggle or intent.target_origin in {TargetOrigin.RANGE, TargetOrigin.ALL, TargetOrigin.EXCEPT, TargetOrigin.ONLY}):
+        return intent
     if intent is None or intent.action not in _TRACK_DEFAULT_ACTIONS:
         return intent
-    if _has_unresolved_target_words(normalize_english_phrase(utterance), intent, snapshot):
+    if _has_unresolved_target_words(normalized, intent, snapshot):
         return replace(intent, track=None, track_conf=0.0, track_stated=1.0, named_evidence=1.0, target_origin=TargetOrigin.NONE)
     if intent.track is None and intent.track_stated >= TRACK_STATED_MIN:
         numbered = re.search(r"\b(?:track\s*\d+|\d+(?:st|nd|rd|th)\s+track)\b", utterance, re.IGNORECASE)

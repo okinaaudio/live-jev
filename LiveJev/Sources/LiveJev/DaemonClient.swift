@@ -16,6 +16,8 @@ final class DaemonClient: @unchecked Sendable {
     private var stderrTask: Task<Void, Never>?
     private var didRetry = false
     private var isStopping = false
+    private var restartRequested = false
+    private var retryTicket = UUID()
     private var generation = UUID()
 
     private static let defaultDaemonPath: String = {
@@ -78,6 +80,8 @@ final class DaemonClient: @unchecked Sendable {
 
     func stop() {
         isStopping = true
+        restartRequested = false
+        retryTicket = UUID()
         guard let process else {
             closePipes()
             return
@@ -100,12 +104,46 @@ final class DaemonClient: @unchecked Sendable {
         }
     }
 
-    private func launch(isRetry: Bool) {
-        let configuredPath = ProcessInfo.processInfo.environment["LIVE_JEV_DAEMON"]
+    static var resolvedDaemonURL: URL {
+        let path = ProcessInfo.processInfo.environment["LIVE_JEV_DAEMON"]
             .flatMap { $0.isEmpty ? nil : $0 }
-            ?? Self.configuredDaemonPath
-            ?? Self.defaultDaemonPath
-        let daemonURL = URL(fileURLWithPath: configuredPath).standardizedFileURL
+            ?? configuredDaemonPath
+            ?? bundledURL("daemon/daemon.py")?.path
+            ?? defaultDaemonPath
+        return URL(fileURLWithPath: path).standardizedFileURL
+    }
+
+    static var remoteScriptSource: URL {
+        bundledURL("remote_script/LiveJev")
+            ?? resolvedDaemonURL.deletingLastPathComponent().appendingPathComponent("remote_script/LiveJev")
+    }
+
+    private static func bundledURL(_ path: String) -> URL? {
+        guard let url = Bundle.main.resourceURL?.appendingPathComponent(path),
+              FileManager.default.fileExists(atPath: url.path) else { return nil }
+        return url
+    }
+
+    private static var pythonURL: URL {
+        if let path = ProcessInfo.processInfo.environment["LIVE_JEV_PYTHON"], !path.isEmpty {
+            return URL(fileURLWithPath: path)
+        }
+        if let bundled = bundledURL("python/bin/python3") { return bundled }
+        let paths = ["/opt/homebrew/bin/python3.13", "/opt/homebrew/bin/python3", "/usr/local/bin/python3", "/usr/bin/python3"]
+        return URL(fileURLWithPath: paths.first { FileManager.default.isExecutableFile(atPath: $0) } ?? paths[3])
+    }
+
+    func restart() {
+        stop()
+        restartRequested = true
+        if process == nil {
+            restartRequested = false
+            start()
+        }
+    }
+
+    private func launch(isRetry: Bool) {
+        let daemonURL = Self.resolvedDaemonURL
 
         guard Self.isRegularAbsoluteFile(daemonURL) else {
             Log.shared.write("daemon not found at resolved path: \(daemonURL.path)")
@@ -121,10 +159,13 @@ final class DaemonClient: @unchecked Sendable {
         let launchGeneration = UUID()
 
         generation = launchGeneration
-        process.executableURL = URL(fileURLWithPath: "/opt/homebrew/bin/python3.13")
+        process.executableURL = Self.pythonURL
+        Log.shared.write("daemon Python: \(process.executableURL!.path)")
         process.arguments = [daemonURL.path]
         var environment = ProcessInfo.processInfo.environment
         environment["LIVE_JEV_LANG"] = language.rawValue
+        environment["PYTHONDONTWRITEBYTECODE"] = "1"
+        if let key = try? Keychain.read() { environment["TYPESAFE_API_KEY"] = key }
         process.environment = environment
         process.standardInput = stdinPipe
         process.standardOutput = stdoutPipe
@@ -193,7 +234,12 @@ final class DaemonClient: @unchecked Sendable {
         closePipes()
         onConnectionChange?(false, isStopping ? nil : AppText.text(.daemonStopped, language: language))
         Log.shared.write("daemon exited with status \(terminatedProcess.terminationStatus)")
-        if !isStopping {
+        if restartRequested {
+            restartRequested = false
+            isStopping = false
+            didRetry = false
+            scheduleRetryIfNeeded()
+        } else if !isStopping {
             scheduleRetryIfNeeded()
         }
     }
@@ -210,9 +256,11 @@ final class DaemonClient: @unchecked Sendable {
     private func scheduleRetryIfNeeded() {
         guard !didRetry, !isStopping else { return }
         didRetry = true
+        let ticket = UUID()
+        retryTicket = ticket
         Task { @MainActor [weak self] in
             try? await Task.sleep(for: .seconds(3))
-            guard let self, !self.isStopping else { return }
+            guard let self, !self.isStopping, self.retryTicket == ticket else { return }
             self.launch(isRetry: true)
         }
     }

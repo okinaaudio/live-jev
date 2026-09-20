@@ -5,12 +5,13 @@ import io
 import json
 import subprocess
 import sys
+import time
 from unittest import mock
 import unittest
 
-from daemon import JevClient, LiveJevService, Pending, run_stdio
+from daemon import JevClient, LiveJevService, Pending, StaleSnapshot, run_stdio
 from bridge_client import Ack, BridgeError, BridgeResult
-from intent import interpret_response
+from intent import Action, interpret_response, _local_intent
 from tests.support import response, sample_snapshot
 
 
@@ -34,6 +35,7 @@ class DaemonDecisionTests(unittest.TestCase):
             self.calls: list[list[str]] = []
             self.write_count = 0
             self.fail_on_write = fail_on_write
+            self.values = {}
 
         def run(self, arguments):
             arguments = list(arguments)
@@ -42,13 +44,20 @@ class DaemonDecisionTests(unittest.TestCase):
                 self.write_count += 1
                 if self.write_count == self.fail_on_write:
                     raise BridgeError("write failed")
+                for at, item in enumerate(arguments):
+                    if item == "--api-set":
+                        self.values[(arguments[at + 1], arguments[at + 2])] = arguments[at + 3] == "1"
                 return BridgeResult((), 1, 0, False)
             if "--api-get" in arguments:
-                at = arguments.index("--api-get")
-                prop = arguments[at + 2]
                 names = {"live_set tracks 0": "Pad", "live_set tracks 1": "Bass", "live_set tracks 2": "Drums"}
-                payload = names[arguments[at + 1]] if prop == "name" else 1
-                return BridgeResult((Ack("api_get", arguments[at + 3], payload, arguments[at + 1], prop),), 1, 0, False)
+                acks = []
+                for at, item in enumerate(arguments):
+                    if item != "--api-get":
+                        continue
+                    path, prop, request = arguments[at + 1:at + 4]
+                    payload = names[path] if prop == "name" else self.values.get((path, prop), False)
+                    acks.append(Ack("api_get", request, payload, path, prop))
+                return BridgeResult(tuple(acks), 1, 0, False)
             raise AssertionError(arguments)
 
     def test_llm_rewrite_is_reclassified_and_executed(self) -> None:
@@ -104,7 +113,7 @@ class DaemonDecisionTests(unittest.TestCase):
         self.assertEqual(answer["kind"], "error")
         self.assertEqual(answer["line"], "Geminiの回数制限（429）")
 
-    def test_compound_runs_lines_in_order_and_stops_on_second_failure(self) -> None:
+    def test_llm_rewriter_chain_rolls_back_when_second_clause_fails(self) -> None:
         bridge = self.BoolBridge(fail_on_write=2)
         jev_replies = iter([
             response("none", compound=0.71, action_conf=0.2),
@@ -121,10 +130,37 @@ class DaemonDecisionTests(unittest.TestCase):
         )
         answer = service.process({"text": "ドラム消してベースだけ聞かせて"})
         self.assertEqual(answer["kind"], "error")
-        self.assertTrue(service.snapshot.tracks[2].mute)
-        self.assertEqual(bridge.write_count, 2)
-        self.assertIn("2行目", answer["line"])
+        self.assertFalse(service.snapshot.tracks[2].mute)
+        self.assertEqual(bridge.write_count, 3)
+        self.assertIn("変更は残っていません", answer["line"])
         self.assertEqual(answer["decision"]["rewritten"], ["ドラムをミュート", "ベースをソロ"])
+
+    def test_multi_track_batch_skips_matching_values_and_undo_restores_without_live_undo(self) -> None:
+        snapshot = sample_snapshot()
+        snapshot = replace(snapshot, tracks=(
+            replace(snapshot.tracks[0], mute=False),
+            replace(snapshot.tracks[1], mute=True),
+            replace(snapshot.tracks[2], mute=False),
+        ))
+        bridge = self.BoolBridge()
+        bridge.values = {(track.path, "mute"): track.mute for track in snapshot.tracks}
+        service = LiveJevService(
+            bridge=bridge,
+            snapshot=snapshot,
+            key="x",
+            requester=lambda *_args: self.fail("Jev was called"),
+        )
+
+        applied = service.process({"text": "mute all"})
+        self.assertEqual(applied["kind"], "result")
+        writes = [call for call in bridge.calls if "--write" in call]
+        self.assertEqual(sum(item == "--api-set" for item in writes[0]), 2)
+        self.assertTrue(all(track.mute for track in service.snapshot.tracks))
+
+        restored = service.process({"text": "undo"})
+        self.assertEqual(restored["kind"], "result")
+        self.assertEqual([track.mute for track in service.snapshot.tracks], [False, True, False])
+        self.assertFalse(any("--api-call" in call and "undo" in call for call in bridge.calls))
 
     def test_clear_single_command_never_calls_llm(self) -> None:
         bridge = self.BoolBridge()
@@ -163,8 +199,9 @@ class DaemonDecisionTests(unittest.TestCase):
             rewriter=lambda *_args: self.fail("LLM was called"),
         )
         answer = service.process({"text": "テンポ90"})
-        self.assertEqual(answer["kind"], "result")
+        self.assertEqual(answer["kind"], "info")
         self.assertEqual(service.snapshot.tempo, 90)
+        self.assertFalse(any("--tempo" in call for call in bridge.calls))
         self.assertEqual(answer["ms"]["jev"], 0)
         self.assertEqual(answer["ms"]["llm"], 0)
 
@@ -498,29 +535,30 @@ class DaemonDecisionTests(unittest.TestCase):
             requester=lambda _payload, _key: response("mute", "t2"),
         )
         answer = service.process({"text": "ドラムをミュート"})
-        self.assertEqual(answer["kind"], "result")
-        self.assertTrue(service.snapshot.tracks[2].mute)
+        self.assertEqual(answer["kind"], "unknown")
         self.assertEqual(sum("--api-set" in call for call in bridge.calls), 1)
-        self.assertNotIn("--write", bridge.calls[2])
-        self.assertIn("書き込みの応答がなく", answer["line"])
+        self.assertIn("変更が残っている可能性", answer["line"])
         call_count = len(bridge.calls)
         repeated = service.process({"text": "もう少し"})
         self.assertEqual(repeated["kind"], "info")
         self.assertEqual(len(bridge.calls), call_count)
 
     def test_write_and_readback_timeout_returns_unknown(self) -> None:
-        class AlwaysTimeoutBridge:
+        from tests.support import StatefulLive
+
+        class AcceptedWriteThenReadFailure(StatefulLive):
             def __init__(self):
-                self.calls = []
+                super().__init__()
+                self.failed_readback = False
 
             def run(self, arguments):
-                self.calls.append(list(arguments))
-                if "--api-get" in arguments and arguments[arguments.index("--api-get") + 2] == "name":
-                    at = arguments.index("--api-get")
-                    return BridgeResult((Ack("api_get", arguments[at + 3], "Drums", arguments[at + 1], "name"),), 1, 0, False)
-                return BridgeResult((), 10, -1, True)
+                result = super().run(arguments)
+                if "--api-get" in arguments and any("--api-set" in call for call in self.calls) and not self.failed_readback:
+                    self.failed_readback = True
+                    raise BridgeError("post-write readback failed")
+                return result
 
-        bridge = AlwaysTimeoutBridge()
+        bridge = AcceptedWriteThenReadFailure()
         service = LiveJevService(
             bridge=bridge,
             snapshot=sample_snapshot(),
@@ -528,11 +566,10 @@ class DaemonDecisionTests(unittest.TestCase):
             requester=lambda _payload, _key: response("mute", "t2"),
         )
         answer = service.process({"text": "ドラムをミュート"})
-        self.assertEqual(answer["kind"], "unknown")
-        self.assertIn("読み戻せませんでした", answer["line"])
-        self.assertEqual(sum("--api-set" in call for call in bridge.calls), 1)
-        self.assertEqual(len(bridge.calls), 3)
-        self.assertNotIn("--write", bridge.calls[2])
+        self.assertEqual(answer["kind"], "error")
+        self.assertIn("変更は残っていません", answer["line"])
+        self.assertEqual(sum("--api-set" in call for call in bridge.calls), 2)
+        self.assertFalse(bridge.state[(2, "mute")])
 
     def test_db_volume_reaches_target_within_point_zero_five_db(self) -> None:
         class VolumeBridge:
@@ -589,7 +626,7 @@ class DaemonDecisionTests(unittest.TestCase):
                     return BridgeResult((Ack("api_call", arguments[at + 4], "-30.0 dB", arguments[at + 1], "str_for_value"),), 1, 0, False)
                 if "--api-mixer-status" in arguments:
                     at = arguments.index("--api-mixer-status")
-                    mixer = {"parameters": {"volume": {"path": "live_set tracks 0 mixer_device volume", "value": 0.5, "min": 0, "max": 1}}}
+                    mixer = {"parameters": {"volume": {"path": "live_set tracks 0 mixer_device volume", "value": 0.0, "min": 0, "max": 1}}}
                     return BridgeResult((Ack("api_mixer_status", arguments[at + 2], mixer, "live_set tracks 0"),), 1, 0, False)
                 return BridgeResult((), 1, 0, False)
 
@@ -602,6 +639,9 @@ class DaemonDecisionTests(unittest.TestCase):
 
     def test_db_final_readback_timeout_is_unknown(self) -> None:
         class MissingMixerBridge:
+            def __init__(self):
+                self.mixer_reads = 0
+
             def run(self, arguments):
                 arguments = list(arguments)
                 if "--api-get" in arguments:
@@ -611,6 +651,11 @@ class DaemonDecisionTests(unittest.TestCase):
                     at = arguments.index("--api-call")
                     return BridgeResult((Ack("api_call", arguments[at + 4], "-30.0 dB", arguments[at + 1], "str_for_value"),), 1, 0, False)
                 if "--api-mixer-status" in arguments:
+                    self.mixer_reads += 1
+                    if self.mixer_reads == 1:
+                        at = arguments.index("--api-mixer-status")
+                        payload = {"parameters": {"volume": {"path": "live_set tracks 0 mixer_device volume", "value": 0.6}}}
+                        return BridgeResult((Ack("api_mixer_status", arguments[at + 2], payload, "live_set tracks 0"),), 1, 0, False)
                     return BridgeResult((), 1, -1, True)
                 return BridgeResult((), 1, 0, False)
 
@@ -622,7 +667,177 @@ class DaemonDecisionTests(unittest.TestCase):
         )
         answer = service.process({"text": "パッドを-30dBに"})
         self.assertEqual(answer["kind"], "unknown")
-        self.assertIn("読み戻せませんでした", answer["line"])
+        self.assertIn("変更が残っている可能性", answer["line"])
+
+    def test_receipt_undo_phrasings_never_call_live_undo(self) -> None:
+        from tests.support import StatefulLive
+
+        for phrase in ("undo", "undo that", "take that back", "アンドゥ", "元に戻して", "取り消して"):
+            with self.subTest(phrase=phrase):
+                bridge = StatefulLive()
+                service = LiveJevService(bridge=bridge, snapshot=sample_snapshot(), key="x", requester=lambda *_: response("mute", "t0"))
+                self.assertEqual(service.process({"text": "mute Pad"})["kind"], "result")
+                self.assertEqual(service.process({"text": phrase})["kind"], "result")
+                self.assertFalse(bridge.state[(0, "mute")])
+                self.assertFalse(any("--api-call" in call and "undo" in call for call in bridge.calls))
+
+    def test_replaced_track_is_not_written_during_undo(self) -> None:
+        from tests.support import StatefulLive
+
+        bridge = StatefulLive()
+        service = LiveJevService(bridge=bridge, snapshot=sample_snapshot(), key="x", requester=lambda *_: response("mute", "t0"))
+        service.process({"text": "mute Pad"})
+        writes = sum("--api-set" in call for call in bridge.calls)
+        bridge.replace_track(0, "Replacement")
+        answer = service.process({"cmd": "undo"})
+        self.assertEqual(answer["kind"], "info")
+        self.assertEqual(sum("--api-set" in call for call in bridge.calls), writes)
+        self.assertTrue(bridge.state[(0, "mute")])
+
+    def test_multi_track_readback_failure_is_not_success(self) -> None:
+        from tests.support import StatefulLive
+
+        bridge = StatefulLive(ignore_writes=True)
+        service = LiveJevService(bridge=bridge, snapshot=sample_snapshot(), key="x", requester=lambda *_: self.fail("Jev called"))
+        answer = service.process({"text": "mute all"})
+        self.assertNotEqual(answer["kind"], "result")
+        self.assertEqual(bridge.flags("mute"), {"Pad": False, "Bass": False, "Drums": False})
+
+    def test_solo_only_uses_live_state_for_every_track(self) -> None:
+        from tests.support import StatefulLive
+
+        bridge = StatefulLive()
+        bridge.state[(1, "solo")] = True
+        service = LiveJevService(bridge=bridge, snapshot=sample_snapshot(), key="x", requester=lambda *_: self.fail("Jev called"))
+        answer = service.process({"text": "solo only Pad"})
+        self.assertEqual(answer["kind"], "result")
+        self.assertEqual(bridge.flags("solo"), {"Pad": True, "Bass": False, "Drums": False})
+
+    def test_absolute_pan_send_and_parameter_undo_to_live_before_values(self) -> None:
+        from tests.support import StatefulLive
+
+        pan_bridge = StatefulLive()
+        pan_bridge.values[(0, "panning")] = 0.4
+        pan_service = LiveJevService(bridge=pan_bridge, snapshot=sample_snapshot(), key="x", requester=lambda *_: response("pan", "t0", "set"))
+        self.assertEqual(pan_service.process({"text": "Padを左20"})["kind"], "result")
+        self.assertEqual(pan_service.process({"cmd": "undo"})["kind"], "result")
+        self.assertAlmostEqual(pan_bridge.values[(0, "panning")], 0.4)
+
+        snapshot = sample_snapshot()
+        snapshot = replace(snapshot, tracks=tuple(replace(track, sends=(0.2,)) for track in snapshot.tracks), returns=("Verb",))
+        send_bridge = StatefulLive()
+        send_bridge.sends[(0, 0)] = 0.7
+        send_service = LiveJevService(bridge=send_bridge, snapshot=snapshot, key="x", requester=lambda *_: self.fail("Jev called"))
+        self.assertEqual(send_service.process({"text": "Pad send A to 50%"})["kind"], "result")
+        self.assertEqual(send_service.process({"cmd": "undo"})["kind"], "result")
+        self.assertAlmostEqual(send_bridge.sends[(0, 0)], 0.7)
+
+        param_bridge = StatefulLive()
+        param_bridge.parameters["live_set tracks 0 devices 0 parameters 0"] = 0.7
+        param_service = LiveJevService(bridge=param_bridge, snapshot=sample_snapshot(), key="x", requester=lambda *_: response("param", "t0", "set", param="d0p0"))
+        self.assertEqual(param_service.process({"text": "PadのDry/Wetを80%に"})["kind"], "result")
+        self.assertEqual(param_service.process({"cmd": "undo"})["kind"], "result")
+        self.assertAlmostEqual(param_bridge.parameters["live_set tracks 0 devices 0 parameters 0"], 0.7)
+
+    def test_prewrite_owner_replacement_aborts_before_track_write(self) -> None:
+        from tests.support import StatefulLive
+
+        class ReplaceDuringValueRead(StatefulLive):
+            def run(self, arguments):
+                result = super().run(arguments)
+                if "--api-get" in arguments and arguments[arguments.index("--api-get") + 2] == "mute":
+                    self.replace_track(0, "Replacement")
+                return result
+
+        bridge = ReplaceDuringValueRead()
+        service = LiveJevService(bridge=bridge, snapshot=sample_snapshot(), key="x", requester=lambda *_: response("mute", "t0"))
+        with self.assertRaises(StaleSnapshot):
+            service._execute_now(_local_intent(Action.MUTE, track=0), None, 0, 0, time.perf_counter(), "mute Pad", None)
+        self.assertFalse(bridge.state[(0, "mute")])
+
+    def test_multi_track_runtime_error_rolls_back_applied_batch(self) -> None:
+        from tests.support import StatefulLive
+
+        class RaiseAfterMultiWrite(StatefulLive):
+            def run(self, arguments):
+                result = super().run(arguments)
+                if arguments.count("--api-set") > 1:
+                    raise RuntimeError("after apply")
+                return result
+
+        bridge = RaiseAfterMultiWrite()
+        service = LiveJevService(bridge=bridge, snapshot=sample_snapshot(), key="x", requester=lambda *_: self.fail("Jev called"))
+        answer = service.process({"text": "mute all"})
+        self.assertEqual(answer["kind"], "error")
+        self.assertEqual(bridge.flags("mute"), {"Pad": False, "Bass": False, "Drums": False})
+
+    def test_complete_failed_chain_rollback_blocks_live_undo(self) -> None:
+        from tests.support import StatefulLive
+
+        bridge = StatefulLive()
+        bridge.inject_fault("set", "ok")
+        bridge.inject_fault("set", "error")
+        service = LiveJevService(bridge=bridge, snapshot=sample_snapshot(), key="x", requester=lambda *_: self.fail("Jev called"))
+        answer = service.process({"text": "mute Pad and solo Bass"})
+        self.assertEqual(answer["kind"], "error")
+        undo = service.process({"cmd": "undo"})
+        self.assertEqual(undo["kind"], "info")
+        self.assertFalse(any("--api-call" in call and "undo" in call for call in bridge.calls))
+
+    def test_missing_prewrite_parameter_value_aborts_without_write(self) -> None:
+        from tests.support import StatefulLive
+
+        class MissingParameters(StatefulLive):
+            def run(self, arguments):
+                result = super().run(arguments)
+                if "--api-device-parameters" in arguments:
+                    ack = result.acks[-1]
+                    return BridgeResult((replace(ack, payload={"parameters": []}),), result.elapsed_ms, 0, False)
+                return result
+
+        bridge = MissingParameters()
+        bridge.parameters["live_set tracks 0 devices 0 parameters 0"] = 0.7
+        service = LiveJevService(bridge=bridge, snapshot=sample_snapshot(), key="x", requester=lambda *_: response("param", "t0", "set", param="d0p0"))
+        answer = service.process({"text": "PadのDry/Wetを80%に"})
+        self.assertEqual(answer["kind"], "error")
+        self.assertFalse(any("--api-parameter-set" in call for call in bridge.calls))
+        self.assertAlmostEqual(bridge.parameters["live_set tracks 0 devices 0 parameters 0"], 0.7)
+
+    def test_ignored_send_write_is_not_reported_as_success(self) -> None:
+        from tests.support import StatefulLive
+
+        snapshot = replace(sample_snapshot(), tracks=tuple(replace(track, sends=(0.0,)) for track in sample_snapshot().tracks), returns=("Verb",))
+        bridge = StatefulLive(ignore_writes=True)
+        service = LiveJevService(bridge=bridge, snapshot=snapshot, key="x", requester=lambda *_: self.fail("Jev called"))
+        answer = service.process({"text": "Pad send A to 50%"})
+        self.assertNotEqual(answer["kind"], "result")
+        self.assertEqual(bridge.sends[(0, 0)], 0.0)
+
+    def test_numeric_undo_restores_small_raw_difference_exactly(self) -> None:
+        from tests.support import StatefulLive
+
+        snapshot = replace(sample_snapshot(), tracks=tuple(replace(track, sends=(0.49995,)) for track in sample_snapshot().tracks), returns=("Verb",))
+        bridge = StatefulLive()
+        bridge.sends[(0, 0)] = 0.49995
+        service = LiveJevService(bridge=bridge, snapshot=snapshot, key="x", requester=lambda *_: self.fail("Jev called"))
+        self.assertEqual(service.process({"text": "Pad send A to 50%"})["kind"], "result")
+        self.assertEqual(service.process({"cmd": "undo"})["kind"], "result")
+        self.assertEqual(bridge.sends[(0, 0)], 0.49995)
+
+    def test_unchanged_send_parameter_and_tempo_do_not_write_or_replace_history(self) -> None:
+        from tests.support import StatefulLive
+
+        snapshot = replace(sample_snapshot(), tracks=tuple(replace(track, sends=(0.5,)) for track in sample_snapshot().tracks), returns=("Verb",))
+        bridge = StatefulLive()
+        bridge.sends[(0, 0)] = 0.5
+        bridge.parameters["live_set tracks 0 devices 0 parameters 0"] = 0.25
+        service = LiveJevService(bridge=bridge, snapshot=snapshot, key="x", requester=lambda *_: response("param", "t0", "set", param="d0p0"))
+        marker = object()
+        service.previous = marker
+        for text in ("Pad send A to 50%", "PadのDry/Wetを25%に", "set tempo to 120"):
+            self.assertEqual(service.process({"text": text})["kind"], "info")
+            self.assertIs(service.previous, marker)
+        self.assertFalse(any("--api-parameter-set" in call or "--tempo" in call for call in bridge.calls))
 
 
 class JsonLineTests(unittest.TestCase):

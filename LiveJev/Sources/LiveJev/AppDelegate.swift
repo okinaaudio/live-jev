@@ -7,6 +7,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var panelController: PanelController?
     private var hotKey: HotKey?
     private var statusItem: NSStatusItem?
+    private var onboarding: Onboarding?
     private var loginItem: NSMenuItem?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -27,6 +28,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         viewModel.start()
+        if !UserDefaults.standard.bool(forKey: "LiveJevSetupDone") { showSetup() }
         // Do not show the on-demand UI at launch, which would display the pill after every login. Open it with Cmd-Shift-Space or the menu.
     }
 
@@ -52,6 +54,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func makeStatusMenu() -> NSMenu {
         let menu = NSMenu()
         menu.addItem(withTitle: viewModel.text(.show), action: #selector(showPanel), keyEquivalent: "")
+        menu.addItem(withTitle: viewModel.text(.setup), action: #selector(showSetup), keyEquivalent: "")
         let loginItem = menu.addItem(
             withTitle: viewModel.text(.launchAtLogin),
             action: #selector(toggleLoginItem),
@@ -108,6 +111,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return main
     }
 
+    @objc private func showSetup() {
+        if onboarding == nil { onboarding = Onboarding(viewModel: viewModel) }
+        onboarding?.show()
+    }
+
     @objc private func showPanel() {
         panelController?.showAndFocus()
     }
@@ -131,6 +139,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.mainMenu = makeMainMenu()
         statusItem?.menu = makeStatusMenu()
         panelController?.updateLocalizedText()
+        onboarding?.updateLocalizedText()
     }
 
     private func updateLoginItemState() {
