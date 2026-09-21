@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import sys
 import time
@@ -57,7 +58,14 @@ def scan() -> dict[str, object]:
 def main() -> int:
     data = scan()
     OUTPUT.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
-    print(f"{data['count']} 件を {OUTPUT} に書きました")
+    setting = os.environ.get("LIVE_JEV_LANG", "ja")
+    if setting == "auto":
+        locale = os.environ.get("LC_ALL") or os.environ.get("LC_MESSAGES") or os.environ.get("LANG", "")
+        setting = "ja" if locale.casefold().startswith("ja") else "en"
+    if setting == "en":
+        print(f"Wrote {data['count']} items to {OUTPUT}")
+    else:
+        print(f"{data['count']} 件を {OUTPUT} に書きました")
     return 0
 
 

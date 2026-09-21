@@ -19,7 +19,8 @@ enum AppLanguage: String, CaseIterable {
 
 enum AppText {
     enum Key {
-        case setup, setupTitle, installScript, selectLive, selectLiveHelp, addKey, keyHelp, shellKey, tryIt, tryHelp, install, update, chooseLibrary, saveKey, removeKey, getKey, done, finishLater, installed, olderScript, differentScript, missingScript, scriptProblem, installFailed, keyProblem, pending, ready, problem
+        case setup, setupTitle, installScript, selectLive, selectLiveHelp, addKey, keyHelp, shellKey, tryIt, tryHelp, install, update, chooseLibrary, saveKey, removeKey, getKey, done, finishLater, installed, installedRestart, runningScriptOutdated, olderScript, differentScript, missingScript, scriptProblem, installFailed, keyProblem, pending, ready, problem
+        case geminiKey, geminiHelp, geminiDisclosure, geminiSaved, geminiEmpty, geminiSaveFailed, getGeminiKey
         case show, launchAtLogin, version, quit, showDetails, language, automatic, japanese, english
         case edit, undo, redo, cut, copy, paste, selectAll
         case daemonStarting, refreshing, checkingLive, daemonUnavailable, daemonSendFailed
@@ -49,12 +50,21 @@ enum AppText {
         case .done: pair = ("完了", "Done")
         case .finishLater: pair = ("あとで設定", "Finish later")
         case .installed: pair = ("同じバージョンがインストール済み", "Installed · same version")
+        case .installedRestart: pair = ("インストールしました。Liveを再起動すると反映されます（Liveは起動時に読み込んだ部品を使い続けます）", "Installed. Restart Live to load it — Live keeps using the script it loaded at launch.")
+        case .runningScriptOutdated: pair = ("Liveの中で動いている部品が古いままです。Live本体を終了して起動し直してください", "Live is still running the old script. Quit Live and open it again.")
         case .olderScript: pair = ("古いバージョンがインストール済み", "Older version installed")
         case .differentScript: pair = ("別のバージョンがインストール済み", "Different version installed")
         case .missingScript: pair = ("未インストール", "Not installed")
         case .scriptProblem: pair = ("スクリプトのバージョンを確認できません。", "Could not read the script version.")
         case .installFailed: pair = ("インストールできません。保存先とアクセス権を確認してください。", "Could not install. Check the destination and permissions.")
         case .keyProblem: pair = ("キーチェーンにアクセスできません。", "Could not access the Keychain.")
+        case .geminiKey: pair = ("Gemini APIキー（任意）", "Gemini API key (optional)")
+        case .geminiHelp: pair = ("操作の意味が分からないときだけGeminiに問い合わせます。未設定でも使えます。", "Ask Gemini only when the operation is unclear. Live Jev works without this key.")
+        case .geminiDisclosure: pair = ("入力文、トラック・デバイス名、インストール済みプラグイン名をGoogleに送信します。API利用料がかかる場合があります。", "Sends your request, track/device names, and installed plug-in names to Google. API charges may apply.")
+        case .geminiSaved: pair = ("キーチェーンに保存しました", "Saved in Keychain")
+        case .geminiEmpty: pair = ("キーチェーン未設定。Geminiなしで続行できます。Geminiを使うには、ここにキーを保存してください。", "Not saved in Keychain. You can continue without Gemini. To use Gemini, save a key here.")
+        case .geminiSaveFailed: pair = ("キーチェーンに保存できませんでした", "Could not save to Keychain")
+        case .getGeminiKey: pair = ("Google AI Studioでキーを取得", "Get a key in Google AI Studio")
         case .pending: pair = ("未確認", "Pending")
         case .ready: pair = ("確認済み", "Ready")
         case .problem: pair = ("要確認", "Needs attention")
@@ -186,6 +196,7 @@ struct StatusMessage: Decodable, Sendable {
 struct LineMessage: Codable, Sendable {
     let id: String?
     let line: String
+    let via: String?
     let ms: Timing?
     let decision: Decision?
 }
@@ -194,11 +205,13 @@ struct AskMessage: Decodable, Sendable {
     let id: String?
     let line: String
     let options: [String]
+    let via: String?
 }
 
 struct ConfirmMessage: Decodable, Sendable {
     let id: String
     let line: String
+    let via: String?
 }
 
 enum DaemonMessage: Decodable, Sendable {

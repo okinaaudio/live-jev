@@ -7,7 +7,7 @@ from dataclasses import replace
 from typing import Literal
 
 from bridge_client import NATIVE_DEVICES
-from snapshot import Snapshot, is_bridge_track
+from snapshot import Snapshot, TargetKind, TargetRef, Track, is_bridge_track
 from intent import (
     Action,
     ClipNotesRequest,
@@ -22,6 +22,7 @@ from intent import (
     parse_number,
     eligible_track_indices,
     resolve_multi_endpoint,
+    resolve_addressable_target,
 )
 
 
@@ -98,26 +99,33 @@ def is_negated_en(utterance: str) -> bool:
 
 def _track_target_pattern(snapshot: Snapshot, include_master: bool = True) -> str:
     names = [re.escape(track.name) for track in snapshot.tracks if track.name and not is_bridge_track(track)]
+    names += [re.escape(track.name) for track in snapshot.returns if track.name]
+    names += [rf"return\s*{chr(ord('A') + track.index)}" for track in snapshot.returns]
     names.sort(key=len, reverse=True)
     fixed = [
         _alternation("selected_track"),
         r"track\s*\d+",
         r"(?:\d+)(?:st|nd|rd|th)\s+track",
+        r"return(?:\s+track)?\s+\d+",
+        r"(?:the\s+)?\d+(?:st|nd|rd|th)\s+return(?:\s+track)?",
+        r"(?:the\s+)?(?:first|second|third)\s+return(?:\s+track)?",
     ]
     if include_master:
         fixed += [r"master(?:\s+track)?", r"main(?:\s+(?:track|out))?", r"whole\s+mix", r"the\s+mix", r"everything"]
     return "(?:" + "|".join(fixed + names) + ")"
 
 
-def _track_en(snapshot: Snapshot, value: str) -> int | None | Literal["master", "selected"]:
+def _track_en(snapshot: Snapshot, value: str) -> int | TargetRef | None | Literal["master", "selected"]:
     text = value.strip().casefold()
     if text in {item.casefold() for item in ENGLISH_PHRASES["selected_track"]}:
         return "selected"
     text = re.sub(r"^the\s+", "", text)
     if text == "track":
         return "selected"
-    if text in {"master", "master track", "main", "main track", "main out", "whole mix", "mix", "everything"}:
-        return "master"
+    master_words = {"master", "master track", "main", "main track", "main out", "whole mix", "mix", "everything"}
+    resolved = resolve_addressable_target(snapshot, text)
+    if resolved is not None or text in master_words:
+        return resolved
     numbered = re.fullmatch(r"(?:track\s*(\d+)|(\d+)(?:st|nd|rd|th)\s+track)", text)
     if numbered:
         position = int(next(group for group in numbered.groups() if group))
@@ -125,18 +133,37 @@ def _track_en(snapshot: Snapshot, value: str) -> int | None | Literal["master", 
         return found.index if found is not None and position > 0 else None
     if text.endswith(" track"):
         text = text[:-6].strip()
-    matches = [
-        track.index for track in snapshot.tracks
-        if not is_bridge_track(track) and track.name.casefold() == text
-    ]
-    return matches[0] if len(matches) == 1 else None
+    return resolve_addressable_target(snapshot, text)
 
 
 def _find_target(snapshot: Snapshot, text: str, include_master: bool = True):
-    match = re.search(rf"(?<![\w])(?P<target>{_track_target_pattern(snapshot, include_master)})(?![\w])", text, re.IGNORECASE)
-    if not match:
+    target_pattern = _track_target_pattern(snapshot, include_master)
+    explicit = list(re.finditer(rf"\b(?:on|in|for|to)\s+(?:the\s+)?(?P<target>{target_pattern})(?![\w])", text, re.IGNORECASE))
+    if explicit:
+        match = explicit[-1]
+        target_match = re.search(rf"(?P<target>{target_pattern})(?![\w])$", match.group(0), re.IGNORECASE)
+        assert target_match is not None
+        start = match.start() + target_match.start()
+        end = match.start() + target_match.end()
+        return _track_en(snapshot, target_match.group("target")), (start, end)
+    matches = list(re.finditer(rf"(?<![\w])(?P<target>{target_pattern})(?![\w])", text, re.IGNORECASE))
+    matches = [
+        match for match in matches
+        if not (
+            match.group("target").casefold() in {"a", "an"}
+            and (
+                re.search(r"\bsend\s+$", text[:match.start()], re.IGNORECASE)
+                or re.match(r"\s+(?:little|bit|touch|track|channel)\b", text[match.end():], re.IGNORECASE)
+            )
+        )
+    ]
+    if not matches:
         return None, None
-    return _track_en(snapshot, match.group("target")), match.span()
+    resolved = [(_track_en(snapshot, match.group("target")), match) for match in matches]
+    if len({target for target, _match in resolved}) > 1:
+        return None, None
+    target, match = resolved[0]
+    return target, match.span()
 
 
 def _step(text: str, direction: str | None = None) -> Step:
@@ -176,9 +203,23 @@ def _clean_object(value: str) -> str:
     return text.strip(" ,\"'")
 
 
+_PLAIN_RETURN_PATTERN = (
+    r"(?:(?:create|make|add)\s+(?:(?:a|an)\s+)?(?:(?:new|another|fresh)\s+)?return(?:\s+track)?|"
+    r"(?:a\s+)?new\s+return(?:\s+track)?)(?:\s+(?:named|called)\s+(.+))?"
+)
+
+
 def _new_track_request(text: str, snapshot: Snapshot) -> tuple[str, str | None, str | None] | None:
     working, track_name = _named_track(text)
     working = re.sub(rf"^(?:{_alternation('request_prefix')})\s+", "", working, flags=re.IGNORECASE)
+    return_match = re.fullmatch(
+        r"(?:create|make|add)?\s*(?:an?\s+)?(?:new\s+)?return(?:\s+track)?\s+(?:with|containing)\s+(?P<object>.+)",
+        working,
+        re.IGNORECASE,
+    )
+    if return_match:
+        raw = _clean_object(return_match.group("object"))
+        return (raw, "return", track_name) if raw else None
     kind_match = re.search(r"\b(audio|midi|instrument)\s+track\b", working, re.IGNORECASE)
     kind = "audio" if kind_match and kind_match.group(1).casefold() == "audio" else None
     insert = _alternation("insert")
@@ -214,11 +255,13 @@ def extract_plugin_request_en(utterance: str, snapshot: Snapshot) -> PluginReque
     if is_negated_en(utterance):
         return None
     text = normalize_english_phrase(utterance)
+    if re.fullmatch(_PLAIN_RETURN_PATTERN, text, re.IGNORECASE):
+        return None
     new_request = _new_track_request(text, snapshot)
     if new_request is not None:
         raw, kind, track_name = new_request
         if resolve_native_device(raw) is None:
-            return PluginRequest(Action.ADD_TRACK_WITH_PLUGIN, raw, None, track_name or kind)
+            return PluginRequest(Action.ADD_TRACK_WITH_PLUGIN, raw, None, track_name or (kind if kind != "return" else None), track_kind=kind or "midi")
         return None
 
     insert = _alternation("insert")
@@ -249,8 +292,8 @@ def extract_plugin_request_en(utterance: str, snapshot: Snapshot) -> PluginReque
 
 def _device_in(snapshot: Snapshot, text: str):
     choices = [
-        (track.index, device)
-        for track in snapshot.tracks if not is_bridge_track(track)
+        (track.index if isinstance(track, Track) else track.ref, device)
+        for track in snapshot.addressable_targets if not (isinstance(track, Track) and is_bridge_track(track))
         for device in track.devices if device.name
     ]
     choices.sort(key=lambda pair: len(pair[1].name), reverse=True)
@@ -297,6 +340,12 @@ def _parse_local_en(utterance: str, snapshot: Snapshot) -> Intent | None:
     multi_action = next((action for pattern, action in multi_patterns if re.search(pattern, text)), None)
     eligible = eligible_track_indices(snapshot)
     if multi_action is not None:
+        literal_targets = {
+            _track_en(snapshot, match.group("target"))
+            for match in re.finditer(rf"(?<![\w])(?P<target>{_track_target_pattern(snapshot)})(?![\w])", text, re.IGNORECASE)
+        }
+        if len(literal_targets) > 1 and re.search(r"\s+and\s+|,", text, re.IGNORECASE):
+            return _local_intent(multi_action, track_stated=1.0)
         action_word = r"(?:mute|unmute|solo|unsolo|arm|disarm)"
         literal = next((track for track in snapshot.tracks if re.fullmatch(action_word + r"\s+" + re.escape(track.name), text, re.IGNORECASE)), None)
         if literal is not None:
@@ -355,6 +404,11 @@ def _parse_local_en(utterance: str, snapshot: Snapshot) -> Intent | None:
         device = resolve_native_device(raw)
         if device is not None:
             return _local_intent(Action.ADD_TRACK_WITH_DEVICE, text=original_track_name or track_name, track_kind=kind or "midi", native_device=device)
+    plain_return = re.fullmatch(_PLAIN_RETURN_PATTERN, text, re.IGNORECASE)
+    if plain_return:
+        original = re.fullmatch(_PLAIN_RETURN_PATTERN, utterance.strip(), re.IGNORECASE)
+        name = _clean_object(original.group(1) or "") if original else _clean_object(plain_return.group(1) or "")
+        return _local_intent(Action.ADD_RETURN_TRACK, text=name or None, track_kind="return")
     plain_track = re.fullmatch(r"(?:create|make|add)\s+(?:(?:a|an)\s+)?(?:(?:new|another|fresh)\s+)?(?:(midi|audio|instrument)\s+)?track(?:\s+(?:named|called)\s+(.+))?", text)
     if plain_track:
         action = Action.ADD_AUDIO_TRACK if plain_track.group(1) == "audio" else Action.ADD_MIDI_TRACK
@@ -509,7 +563,13 @@ _TRACK_DEFAULT_ACTIONS = {
 
 def _has_unresolved_target_words(text: str, intent: Intent, snapshot: Snapshot) -> bool:
     # Identifiers go first: once "send" is removed as a word, the "b" of "send B" would read as a leftover name.
-    residual = re.sub(r"(?:[-+]\s*\d+(?:\.\d+)?|\d+(?:\.\d+)?\s*(?:%|percent|db|decibels?|bpm|st|semitones?)|\b(?:to|by|at|of)\s+\d+(?:\.\d+)?)", " ", text, flags=re.IGNORECASE)
+    residual = re.sub(
+        r"\b(?:return(?:\s+track)?\s+\d+|(?:the\s+)?\d+(?:st|nd|rd|th)\s+return(?:\s+track)?|(?:the\s+)?(?:first|second|third)\s+return(?:\s+track)?|track\s*\d+|\d+(?:st|nd|rd|th)\s+track)\b",
+        " ",
+        text,
+        flags=re.IGNORECASE,
+    )
+    residual = re.sub(r"(?:[-+]\s*\d+(?:\.\d+)?|\d+(?:\.\d+)?\s*(?:%|percent|db|decibels?|bpm|st|semitones?)|\b(?:to|by|at|of)\s+\d+(?:\.\d+)?)", " ", residual, flags=re.IGNORECASE)
     residual = re.sub(r"\bsend\s+(?:[a-z]|\d+)\b", " ", residual, flags=re.IGNORECASE)
     # A bare number next to a pan side is an amount ("pan left 20", "20 to the left"), not a track called "20".
     residual = re.sub(r"\b(?:left|right)\s+\d+(?:\.\d+)?|\d+(?:\.\d+)?\s+(?:to\s+the\s+)?(?:left|right)\b", " ", residual, flags=re.IGNORECASE)
@@ -518,9 +578,11 @@ def _has_unresolved_target_words(text: str, intent: Intent, snapshot: Snapshot) 
         {phrase for phrases in ENGLISH_PHRASES.values() for phrase in phrases}, key=len, reverse=True
     ):
         residual = re.sub(rf"(?<!\w){re.escape(phrase)}(?!\w)", " ", residual, flags=re.IGNORECASE)
-    for track in sorted(snapshot.tracks, key=lambda item: len(item.name), reverse=True):
+    for track in sorted(snapshot.addressable_targets, key=lambda item: len(item.name), reverse=True):
         if track.name:
             residual = re.sub(rf"(?<!\w){re.escape(track.name)}(?!\w)", " ", residual, count=1, flags=re.IGNORECASE)
+    for track in snapshot.returns:
+        residual = re.sub(rf"\breturn\s*{chr(ord('A') + track.index)}\b", " ", residual, flags=re.IGNORECASE)
     if intent.device_name:
         residual = re.sub(rf"(?<!\w){re.escape(intent.device_name)}(?!\w)", " ", residual, flags=re.IGNORECASE)
     residual = re.sub(
@@ -548,7 +610,7 @@ def parse_local_en(utterance: str, snapshot: Snapshot) -> Intent | None:
     normalized = normalize_english_phrase(utterance)
     exact_named_toggle = intent is not None and intent.target_origin is TargetOrigin.NAMED and any(
         re.fullmatch(r"(?:mute|unmute|solo|unsolo|arm|disarm)\s+" + re.escape(track.name), normalized, re.IGNORECASE)
-        for track in snapshot.tracks if track.name
+        for track in snapshot.addressable_targets if track.name
     )
     if intent is not None and (exact_named_toggle or intent.target_origin in {TargetOrigin.RANGE, TargetOrigin.ALL, TargetOrigin.EXCEPT, TargetOrigin.ONLY}):
         return intent
@@ -556,8 +618,18 @@ def parse_local_en(utterance: str, snapshot: Snapshot) -> Intent | None:
         return intent
     if _has_unresolved_target_words(normalized, intent, snapshot):
         return replace(intent, track=None, track_conf=0.0, track_stated=1.0, named_evidence=1.0, target_origin=TargetOrigin.NONE)
+    literal_targets = {
+        _track_en(snapshot, match.group("target"))
+        for match in re.finditer(rf"(?<![\w])(?P<target>{_track_target_pattern(snapshot)})(?![\w])", normalized, re.IGNORECASE)
+    }
+    if len(literal_targets) > 1 and intent.action is not Action.SEND:
+        return replace(intent, track=None, track_conf=0.0, track_stated=1.0, named_evidence=1.0, target_origin=TargetOrigin.NONE)
     if intent.track is None and intent.track_stated >= TRACK_STATED_MIN:
-        numbered = re.search(r"\b(?:track\s*\d+|\d+(?:st|nd|rd|th)\s+track)\b", utterance, re.IGNORECASE)
+        numbered = re.search(
+            r"\b(?:return(?:\s+track)?\s+\d+|(?:the\s+)?\d+(?:st|nd|rd|th)\s+return(?:\s+track)?|(?:the\s+)?(?:first|second|third)\s+return(?:\s+track)?|track\s*\d+|\d+(?:st|nd|rd|th)\s+track)\b",
+            utterance,
+            re.IGNORECASE,
+        )
         if numbered and _track_en(snapshot, numbered.group(0)) is None:
             return intent
         return replace(intent, track_stated=0.0, named_evidence=0.0)

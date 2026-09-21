@@ -16,6 +16,7 @@
 
 import json
 import math
+import re
 import socket
 
 import Live
@@ -28,6 +29,7 @@ SOCKET_HOST = "127.0.0.1"
 SOCKET_PORT = 9140
 BUFFER_SIZE = 65536
 MAX_ITEMS = 5000
+MAX_BRIDGE_OPS = 1024
 SECTIONS = ("plugins", "instruments", "audio_effects", "midi_effects")
 
 
@@ -46,8 +48,14 @@ class LiveJev(ControlSurface):
         self._running = False
         self._timer = None
         self._last_socket_error = None
+        self._socket_errors = set()
         self._catalog = None
-        self._pump = SocketPump(self._create_listener, self._handle_command, on_error=self._socket_error)
+        self._pump = SocketPump(
+            self._create_listener,
+            self._handle_command,
+            on_error=self._socket_error,
+            require_json_objects=True,
+        )
         self._start_polling()
         self.log_message("LiveJev: started, listening on port %d" % SOCKET_PORT)
 
@@ -63,8 +71,11 @@ class LiveJev(ControlSurface):
             self.schedule_message(1, self._poll_and_rearm)
 
     def _poll(self):
-        if self._running:
-            self._pump.poll()
+        try:
+            if self._running:
+                self._pump.poll()
+        except Exception as error:
+            self._socket_error(error)
 
     def _poll_and_rearm(self):
         if not self._running or self._timer is not None:
@@ -88,19 +99,26 @@ class LiveJev(ControlSurface):
 
     def _socket_error(self, error):
         message = str(error)
-        if message != self._last_socket_error:
+        seen = getattr(self, "_socket_errors", None)
+        if seen is None:
+            seen = set()
+            self._socket_errors = seen
+        if message not in seen:
             self.log_message("LiveJev socket error: %s" % message)
-            self._last_socket_error = message
+            seen.add(message)
+        self._last_socket_error = message
 
     def _handle_command(self, raw):
         try:
             cmd = json.loads(raw)
         except Exception:
-            return json.dumps({"ok": False, "error": "invalid_json"})
+            raise ValueError("invalid_json")
+        if not isinstance(cmd, dict):
+            raise ValueError("invalid_json")
         action = cmd.get("action", "")
         try:
             if action == "ping":
-                answer = {"ok": True, "message": "pong", "version": "0.16"}
+                answer = {"ok": True, "message": "pong", "version": "0.18"}
             elif action == "bridge":
                 request = cmd.get("request")
                 ops = cmd.get("ops")
@@ -120,7 +138,8 @@ class LiveJev(ControlSurface):
                 name = str(cmd.get("name", "")).strip()
                 uri = str(cmd.get("uri", "")).strip()
                 track_index = cmd.get("track_index", None)
-                answer = self._load(name, uri, track_index) if name or uri else {"ok": False, "error": "no_name"}
+                target_path = cmd.get("target_path", None)
+                answer = self._load(name, uri, track_index, target_path) if name or uri else {"ok": False, "error": "no_name"}
             elif action == "add_track":
                 answer = self._add_track(cmd)
             elif action == "clip_notes":
@@ -128,10 +147,19 @@ class LiveJev(ControlSurface):
             else:
                 answer = {"ok": False, "error": "unknown_action"}
         except Exception as error:
-            answer = {"ok": False, "error": str(error)}
+            answer = {"ok": False, "error": self._public_error(error)}
         return json.dumps(answer, ensure_ascii=False)
 
+    def _public_error(self, error):
+        message = str(error)
+        if isinstance(error, ValueError) and re.fullmatch(r"[a-z][a-z0-9_]*", message):
+            return message
+        self.log_message("LiveJev command error: %s" % message)
+        return "internal_error"
+
     def _run_bridge(self, request, ops):
+        if len(ops) > MAX_BRIDGE_OPS:
+            return {"ok": False, "request": request, "error": "too_many_ops"}
         results = []
         for op in ops:
             if not isinstance(op, dict):
@@ -172,8 +200,8 @@ class LiveJev(ControlSurface):
             if name == "ping":
                 return {"ok": True, "value": None}
             return {"ok": False, "error": "unknown_operation"}
-        except Exception as e:
-            return {"ok": False, "error": str(e)}
+        except Exception as error:
+            return {"ok": False, "error": self._public_error(error)}
 
     def _execute_lom(self, name, op):
         path = str(op.get("path", ""))
@@ -202,6 +230,11 @@ class LiveJev(ControlSurface):
         return {"ok": True, "value": self._parameter_payload(target, path)}
 
     def _coerce_set_value(self, prop, raw):
+        if prop == "name":
+            value = str(raw)
+            if not value.strip() or len(value) > 64 or any(ord(ch) < 32 for ch in value):
+                raise ValueError("invalid_name")
+            return value
         if prop in ("loop", "metronome", "session_record", "overdub", "mute", "solo", "arm", "fold_state", "looping", "warping"):
             if raw not in (0, 1, False, True):
                 raise ValueError("invalid_value")
@@ -250,14 +283,10 @@ class LiveJev(ControlSurface):
         position = str(op.get("position", ""))
         if name not in NATIVE_DEVICES or (position and not position.isdigit()):
             return {"ok": False, "error": "invalid_device"}
-        prefix = "live_set tracks "
-        if not path.startswith(prefix) or not path[len(prefix):].isdigit():
-            return {"ok": False, "error": "invalid_track"}
-        track_index = int(path[len(prefix):])
-        tracks = list(self.song().tracks)
-        if track_index < 0 or track_index >= len(tracks):
-            return {"ok": False, "error": "track_not_found"}
-        track = tracks[track_index]
+        try:
+            track = self._target_for_path(path)
+        except ValueError as error:
+            return {"ok": False, "error": str(error)}
         before = list(track.devices)
         insertion = len(before) if position == "" else int(position)
         if insertion < 0 or insertion > len(before):
@@ -267,7 +296,7 @@ class LiveJev(ControlSurface):
                 track.view.selected_device = before[insertion - 1]
             except Exception:
                 pass
-        answer = self._load(name, "", track_index)
+        answer = self._load(name, "", None, path)
         if not answer.get("ok"):
             return answer
         if position != "":
@@ -277,10 +306,6 @@ class LiveJev(ControlSurface):
                 try:
                     self.song().move_device(added[0], track, insertion)
                 except Exception:
-                    try:
-                        self.song().undo()
-                    except Exception:
-                        pass
                     return {"ok": False, "error": "insert_position_failed"}
         return {"ok": True, "value": None}
 
@@ -292,13 +317,13 @@ class LiveJev(ControlSurface):
 
     def _track_path(self, track):
         song = self.song()
-        tracks = list(song.tracks)
+        tracks = _safe(lambda: list(song.tracks), [])
         if track in tracks:
             return "live_set tracks %d" % tracks.index(track)
-        returns = list(song.return_tracks)
+        returns = _safe(lambda: list(song.return_tracks), [])
         if track in returns:
             return "live_set return_tracks %d" % returns.index(track)
-        if track == song.master_track:
+        if track == _safe(lambda: song.master_track, None):
             return "live_set master_track"
         return ""
 
@@ -429,6 +454,9 @@ class LiveJev(ControlSurface):
         if target == "master":
             track = song.master_track
             path = "live_set master_track"
+        elif target.startswith("live_set "):
+            path = target
+            track = self._target_for_path(path)
         else:
             index = int(target)
             tracks = list(song.tracks)
@@ -455,7 +483,12 @@ class LiveJev(ControlSurface):
             "song": context["song"],
             "selected_track_path": context["selected"]["track"]["path"],
             "tracks": [],
-            "master": {"volume": self._mixer_payload(song.master_track, "live_set master_track")["parameters"]["volume"]},
+            "master": {
+                "path": "live_set master_track",
+                "name": str(song.master_track.name),
+                "mixer": {"volume": self._mixer_payload(song.master_track, "live_set master_track")["parameters"]["volume"]},
+                "devices": [],
+            },
             "scenes": [],
             "returns": [],
         }
@@ -467,11 +500,38 @@ class LiveJev(ControlSurface):
             })
             yield None
         for index, track in enumerate(list(song.return_tracks)):
-            payload["returns"].append({
+            path = "live_set return_tracks %d" % index
+            mixer = self._mixer_payload(track, path)["parameters"]
+            item = {
                 "index": index, "path": "live_set return_tracks %d" % index,
                 "name": str(track.name),
-            })
+                "mute": bool(track.mute),
+                "solo": bool(track.solo),
+                "mixer": {"volume": mixer["volume"], "panning": mixer["panning"]},
+                "devices": [],
+            }
+            for device_index, device in enumerate(list(track.devices)):
+                device_path = path + " devices %d" % device_index
+                device_item = self._device_header(device, device_path, device_index)
+                device_item["parameters"] = []
+                for parameter_index, parameter in enumerate(list(device.parameters)):
+                    raw = self._parameter_payload(parameter, device_path + " parameters %d" % parameter_index)
+                    raw["index"] = parameter_index
+                    device_item["parameters"].append(raw)
+                    yield None
+                item["devices"].append(device_item)
+            payload["returns"].append(item)
             yield None
+        for device_index, device in enumerate(list(song.master_track.devices)):
+            device_path = "live_set master_track devices %d" % device_index
+            device_item = self._device_header(device, device_path, device_index)
+            device_item["parameters"] = []
+            for parameter_index, parameter in enumerate(list(device.parameters)):
+                raw = self._parameter_payload(parameter, device_path + " parameters %d" % parameter_index)
+                raw["index"] = parameter_index
+                device_item["parameters"].append(raw)
+                yield None
+            payload["master"]["devices"].append(device_item)
         for index, track in enumerate(list(song.tracks)):
             path = "live_set tracks %d" % index
             mixer = self._mixer_payload(track, path)["parameters"]
@@ -598,14 +658,39 @@ class LiveJev(ControlSurface):
                 stack.append(child)
         return None
 
-    def _load(self, name, uri, track_index):
+    def _target_for_path(self, path):
         song = self.song()
-        tracks = list(song.tracks)
-        if track_index is not None:
+        if path == "live_set master_track":
+            target = _safe(lambda: song.master_track, None)
+            if target is None:
+                raise ValueError("track_not_found")
+            return target
+        match = re.match(r"^live_set (tracks|return_tracks) ([0-9]+)$", str(path))
+        if match is None:
+            raise ValueError("invalid_track")
+        collection = _safe(lambda: list(song.tracks if match.group(1) == "tracks" else song.return_tracks), [])
+        index = int(match.group(2))
+        if index < 0 or index >= len(collection):
+            raise ValueError("track_not_found")
+        return collection[index]
+
+    def _load(self, name, uri, track_index, target_path=None):
+        song = self.song()
+        tracks = _safe(lambda: list(song.tracks), [])
+        if target_path is not None:
+            path = str(target_path)
+            try:
+                target = self._target_for_path(path)
+            except ValueError as error:
+                return {"ok": False, "error": str(error)}
+        elif track_index is not None:
             index = int(track_index)
             if index < 0 or index >= len(tracks):
                 return {"ok": False, "error": "track_not_found"}
-            song.view.selected_track = tracks[index]
+            target = tracks[index]
+            path = self._track_path(target)
+        else:
+            return {"ok": False, "error": "track_not_found"}
         entry = self._find_item(name, uri)
         if entry is None:
             return {"ok": False, "error": "plugin_not_found", "name": name}
@@ -614,34 +699,61 @@ class LiveJev(ControlSurface):
             return {"ok": False, "error": "browser_item_missing", "name": entry["name"]}
         browser = self._browser()
     # Calling load_item during hot-swap, opened with a device's Q button, replaces that device. Never replace it.
-        hotswap = getattr(browser, "hotswap_target", None)
+        hotswap = _safe(lambda: browser.hotswap_target, None)
         if hotswap is not None:
             return {"ok": False, "error": "hotswap_active", "name": entry["name"]}
+        if entry.get("section") == "instruments" and (path == "live_set master_track" or path.startswith("live_set return_tracks ")):
+            return {"ok": False, "error": "instrument_on_non_midi", "name": entry["name"], "target_path": path}
     # Let Live choose the insertion point, as it does on a browser double-click: effects follow the selected device, and instruments replace the existing instrument.
-        target = song.view.selected_track
-        before = [str(d.name) for d in target.devices]
-        browser.load_item(item)
-        after = [str(d.name) for d in target.devices]
+        previous = _safe(lambda: song.view.selected_track, None)
+        before_tracks = _safe(lambda: list(song.tracks), [])
+        before = _safe(lambda: [str(d.name) for d in target.devices], [])
+        try:
+            song.view.selected_track = target
+            browser.load_item(item)
+            after = _safe(lambda: [str(d.name) for d in target.devices], [])
+            after_tracks = _safe(lambda: list(song.tracks), [])
+        except Exception:
+            return {"ok": False, "error": "load_rejected", "name": entry["name"], "target_path": path}
+        finally:
+            if previous is not None:
+                try:
+                    song.view.selected_track = previous
+                except Exception:
+                    pass
+        if len(after_tracks) > len(before_tracks):
+            created = next((index for index, candidate in enumerate(after_tracks) if candidate not in before_tracks), len(before_tracks))
+            return {"ok": False, "error": "load_created_track", "created_index": created, "name": entry["name"], "target_path": path}
         selected_index = tracks.index(target) if target in tracks else None
+        if len(after) <= len(before):
+            self.log_message("LiveJev: pending %s on track %s (%d -> %d devices)" % (entry["name"], selected_index, len(before), len(after)))
+            return {"ok": True, "pending": True, "name": entry["name"], "uri": entry["uri"], "track_index": selected_index, "target_path": path, "devices_before": before, "devices_after": after}
         self.log_message("LiveJev: loaded %s on track %s (%d -> %d devices)" % (entry["name"], selected_index, len(before), len(after)))
-        return {"ok": True, "name": entry["name"], "uri": entry["uri"], "track_index": selected_index, "devices_before": before, "devices_after": after}
+        return {"ok": True, "name": entry["name"], "uri": entry["uri"], "track_index": selected_index, "target_path": path, "devices_before": before, "devices_after": after}
 
     def _add_track(self, cmd):
         song = self.song()
         kind = str(cmd.get("kind", "midi"))
+        if kind not in ("midi", "audio", "return"):
+            return {"ok": False, "error": "invalid_kind"}
         name = str(cmd.get("name") or "").strip()
         device = str(cmd.get("device") or "").strip()
         browser = self._browser()
         item = None
+        entry = None
         if device:
             if getattr(browser, "hotswap_target", None) is not None:
                 return {"ok": False, "error": "hotswap_active", "name": device}
             entry = self._find_item(device, "")
             if entry is None:
                 return {"ok": False, "error": "plugin_not_found", "name": device}
+            if kind == "return" and entry.get("section") == "instruments":
+                return {"ok": False, "error": "instrument_on_non_midi", "name": entry["name"]}
             item = self._resolve_browser_item(entry)
             if item is None:
                 return {"ok": False, "error": "browser_item_missing", "name": entry["name"]}
+        if kind == "return" and len(song.return_tracks) >= 12:
+            return {"ok": False, "error": "return_limit"}
         tracks = list(song.tracks)
         selected = song.view.selected_track
         index = tracks.index(selected) + 1 if selected in tracks else -1
@@ -649,14 +761,31 @@ class LiveJev(ControlSurface):
             index = -1
         song.begin_undo_step()
         try:
-            track = song.create_audio_track(index) if kind == "audio" else song.create_midi_track(index)
+            if kind == "return":
+                try:
+                    song.create_return_track()
+                except Exception:
+                    return {"ok": False, "error": "return_limit"}
+                returns = list(song.return_tracks)
+                if not returns:
+                    return {"ok": False, "error": "return_limit"}
+                track = returns[-1]
+            elif kind == "audio":
+                track = song.create_audio_track(index)
+            else:
+                track = song.create_midi_track(index)
             if name:
                 track.name = name
             song.view.selected_track = track
             if item is not None:
                 browser.load_item(item)
-            new_index = list(song.tracks).index(track)
             after = [str(d.name) for d in track.devices]
+            if kind == "return":
+                new_index = list(song.return_tracks).index(track)
+                path = "live_set return_tracks %d" % new_index
+                self.log_message("LiveJev: added return track at %d (%s)" % (new_index, ", ".join(after)))
+                return {"ok": True, "kind": "return", "return_index": new_index, "target_path": path, "track": str(track.name), "devices_after": after}
+            new_index = list(song.tracks).index(track)
             self.log_message("LiveJev: added %s track at %d (%s)" % (kind, new_index, ", ".join(after)))
             return {"ok": True, "track_index": new_index, "track": str(track.name), "devices_after": after}
         finally:

@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import json
+import os
 import socket
 import sys
 from typing import Any, Mapping
+
+from messages import resolve_language
 
 HOST = "127.0.0.1"
 PORT = 9140
@@ -52,8 +55,9 @@ def list_plugins(refresh: bool = False) -> list[dict[str, str]]:
     return [dict(item) for item in items if isinstance(item, Mapping)] if isinstance(items, list) else []
 
 
-def load(name: str, track_index: int | None, uri: str = "") -> Mapping[str, Any]:
-    answer = call("load", timeout=70.0, name=name, uri=uri, track_index=track_index)
+def load(name: str, target: int | str | None, uri: str = "") -> Mapping[str, Any]:
+    fields = {"target_path": target} if isinstance(target, str) else {"track_index": target}
+    answer = call("load", timeout=70.0, name=name, uri=uri, **fields)
     if not answer.get("ok"):
         raise ScriptError(str(answer.get("error") or "load_failed"))
     return answer
@@ -83,8 +87,10 @@ def version() -> str | None:
 
 
 def main() -> int:
+    lang = resolve_language(os.environ.get("LIVE_JEV_LANG"), default="ja")
     if len(sys.argv) < 2 or sys.argv[1] not in {"ping", "list", "load"}:
-        print("使い方: plugin_script.py ping | list [--refresh] | load <名前> [トラック番号(0始まり)]", file=sys.stderr)
+        usage = "使い方: plugin_script.py ping | list [--refresh] | load <名前> [トラック番号(0始まり)]" if lang == "ja" else "Usage: plugin_script.py ping | list [--refresh] | load <name> [zero-based-track-number]"
+        print(usage, file=sys.stderr)
         return 2
     command = sys.argv[1]
     try:
@@ -95,7 +101,7 @@ def main() -> int:
             items = list_plugins(refresh="--refresh" in sys.argv)
             for item in items:
                 print(f"{item.get('section', ''):14s} {item.get('name', '')}")
-            print(f"{len(items)} 件", file=sys.stderr)
+            print(f"{len(items)} 件" if lang == "ja" else f"{len(items)} items", file=sys.stderr)
             return 0
         track = int(sys.argv[3]) if len(sys.argv) > 3 else None
         print(json.dumps(load(sys.argv[2], track), ensure_ascii=False))

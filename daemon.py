@@ -4,32 +4,46 @@
 from __future__ import annotations
 
 import argparse
+from collections import OrderedDict, deque
 from dataclasses import dataclass, field, replace
 import http.client
+import inspect
 import json
 import math
 import os
 from pathlib import Path
+import queue
 import re
 import shlex
 import socket
 import sys
+import threading
 import time
 import traceback
 from typing import Any, Callable, Literal, Mapping, Union
 from urllib.parse import urlsplit
 
-from actions import ACTIONS, request_id, beats_to_bar, MONITOR_NAMES
+from actions import ACTIONS, DISPATCH_ONLY_ACTIONS, request_id, beats_to_bar, MONITOR_NAMES, target_capability_error, target_for_intent
 from bridge_client import Ack, BridgeClient, BridgeError, BridgeResult, NATIVE_DEVICES, ack_map, make_bridge_client
 import plugin_script
-from intent import NAMED_TRACK_CONF_MIN, TRACK_STATED_MIN, TRACK_UNSTATED_MAX, ClipNotesRequest, parse_clip_notes_phrase, PluginRequest, extract_plugin_request, plugin_intent, resolve_plugin_name, resolve_bare_plugin_name, resolve_native_device, GENERIC_DEVICE_WORDS, ACTION_LABELS, Action, Intent, IntentResult, Number, Step, TargetOrigin, _local_intent, build_request, candidate_params, interpret_response, parse_local, split_compound, eligible_track_indices, MULTI_TOGGLE_ACTIONS, MULTI_TARGET_ORIGINS
-from llm_rewrite import GeminiRewriter
+from intent import NAMED_TRACK_CONF_MIN, TRACK_STATED_MIN, TRACK_UNSTATED_MAX, ClipNotesRequest, parse_clip_notes_phrase, PluginRequest, extract_plugin_request, plugin_intent, plugin_name_candidates, resolve_exact_plugin_name, resolve_plugin_name, resolve_native_device, resolve_device_request_name, GENERIC_DEVICE_WORDS, ACTION_LABELS, Action, Intent, IntentResult, Number, Step, TargetOrigin, _local_intent, build_request, candidate_params, interpret_response, parse_local, split_compound, eligible_track_indices, MULTI_TOGGLE_ACTIONS, MULTI_TARGET_ORIGINS
+from llm_rewrite import GeminiRewriter, RewriteFailure
 from messages import LocalizedError, action_label, contains_japanese, render, resolve_language, step_label, using_language
-from snapshot import Param, Snapshot, build_snapshot, is_bridge_track, replace_param, replace_track, Clip
+from snapshot import Param, ReturnTrack, Snapshot, TargetKind, TargetRef, Track, addressable_targets, build_snapshot, is_bridge_track, replace_param, replace_target, replace_track, target_ref, Clip
 
 
 API_URL = "https://api.typesafe.ai/v1/systemone"
 ERROR_LINE = "Liveに繋がりません。装置が載っているか確認してください"
+MIN_SCRIPT_VERSION = "0.18"
+
+
+def _version_is_older(version: str, minimum: str) -> bool:
+    try:
+        current = tuple(int(part) for part in version.split("."))
+        required = tuple(int(part) for part in minimum.split("."))
+    except (AttributeError, TypeError, ValueError):
+        return True
+    return current < required
 
 
 class WriteResultUnknown(RuntimeError):
@@ -61,6 +75,8 @@ def read_key(variable: str = "TYPESAFE_API_KEY") -> str | None:
     key = os.environ.get(variable, "").strip()
     if key:
         return key
+    if variable == "GEMINI_API_KEY":
+        return None
     # Apps launched from Finder do not inherit shell environment variables, so also read export lines from shell configuration files.
     lines: list[str] = []
     for name in (".zshenv", ".zprofile", ".zshrc", ".bash_profile", ".bashrc", ".profile"):
@@ -85,6 +101,10 @@ def read_key(variable: str = "TYPESAFE_API_KEY") -> str | None:
         elif len(parts) == 1 and parts[0].strip():
             found_key = parts[0].strip()
     return found_key
+
+
+class JevRequestTooLarge(RuntimeError):
+    pass
 
 
 class JevClient:
@@ -121,6 +141,16 @@ class JevClient:
                 response = connection.getresponse()
                 raw = response.read()
                 if not 200 <= response.status < 300:
+                    if response.status == 400:
+                        try:
+                            error = json.loads(raw.decode("utf-8"))
+                        except (ValueError, UnicodeError, json.JSONDecodeError):
+                            error = None
+                        if isinstance(error, Mapping):
+                            detail = error.get("detail")
+                            if isinstance(detail, Mapping) and detail.get("error_type") == "max_tokens_exceeded":
+                                self._discard_connection()
+                                raise JevRequestTooLarge()
                     raise http.client.HTTPException(f"Jev HTTP {response.status}")
                 decoded = json.loads(raw.decode("utf-8"))
                 if not isinstance(decoded, Mapping) or not isinstance(decoded.get("answers"), Mapping):
@@ -141,6 +171,7 @@ class JevClient:
 
 
 _DEFAULT_JEV = JevClient()
+_REPROCESS_PENDING = object()
 
 
 def request_jev(payload: Mapping[str, Any], key: str) -> Mapping[str, Any]:
@@ -332,6 +363,7 @@ class Pending:
     field: str
     created: float = field(default_factory=time.monotonic)
     request_id: Any = None
+    options: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -396,6 +428,11 @@ PLUGIN_HINT = re.compile(r"トラック|挿|差|入れ|いれ|載せ|のせ|開|
 STRONG_NEGATION = re.compile(r"ないで|しなくて|するな|不要|いらない|要らない|禁止|\b(?:don't|do not|never|no need|not necessary)\b", re.IGNORECASE)
 SNAPSHOT_TRUST_SECONDS = 10.0  # Assume the song structure is unchanged if the snapshot was taken or checked within this interval.
 PENDING_TTL_SECONDS = 30.0
+LLM_DEADLINE_SECONDS = 2.0
+LLM_ATTEMPT_TTL_SECONDS = 60.0
+LLM_ATTEMPT_LIMIT = 128
+LLM_RATE_LIMIT = 5
+LLM_RATE_WINDOW_SECONDS = 60.0
 PLUGIN_LOAD_WAIT_SECONDS = 25.0  # Large instruments such as Omnisphere and Kontakt can take more than 10 seconds to load.
 
 
@@ -555,6 +592,11 @@ class LiveJevService:
         self._plugin_uris = {}
         self._plugin_script_ok = None
         self._startup_notice_emitted = False
+        self._llm_attempts: OrderedDict[str, float] = OrderedDict()
+        self._llm_rate: deque[float] = deque()
+        self._llm_cooldown_until = 0.0
+        self._llm_disabled = False
+        self._llm_worker: threading.Thread | None = None
         self.lang = resolve_language(os.environ.get("LIVE_JEV_LANG"), default="ja")
 
     def _m(self, key: str, **values: object) -> str:
@@ -565,6 +607,11 @@ class LiveJevService:
             return error.translated(self.lang)
         line = str(error)
         return self._m("error.generic") if self.lang == "en" and contains_japanese(line) else line
+
+    def _llm_enabled(self, require_key: bool = True) -> bool:
+        if os.environ.get("LIVE_JEV_LLM", "1") == "0":
+            return False
+        return bool(self.llm_key) if require_key else True
 
     def close(self) -> None:
         close = getattr(self.bridge, "close", None)
@@ -585,9 +632,7 @@ class LiveJevService:
         with using_language(self.lang):
             if self.key is None:
                 self.key = read_key()
-            # The public build does not use slow LLM rewriting for ambiguous requests.
-            # Enable it only for experiments with LIVE_JEV_LLM=1. Otherwise return the clarification unchanged.
-            if self.llm_key is None and os.environ.get("LIVE_JEV_LLM", "0") == "1":
+            if self.llm_key is None and self._llm_enabled(require_key=False):
                 self.llm_key = read_key("GEMINI_API_KEY")
             self.live = self.bridge.ping()
             if self.live:
@@ -600,11 +645,29 @@ class LiveJevService:
     def status(self, message_id: Any = None) -> dict[str, Any]:
         tracks = len(self.snapshot.tracks) if self.snapshot else 0
         tempo = self.snapshot.tempo if self.snapshot else 0.0
-        line = self._m("status.connected", tracks=tracks, tempo=tempo) if self.live and self.snapshot else self._m("status.disconnected")
+        outdated = self._script_outdated()
+        line = self._m("error.script_outdated") if self.live and outdated else self._m("status.connected", tracks=tracks, tempo=tempo) if self.live and self.snapshot else self._m("status.disconnected")
         result: dict[str, Any] = {"kind": "status", "live": self.live, "jev": bool(self.key), "tracks": tracks, "tempo": tempo, "line": line}
         if message_id is not None:
             result["id"] = message_id
         return result
+
+    def _script_outdated(self) -> bool:
+        if not hasattr(self.bridge, "script_version"):
+            return False
+        version = getattr(self.bridge, "script_version")
+        return not isinstance(version, str) or _version_is_older(version, MIN_SCRIPT_VERSION)
+
+    def _ensure_script_current(self) -> bool:
+        if not hasattr(self.bridge, "script_version"):
+            return True
+        ping = getattr(self.bridge, "ping", None)
+        if callable(ping):
+            ping()
+        return not self._script_outdated()
+
+    def _outdated_response(self, message_id: Any, started: float) -> dict[str, Any]:
+        return {"id": message_id, "kind": "error", "line": self._m("error.script_outdated"), "ms": self._ms(started, 0, 0, 0)}
 
     def refresh(self, message_id: Any = None) -> dict[str, Any]:
         old_tracks = self._structure_fingerprint(self.snapshot) if self.snapshot else ()
@@ -630,7 +693,7 @@ class LiveJevService:
 
     @staticmethod
     def _structure_fingerprint(snapshot: Snapshot) -> tuple[Any, ...]:
-        return tuple((track.index, track.name, tuple((device.path, device.name) for device in track.devices)) for track in snapshot.tracks)
+        return tuple((track.path, track.name, tuple((device.path, device.name) for device in track.devices)) for track in addressable_targets(snapshot))
 
     @staticmethod
     def _ms(started: float, jev: int, llm: int, bridge: int) -> dict[str, int]:
@@ -701,10 +764,12 @@ class LiveJevService:
                 return {"id": message_id, "kind": "info", "line": self._m("info.expired")}
             return self._answer_confirm(message_id, bool(message.get("confirm")))
         if command == "undo":
-            return self._dispatch_undo(message_id)
+            return self._dispatch_only_action(Action.UNDO, message_id)
         text = message.get("text")
         if not isinstance(text, str) or not text.strip():
             return {"id": message_id, "kind": "error", "line": self._m("error.empty")}
+        if len(text) > 500:
+            return {"id": message_id, "kind": "info", "line": self._m("info.input_too_long")}
         answering = message.get("answering")
         if answering is not None and (self.pending is None or self.pending.request_id != answering):
             return {"id": message_id, "kind": "info", "line": self._m("info.expired")}
@@ -727,28 +792,57 @@ class LiveJevService:
             self.pending_confirm_created = None
         started = time.perf_counter()
         if self._is_undo_request(text):
-            return self._dispatch_undo(message_id, started)
+            return self._dispatch_only_action(Action.UNDO, message_id, started)
+        if self._is_redo_request(text):
+            return self._dispatch_only_action(Action.REDO, message_id, started)
         clauses = split_compound(text, self.snapshot)
         if not clauses:
             return {"id": message_id, "kind": "info", "line": self._m("info.one_at_a_time"), "ms": self._ms(started, 0, 0, 0)}
         if len(clauses) > 1:
-            return self._process_chain(clauses, message_id, started)
+            try:
+                return self._process_chain(clauses, message_id, started)
+            except JevRequestTooLarge:
+                return {"id": message_id, "kind": "error", "line": self._m("error.jev_too_large")}
+        pending_answer = self.pending
         filled = self._fill_pending(text)
+        if filled is _REPROCESS_PENDING:
+            return self._process_once({key: value for key, value in message.items() if key != "answering"})
         if filled is not None:
+            dispatched = self._dispatch_only_action(filled.intent.action, message_id, started)
+            if dispatched is not None:
+                return dispatched
             filled = self._apply_selected_track(filled)
             filled = self._resolve_clip_target(filled)
             decision = self._decision(filled, message_id)
-            if decision is not None and decision.get("kind") == "ask":
-                return self._rewrite_and_process(text, filled, decision, message_id, 0, started)
             if decision is not None:
                 decision["ms"] = self._ms(started, 0, 0, 0)
                 return decision
             return self._execute(filled.intent, message_id, 0, 0, started, text, None)
+        if pending_answer is not None:
+            if pending_answer.field == "plugin":
+                self.pending = pending_answer
+                answer = self._plugin_candidate_question(message_id, pending_answer.options)
+                answer["ms"] = self._ms(started, 0, 0, 0)
+                return answer
+            fallback = self._decision(pending_answer.result, message_id)
+            if fallback is None:
+                fallback = self._ask_for_action(pending_answer.result, message_id)
+            return self._rewrite_and_process(
+                text,
+                pending_answer.result,
+                fallback,
+                message_id,
+                0,
+                started,
+                saved_pending=pending_answer,
+                pending_field=pending_answer.field,
+            )
         request = extract_plugin_request(text, self.snapshot)
-        if request is not None and request.raw_name.strip().casefold() in {word.casefold() for word in GENERIC_DEVICE_WORDS}:
-            request = None
+        if request is not None:
+            request_name = resolve_device_request_name(request.raw_name)
+            request = replace(request, raw_name=request_name) if request_name is not None else None
         deferred_plugin: PluginRequest | None = None
-        if request is not None and request.action is Action.INSERT_PLUGIN and resolve_plugin_name(request.raw_name, self._plugin_names()) is None:
+        if request is not None and request.action in {Action.INSERT_PLUGIN, Action.ADD_TRACK_WITH_PLUGIN} and resolve_native_device(request.raw_name) is None and resolve_plugin_name(request.raw_name, self._plugin_names()) is None:
             # Insertion verbs also describe other actions, such as enabling the metronome or loop.
             # If the name has no immediate catalog match, try normal parsing first. Search for a plug-in only if that fails; Jev then resolves katakana names against the catalog.
             deferred_plugin, request = request, None
@@ -758,13 +852,19 @@ class LiveJevService:
         if notes_request is not None and notes_request.target_missing:
             return {"id": message_id, "kind": "error", "line": self._m("error.named_track_missing"), "ms": self._ms(started, 0, 0, 0)}
         if notes_request is not None and self._script_available():
+            if not self._ensure_script_current():
+                return self._outdated_response(message_id, started)
             return self._run_clip_notes(notes_request, text, message_id, started)
-        plugin_notice = self._plugin_notice(message_id, text)
+        llm_available = self._llm_enabled()
+        plugin_notice = None if deferred_plugin is not None and llm_available else self._plugin_notice(message_id, text)
         if plugin_notice is not None:
             plugin_notice["ms"] = self._ms(started, 0, 0, 0)
             return plugin_notice
         local = parse_local(text, self.snapshot)
         if local is not None:
+            dispatched = self._dispatch_only_action(local.action, message_id, started)
+            if dispatched is not None:
+                return dispatched
             result = self._resolve_previous(IntentResult(local, (), (), ()), text)
             track_named = result.intent.track_stated >= TRACK_STATED_MIN
             result = self._apply_selected_track(self._resolve_release_target(result))
@@ -778,47 +878,82 @@ class LiveJevService:
                 decision["ms"] = self._ms(started, 0, 0, 0)
                 return decision
             return self._execute(result.intent, message_id, 0, 0, started, text, None)
+        if deferred_plugin is not None and len(plugin_name_candidates(deferred_plugin.raw_name, self._plugin_names())) > 1:
+            return self._process_plugin_request(deferred_plugin, text, message_id, started)
+        bare = self._local_bare_plugin_request(text, message_id, started)
+        if bare is not None:
+            return bare
         if not self.key:
             return {"id": message_id, "kind": "error", "line": self._m("error.jev_key")}
         jev_started = time.perf_counter()
+        selected_track_index = self._selected_track_index()
+        jev_request = build_request(self.snapshot, text, selected_track_index)
         try:
-            response = self.requester(build_request(self.snapshot, text), self.key)
+            response = self.requester(jev_request, self.key)
+        except JevRequestTooLarge:
+            return {"id": message_id, "kind": "error", "line": self._m("error.jev_too_large")}
         except RuntimeError:
             return {"id": message_id, "kind": "error", "line": self._m("error.jev")}
         jev_ms = round((time.perf_counter() - jev_started) * 1000)
         if self.verbose:
-            print(f"[jev] questions={len(build_request(self.snapshot, text)['questions'])} ms={jev_ms}", file=sys.stderr)
-        result = self._step_from_utterance(interpret_response(self.snapshot, text, response), text)
+            print(f"[jev] questions={len(jev_request['questions'])} ms={jev_ms}", file=sys.stderr)
+        detail_tracks = jev_request["state"].get("detail_tracks", ())
+        result = interpret_response(self.snapshot, text, response, detail_tracks)
+        if result.intent.action in DISPATCH_ONLY_ACTIONS:
+            decision = self._decision(result, message_id)
+            assert decision is not None
+            decision["ms"] = self._ms(started, jev_ms, 0, 0)
+            return decision
+        result = self._step_from_utterance(result, text)
         result = self._resolve_previous(result, text)
         track_named = result.intent.track_stated >= TRACK_STATED_MIN
         result = self._apply_selected_track(self._resolve_release_target(result))
         result = self._resolve_clip_target(result)
         result = self._device_named_in_text(result, text, track_named)
         decision = self._decision(result, message_id)
+        detail_omitted = (
+            decision is not None
+            and decision.get("kind") == "ask"
+            and isinstance(result.intent.track, int)
+            and result.intent.track not in result.evaluated_detail_tracks
+            and (
+                ACTIONS[result.intent.action].needs_param
+                or ACTIONS[result.intent.action].needs_clip
+                or ACTIONS[result.intent.action].needs_device
+            )
+        )
         if ACTIONS[result.intent.action].kind in {"plugin", "plugin_track"} and not result.intent.plugin:
+            if decision is not None:
+                decision["ms"] = self._ms(started, jev_ms, 0, 0)
+                return decision
             if deferred_plugin is not None:
-                return self._process_plugin_request(deferred_plugin, text, message_id, started, jev_ms)
-            found = self._plugin_fallback(text, message_id, started, jev_ms)
+                return self._process_plugin_request(deferred_plugin, text, message_id, started, jev_ms, initial_result=result)
+            found = self._plugin_fallback(text, message_id, started, jev_ms, initial_result=result)
             if found is not None:
                 return found
             return {"id": message_id, "kind": "info", "line": self._m("info.plugin_name_needed"), "ms": self._ms(started, jev_ms, 0, 0)}
         undecided = decision is not None and decision.get("kind") in {"ask", "info"}
+        if undecided and deferred_plugin is not None and llm_available and self._rewrite_eligible(result):
+            return self._rewrite_and_process(text, result, decision, message_id, jev_ms, started)
         if undecided and deferred_plugin is not None and (
             result.intent.action is Action.NONE or result.intent.action_conf < 0.6 or ACTIONS[result.intent.action].kind == "structure_device"
         ):
-            return self._process_plugin_request(deferred_plugin, text, message_id, started, jev_ms)
+            return self._process_plugin_request(deferred_plugin, text, message_id, started, jev_ms, initial_result=result)
         if decision is not None and decision.get("kind") in {"ask", "info"} and result.intent.action is Action.NONE:
-            bare = self._bare_plugin_request(text, message_id, started, jev_ms)
+            bare = self._bare_plugin_request(text, message_id, started, jev_ms, initial_result=result)
             if bare is not None:
                 return bare
         if decision is not None and decision.get("kind") in {"ask", "info"} and PLUGIN_HINT.search(text) and (
             ACTIONS[result.intent.action].kind == "structure_device" or result.intent.action is Action.NONE
         ):
-            fallback = self._plugin_fallback(text, message_id, started, jev_ms)
+            fallback = self._plugin_fallback(text, message_id, started, jev_ms, initial_result=result)
             if fallback is not None:
                 return fallback
-        if result.intent.compound > 0.7 or (decision is not None and decision.get("kind") == "ask"):
+        if decision is not None and self._rewrite_eligible(result):
             return self._rewrite_and_process(text, result, decision, message_id, jev_ms, started)
+        if detail_omitted:
+            decision["ms"] = self._ms(started, jev_ms, 0, 0)
+            return decision
         if decision is not None:
             decision["ms"] = self._ms(started, jev_ms, 0, 0)
             return decision
@@ -832,55 +967,381 @@ class LiveJevService:
         message_id: Any,
         jev_ms: int,
         started: float,
+        *,
+        saved_pending: Pending | None = None,
+        pending_field: str | None = None,
+        semantic_fallback: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        if not self.llm_key:
-            fallback = initial_decision or self._ask_for_action(initial, message_id)
-            fallback["ms"] = self._ms(started, jev_ms, 0, 0)
-            return fallback
-        llm_started = time.perf_counter()
-        try:
-            rewritten_text = self.rewriter(self.snapshot, utterance, self.llm_key)  # type: ignore[arg-type]
-        except RuntimeError as error:
-            return {
-                "id": message_id,
-                "kind": "error",
-                "line": self._error_text(error),
-                "ms": self._ms(started, jev_ms, round((time.perf_counter() - llm_started) * 1000), 0),
-            }
-        llm_ms = round((time.perf_counter() - llm_started) * 1000)
-        rewritten = [line.strip() for line in rewritten_text.splitlines() if line.strip()]
-        if not rewritten or any(line == "不明" for line in rewritten):
-            fallback = (
-                initial_decision
-                if initial_decision is not None and initial_decision.get("kind") == "ask"
-                else self._ask_for_action(initial, message_id)
-            )
-            fallback["ms"] = self._ms(started, jev_ms, llm_ms, 0)
-            return fallback
+        fallback = initial_decision or self._ask_for_action(initial, message_id)
+        gemini_called = False
+        if saved_pending is None:
+            saved_pending = self.pending
 
-        clauses: list[str] = []
-        for line in rewritten:
-            split = split_compound(line, self.snapshot)
-            if not split:
-                return {
-                    "id": message_id,
-                    "kind": "info",
-                    "line": self._m("info.one_at_a_time"),
-                    "ms": self._ms(started, jev_ms, llm_ms, 0),
-                }
-            clauses.extend(split)
-        if len(clauses) > 4:
-            return {
-                "id": message_id,
-                "kind": "info",
-                "line": self._m("info.one_at_a_time"),
-                "ms": self._ms(started, jev_ms, llm_ms, 0),
-            }
-        answer = self._process_chain(clauses, message_id, started, jev_ms=jev_ms, llm_ms=llm_ms, rewritten=rewritten)
-        decision = answer.get("decision")
-        if isinstance(decision, dict):
-            decision["utterance"] = utterance
+        def finish_fallback(
+            llm_ms: int = 0,
+            prefix: str | None = None,
+            *,
+            semantic: bool = False,
+            prefix_only: bool = False,
+        ) -> dict[str, Any]:
+            self.pending = saved_pending
+            answer = dict(semantic_fallback if semantic and semantic_fallback is not None else fallback)
+            if prefix:
+                answer["line"] = prefix if prefix_only else f"{prefix} {answer['line']}"
+            answer["ms"] = self._ms(started, jev_ms, llm_ms, 0)
+            if gemini_called:
+                answer["via"] = "gemini"
+            return answer
+
+        def finish_semantic_failure(llm_ms: int) -> dict[str, Any]:
+            if semantic_fallback is not None:
+                return finish_fallback(llm_ms, semantic=True)
+            return finish_fallback(llm_ms, self._m("llm.response"))
+
+        if not self._llm_enabled():
+            return finish_fallback()
+
+        now = self._clock()
+        normalized = _normalize(utterance)
+        while self._llm_attempts:
+            oldest, attempted = next(iter(self._llm_attempts.items()))
+            if now - attempted < LLM_ATTEMPT_TTL_SECONDS:
+                break
+            self._llm_attempts.pop(oldest)
+        while self._llm_rate and now - self._llm_rate[0] >= LLM_RATE_WINDOW_SECONDS:
+            self._llm_rate.popleft()
+        if (
+            self._llm_disabled
+            or now < self._llm_cooldown_until
+            or normalized in self._llm_attempts
+            or len(self._llm_rate) >= LLM_RATE_LIMIT
+            or (self._llm_worker is not None and self._llm_worker.is_alive())
+        ):
+            return finish_fallback(semantic=semantic_fallback is not None)
+        self._llm_attempts[normalized] = now
+        self._llm_attempts.move_to_end(normalized)
+        while len(self._llm_attempts) > LLM_ATTEMPT_LIMIT:
+            self._llm_attempts.popitem(last=False)
+        self._llm_rate.append(now)
+
+        llm_started = time.perf_counter()
+        completed: queue.Queue[tuple[str, Any]] = queue.Queue(maxsize=1)
+        snapshot = self.snapshot
+        rewriter = self.rewriter
+        requester = self.requester
+        if requester is request_jev:
+            requester = JevClient()
+        llm_key = self.llm_key
+        jev_key = self.key
+        plugin_catalog = self._plugin_names()
+        built_in_devices = tuple(sorted(NATIVE_DEVICES))
+        insertion_catalog = tuple(sorted(set(plugin_catalog) | set(built_in_devices)))
+
+        def rewrite_and_classify() -> None:
+            try:
+                assert snapshot is not None and llm_key is not None
+                try:
+                    inspect.signature(rewriter).bind(snapshot, utterance, llm_key, plugin_catalog, built_in_devices)
+                except (TypeError, ValueError):
+                    rewritten_text = rewriter(snapshot, utterance, llm_key)
+                else:
+                    rewritten_text = rewriter(snapshot, utterance, llm_key, plugin_catalog, built_in_devices)
+                lines = [line.strip() for line in rewritten_text.splitlines() if line.strip()]
+                if len(lines) != 1 or lines[0] == "不明" or len(split_compound(lines[0], snapshot)) != 1:
+                    completed.put_nowait(("response", lines))
+                    return
+                rewritten = lines[0]
+                plugin_request = extract_plugin_request(rewritten, snapshot)
+                plugin = resolve_exact_plugin_name(plugin_request.raw_name, insertion_catalog) if plugin_request is not None else None
+                if plugin_request is not None and plugin is None:
+                    completed.put_nowait(("response", lines))
+                    return
+                if plugin_request is not None and plugin is not None:
+                    candidate = IntentResult(plugin_intent(plugin_request, plugin), (), (), ())
+                elif (local := parse_local(rewritten, snapshot)) is not None:
+                    if local.action is Action.ADD_TRACK_WITH_DEVICE:
+                        plugin = resolve_exact_plugin_name(local.native_device or "", insertion_catalog)
+                        if plugin is None:
+                            completed.put_nowait(("response", lines))
+                            return
+                        local = replace(
+                            local,
+                            action=Action.ADD_TRACK_WITH_PLUGIN,
+                            native_device=None,
+                            native_device_conf=0.0,
+                            plugin=plugin,
+                        )
+                    candidate = IntentResult(local, (), (), ())
+                elif jev_key:
+                    request = build_request(snapshot, rewritten, None)
+                    response = requester(request, jev_key)
+                    details = request["state"].get("detail_tracks", ())
+                    candidate = interpret_response(snapshot, rewritten, response, details)
+                else:
+                    completed.put_nowait(("response", lines))
+                    return
+                completed.put_nowait(("ok", (lines, candidate)))
+            except RewriteFailure as error:
+                completed.put_nowait(("failure", error.reason))
+            except Exception:
+                completed.put_nowait(("failure", "unavailable"))
+
+        self._llm_worker = threading.Thread(target=rewrite_and_classify, name="live-jev-gemini", daemon=True)
+        gemini_called = True
+        self._llm_worker.start()
+        try:
+            kind, payload = completed.get(timeout=max(0.0, LLM_DEADLINE_SECONDS - (time.perf_counter() - llm_started)))
+        except queue.Empty:
+            self._llm_cooldown_until = now + 30.0
+            elapsed = round((time.perf_counter() - llm_started) * 1000)
+            return finish_fallback(
+                elapsed,
+                self._m("llm.unavailable"),
+                semantic=semantic_fallback is not None,
+                prefix_only=semantic_fallback is not None,
+            )
+        llm_ms = round((time.perf_counter() - llm_started) * 1000)
+        if kind == "failure":
+            if payload == "quota":
+                self._llm_cooldown_until = now + 300.0
+            elif payload in {"auth", "configuration"}:
+                self._llm_disabled = True
+            elif payload == "unavailable":
+                self._llm_cooldown_until = now + 30.0
+            key = {
+                "auth": "llm.auth",
+                "configuration": "llm.configuration",
+                "quota": "llm.quota",
+                "unavailable": "llm.unavailable",
+            }.get(payload, "llm.response")
+            return finish_fallback(
+                llm_ms,
+                self._m(key),
+                semantic=semantic_fallback is not None,
+                prefix_only=semantic_fallback is not None,
+            )
+        if kind != "ok":
+            return finish_semantic_failure(llm_ms)
+        rewritten, candidate = payload
+        if candidate.intent.action in DISPATCH_ONLY_ACTIONS:
+            return finish_semantic_failure(llm_ms)
+        candidate = self._step_from_utterance(candidate, rewritten[0])
+        constrained_result = self._constrain_rewrite(
+            initial,
+            candidate,
+            utterance=utterance,
+            insertion_catalog=insertion_catalog,
+            pending_field=pending_field,
+        )
+        if constrained_result is None:
+            return finish_semantic_failure(llm_ms)
+        constrained, trusted_fields = constrained_result
+        original_track_conf = constrained.intent.track_conf
+        constrained = self._apply_selected_track(constrained)
+        if constrained.intent.target_origin is TargetOrigin.SELECTED:
+            constrained = replace(constrained, intent=replace(constrained.intent, track_conf=original_track_conf))
+        decision = self._decision(constrained, message_id, trusted_fields=trusted_fields)
+        if decision is not None:
+            return finish_semantic_failure(llm_ms)
+        denied = self._authorize_target(constrained.intent)
+        if denied is not None:
+            return finish_semantic_failure(llm_ms)
+        answer = self._execute(
+            constrained.intent,
+            message_id,
+            jev_ms,
+            llm_ms,
+            started,
+            utterance,
+            rewritten,
+            force_confirm=True,
+            trusted_fields=trusted_fields,
+        )
+        answer["via"] = "gemini"
         return answer
+
+    def _rewrite_eligible(self, result: IntentResult) -> bool:
+        intent = result.intent
+        if intent.action is Action.NONE or intent.action_conf < 0.6:
+            return True
+        if self.pending is not None and self.pending.field != "track":
+            return True
+        if intent.named_evidence >= TRACK_STATED_MIN and intent.track is None:
+            return True
+        if intent.named_evidence >= TRACK_UNSTATED_MAX and isinstance(intent.track, (int, TargetRef)) and intent.track_conf < NAMED_TRACK_CONF_MIN:
+            return True
+        return ACTIONS[intent.action].needs_device and bool(intent.device_name) and intent.device is None
+
+    def _constrain_rewrite(
+        self,
+        initial: IntentResult,
+        candidate: IntentResult,
+        *,
+        utterance: str = "",
+        insertion_catalog: tuple[str, ...] = (),
+        pending_field: str | None = None,
+    ) -> tuple[IntentResult, frozenset[str]] | None:
+        original = initial.intent
+        proposed = candidate.intent
+        if ACTIONS[proposed.action].kind in {"plugin", "plugin_track"}:
+            return self._constrain_plugin_rewrite(initial, candidate, utterance, insertion_catalog, pending_field)
+        allowed_kinds = {
+            "track_bool", "track_int", "mixer", "send", "param", "clip_prop", "song_bool",
+            "jump", "tempo", "rename", "transport", "song_call", "track_call", "clip_call", "scene_call",
+        }
+        if proposed.action is Action.NONE or ACTIONS[proposed.action].kind not in allowed_kinds:
+            return None
+        if proposed.target_origin in MULTI_TARGET_ORIGINS or proposed.tracks:
+            return None
+        if original.action_conf >= 0.6 and proposed.action is not original.action:
+            return None
+        if pending_field is not None:
+            field_for_pending = {
+                "action": "action", "track": "track", "param": "param", "device": "device",
+                "clip": "clip", "send": "send", "scene": "scene", "step": "step",
+            }.get(pending_field)
+            changed = {
+                name for name in ("action", "track", "param", "device", "clip", "send", "scene", "step")
+                if getattr(proposed, name) not in {None, Step.NONE} and getattr(proposed, name) != getattr(original, name)
+            }
+            if any(name != field_for_pending for name in changed):
+                return None
+
+        track = original.track
+        target_origin = original.target_origin
+        if proposed.track is not None and proposed.track != original.track:
+            can_correct_named_track = (
+                original.track is None
+                and original.named_evidence >= TRACK_STATED_MIN
+                and isinstance(proposed.track, (int, TargetRef))
+                and self.snapshot is not None
+                and self.snapshot.target(proposed.track) is not None
+            )
+            if not can_correct_named_track:
+                return None
+            track = proposed.track
+            target_origin = TargetOrigin.NAMED
+
+        if proposed.number is not None and proposed.number != original.number:
+            return None
+        if proposed.step is not Step.NONE and proposed.step != original.step:
+            return None
+        if proposed.text is not None and proposed.text != original.text:
+            return None
+        if proposed.native_device is not None and proposed.native_device != original.native_device:
+            return None
+        if proposed.plugin is not None and proposed.plugin != original.plugin:
+            return None
+
+        trusted: set[str] = set()
+        if original.action is Action.NONE or original.action_conf < 0.6:
+            trusted.add("action")
+
+        values: dict[str, Any] = {"action": proposed.action, "track": track, "target_origin": target_origin}
+        proposed_spec = ACTIONS[proposed.action]
+        for name, confidence_name in (
+            ("param", "param_conf"), ("device", "device_conf"), ("clip", "clip_conf"),
+            ("send", "send_conf"), ("scene", "scene_conf"),
+        ):
+            old_value = getattr(original, name)
+            new_value = getattr(proposed, name)
+            needed = {
+                "param": proposed_spec.needs_param or proposed_spec.needs_device,
+                "device": proposed_spec.needs_device,
+                "clip": proposed_spec.needs_clip,
+                "send": proposed_spec.needs_send,
+                "scene": proposed_spec.needs_scene,
+            }[name]
+            if old_value is None and new_value is not None and not needed:
+                return None
+            if old_value is not None and new_value is not None and new_value != old_value:
+                return None
+            chosen = old_value if old_value is not None else new_value
+            if chosen is not None and (old_value is None or getattr(original, confidence_name) < 0.6):
+                trusted.add(name)
+            values[name] = chosen
+
+        if values["param"] is not None:
+            parameter = values["param"]
+            if not isinstance(track, (int, TargetRef)) or self.snapshot is None:
+                return None
+            owner = self.snapshot.target(track)
+            if owner is None or not any(parameter in device.params for device in owner.devices):
+                return None
+        if values["device"] is not None:
+            device = values["device"]
+            if not isinstance(track, (int, TargetRef)) or self.snapshot is None:
+                return None
+            owner = self.snapshot.target(track)
+            if owner is None or device not in owner.devices:
+                return None
+            values["device_name"] = device.name
+        if values["clip"] is not None:
+            if not isinstance(track, int) or self.snapshot is None:
+                return None
+            owner = next((item for item in self.snapshot.tracks if item.index == track), None)
+            clip = next((item for item in owner.clips if item.slot == values["clip"]), None) if owner else None
+            if clip is None:
+                return None
+            values["clip_name"], values["clip_path"] = clip.name, clip.path
+
+        if original.step is not Step.NONE and proposed.step is original.step and original.step_conf < 0.6:
+            trusted.add("step")
+        intent = replace(original, **values)
+        return replace(initial, intent=intent), frozenset(trusted)
+
+    def _constrain_plugin_rewrite(
+        self,
+        initial: IntentResult,
+        candidate: IntentResult,
+        utterance: str,
+        catalog: tuple[str, ...],
+        pending_field: str | None,
+    ) -> tuple[IntentResult, frozenset[str]] | None:
+        original = initial.intent
+        proposed = candidate.intent
+        if pending_field is not None or original.action_conf >= 0.6 and proposed.action is not original.action:
+            return None
+        if proposed.action not in {Action.INSERT_PLUGIN, Action.ADD_TRACK_WITH_PLUGIN}:
+            return None
+        if proposed.tracks or proposed.target_origin in MULTI_TARGET_ORIGINS:
+            return None
+        plugin = resolve_exact_plugin_name(proposed.plugin or "", catalog)
+        source = extract_plugin_request(utterance, self.snapshot) if self.snapshot is not None else None
+        if plugin is None or source is None or source.target_missing or source.action is not proposed.action:
+            return None
+        expected = plugin_intent(source, plugin)
+        if (
+            proposed.track != expected.track
+            or proposed.text != expected.text
+            or proposed.track_kind != expected.track_kind
+            or proposed.number is not None
+            or proposed.step is not Step.NONE
+            or proposed.native_device is not None
+        ):
+            return None
+        if isinstance(expected.track, (int, TargetRef)) and original.track != expected.track:
+            can_correct_named_track = (
+                original.track is None
+                and original.named_evidence >= TRACK_STATED_MIN
+                and self.snapshot.target(expected.track) is not None
+            )
+            if not can_correct_named_track:
+                return None
+        if expected.track is None and original.named_evidence >= TRACK_STATED_MIN:
+            return None
+        constrained = replace(
+            expected,
+            action_conf=original.action_conf,
+            track_conf=min(expected.track_conf, original.track_conf),
+            track_stated=max(expected.track_stated, original.track_stated),
+            named_evidence=max(expected.named_evidence, original.named_evidence),
+            needs_generation=original.needs_generation,
+            compound=original.compound,
+            refers_previous=original.refers_previous,
+            utterance=utterance,
+        )
+        return replace(initial, intent=constrained), frozenset({"action"})
 
     def _ask_for_action(self, result: IntentResult, message_id: Any) -> dict[str, Any]:
         self.pending = Pending(result, "action", self._clock(), message_id)
@@ -893,8 +1354,8 @@ class LiveJevService:
         replacements = {"マスター": "Master", "選択中のトラック": "Selected track"}
         return [replacements.get(option, option) for option in options]
 
-    def _selected_track_index(self) -> int | None:
-        """Read the currently selected track index from Live in one command instead of using the snapshot."""
+    def _selected_track_index(self) -> int | TargetRef | None:
+        """Read the currently selected addressable target from Live."""
         request = request_id("context")
         try:
             result = self.bridge.run(["--api-session-context", request])
@@ -905,8 +1366,11 @@ class LiveJevService:
         selected = payload.get("selected") if isinstance(payload, Mapping) else None
         track = selected.get("track") if isinstance(selected, Mapping) else None
         path = str(track.get("path", "")) if isinstance(track, Mapping) else ""
-        match = re.fullmatch(r"live_set tracks (\d+)", path)
-        return int(match.group(1)) if match else None
+        match = re.fullmatch(r"live_set (tracks|return_tracks) (\d+)", path)
+        if match:
+            index = int(match.group(2))
+            return index if match.group(1) == "tracks" else TargetRef(TargetKind.RETURN, index)
+        return TargetRef(TargetKind.MASTER) if path == "live_set master_track" else None
 
     @staticmethod
     def _step_from_utterance(result: IntentResult, text: str) -> IntentResult:
@@ -927,7 +1391,9 @@ class LiveJevService:
         wants_selected = intent.track == "selected"
         if wants_selected and intent.target_origin in {TargetOrigin.EXCEPT, TargetOrigin.ONLY}:
             index = self._selected_track_index()
-            if index is None or any(is_bridge_track(track) and track.index == index for track in self.snapshot.tracks):
+            if index is None or isinstance(index, int) and any(is_bridge_track(track) and track.index == index for track in self.snapshot.tracks):
+                return replace(result, intent=replace(intent, track=None, tracks=()))
+            if intent.target_origin is TargetOrigin.ONLY and not isinstance(index, int):
                 return replace(result, intent=replace(intent, track=None, tracks=()))
             members = (index,) if intent.target_origin is TargetOrigin.ONLY else tuple(item for item in eligible_track_indices(self.snapshot) if item != index)
             return replace(result, intent=replace(intent, track=None, tracks=members, track_conf=1.0))
@@ -949,7 +1415,7 @@ class LiveJevService:
         index = self._selected_track_index()
         if index is None:
             return replace(result, intent=replace(intent, track=None, track_conf=0.0, target_origin=TargetOrigin.NONE))
-        if any(is_bridge_track(track) and track.index == index for track in self.snapshot.tracks):
+        if isinstance(index, int) and any(is_bridge_track(track) and track.index == index for track in self.snapshot.tracks):
             return replace(result, intent=replace(intent, track=None, track_conf=0.0, target_origin=TargetOrigin.NONE))
         return replace(result, intent=replace(intent, track=index, track_conf=1.0, target_origin=TargetOrigin.SELECTED))
 
@@ -979,17 +1445,25 @@ class LiveJevService:
         local = parse_local(text, self.snapshot)
         jev_ms = 0
         if local is not None:
+            if self._dispatch_only_action(local.action, None, dispatch=False) is not None:
+                return None, jev_ms
             result = self._resolve_previous(IntentResult(local, (), (), ()), text)
         else:
             if not self.key:
                 return None, 0
             began = time.perf_counter()
+            selected_track_index = self._selected_track_index()
+            jev_request = build_request(self.snapshot, text, selected_track_index)
             try:
-                response = self.requester(build_request(self.snapshot, text), self.key)
+                response = self.requester(jev_request, self.key)
             except RuntimeError:
                 return None, 0
             jev_ms = round((time.perf_counter() - began) * 1000)
-            result = self._step_from_utterance(interpret_response(self.snapshot, text, response), text)
+            detail_tracks = jev_request["state"].get("detail_tracks", ())
+            result = interpret_response(self.snapshot, text, response, detail_tracks)
+            if self._dispatch_only_action(result.intent.action, None, dispatch=False) is not None:
+                return None, jev_ms
+            result = self._step_from_utterance(result, text)
             result = self._resolve_previous(result, text)
         intent = result.intent
         if (
@@ -1028,14 +1502,15 @@ class LiveJevService:
     def _read_receipt_value(self, entry: ReceiptEntry) -> tuple[Any, str, str | None]:
         """Read the live value behind a receipt entry with the reads the allow-list permits.
         A plain get of "value" is only allowed on sends; faders and device parameters have their own read commands."""
-        mixer = re.fullmatch(r"live_set (?:tracks (\d+)|(master_track)) mixer_device (volume|panning)", entry.path)
+        mixer = re.fullmatch(r"live_set (?:(tracks|return_tracks) (\d+)|(master_track)) mixer_device (volume|panning)", entry.path)
         if mixer:
-            target = "master" if mixer.group(2) else mixer.group(1)
+            owner_path = "live_set master_track" if mixer.group(3) else f"live_set {mixer.group(1)} {mixer.group(2)}"
+            target = "master" if mixer.group(3) else mixer.group(2) if mixer.group(1) == "tracks" else owner_path
             arguments: list[str] = []
             name_id = None
-            if mixer.group(1):
+            if not mixer.group(3):
                 name_id = request_id("restore-owner")
-                arguments.extend(["--api-get", f"live_set tracks {mixer.group(1)}", "name", name_id])
+                arguments.extend(["--api-get", owner_path, "name", name_id])
             arguments.extend(["--api-mixer-status", target, request_id("restore-read")])
             result = self.bridge.run(arguments)
             ack = next((item for item in reversed(result.acks) if item.event == "api_mixer_status"), None)
@@ -1044,7 +1519,7 @@ class LiveJevService:
                 result = BridgeResult(tuple(result.acks) + tuple(mixer_result.acks), result.elapsed_ms + mixer_result.elapsed_ms, mixer_result.returncode, mixer_result.timed_out)
                 ack = next((item for item in reversed(result.acks) if item.event == "api_mixer_status"), None)
             parameters = ack.payload.get("parameters") if ack and isinstance(ack.payload, Mapping) else None
-            parameter = parameters.get(mixer.group(3)) if isinstance(parameters, Mapping) else None
+            parameter = parameters.get(mixer.group(4)) if isinstance(parameters, Mapping) else None
             if not isinstance(parameter, Mapping) or "value" not in parameter:
                 raise BridgeError("restore read failed")
             owner = str(ack_map(result)[name_id].payload) if name_id else "master"
@@ -1062,7 +1537,7 @@ class LiveJevService:
                     return float(raw["value"]), str(found[track_name_id].payload), str(found[device_name_id].payload)
             raise BridgeError("restore read failed")
         read_id = request_id("restore-read")
-        track_match = re.match(r"(live_set tracks \d+)(?: |$)", entry.path)
+        track_match = re.match(r"(live_set (?:tracks|return_tracks) \d+)(?: |$)", entry.path)
         if track_match and entry.write_kind != "rename":
             owner_id = request_id("restore-owner")
             result = self.bridge.run(["--api-get", track_match.group(1), "name", owner_id, "--api-get", entry.path, entry.prop, read_id])
@@ -1070,7 +1545,7 @@ class LiveJevService:
         result = self.bridge.run(["--api-get", entry.path, entry.prop, read_id])
         return _find(result, read_id).payload, entry.owner, None
 
-    def _restore_receipt(self, receipt: Receipt) -> Receipt | None:
+    def _restore_receipt(self, receipt: Receipt, unresolved_values: list[Any] | None = None) -> Receipt | None:
         if not receipt.entries:
             return receipt
         unresolved: list[ReceiptEntry] = []
@@ -1079,17 +1554,23 @@ class LiveJevService:
                 current, owner, device_owner = self._read_receipt_value(entry)
                 if owner != entry.owner or (entry.device_owner is not None and device_owner != entry.device_owner):
                     unresolved.append(entry)
+                    if unresolved_values is not None:
+                        unresolved_values.append(current)
                     continue
                 if self._same_restored_value(current, entry.before):
                     continue
                 if not self._same_value(current, entry.after):
                     unresolved.append(entry)
+                    if unresolved_values is not None:
+                        unresolved_values.append(current)
                     continue
                 if entry.write_kind == "tempo":
                     write = ["--write", "--tempo", f"{float(entry.before):g}"]
-                elif entry.write_kind == "rename":
+                elif entry.write_kind == "rename" and entry.path.startswith("live_set tracks "):
                     index = entry.path.split()[2]
                     write = ["--write", "--rename-track-index", index, "--rename-track-name", str(entry.before)]
+                elif entry.write_kind == "rename":
+                    write = ["--write", "--api-set", entry.path, "name", json.dumps(str(entry.before), ensure_ascii=False), request_id("restore")]
                 elif entry.parameter:
                     write = ["--write", "--api-parameter-set", entry.path, json.dumps(entry.before), request_id("restore")]
                 else:
@@ -1102,9 +1583,12 @@ class LiveJevService:
                 if restored_owner != entry.owner or (entry.device_owner is not None and restored_device != entry.device_owner) or not self._same_restored_value(restored, entry.before):
                     unresolved.append(entry)
                     continue
-                match = re.fullmatch(r"live_set tracks (\d+)", entry.path)
+                match = re.fullmatch(r"live_set (tracks|return_tracks) (\d+)", entry.path)
                 if match and self.snapshot is not None:
-                    self.snapshot = replace_track(self.snapshot, int(match.group(1)), **{entry.prop: entry.before})
+                    ref: int | TargetRef = int(match.group(2)) if match.group(1) == "tracks" else TargetRef(TargetKind.RETURN, int(match.group(2)))
+                    self.snapshot = replace_target(self.snapshot, ref, **{entry.prop: entry.before})
+                elif entry.path == "live_set master_track" and self.snapshot is not None:
+                    self.snapshot = replace_target(self.snapshot, TargetRef(TargetKind.MASTER), **{entry.prop: entry.before})
             except Exception:
                 unresolved.append(entry)
         return replace(receipt, entries=tuple(reversed(unresolved))) if unresolved else None
@@ -1126,6 +1610,9 @@ class LiveJevService:
         llm_ms: int = 0,
         rewritten: list[str] | None = None,
     ) -> dict[str, Any]:
+        if not self._ensure_script_current():
+            return self._outdated_response(message_id, started)
+        self.pending = None
         planned: list[Intent] = []
         inherited: Intent | None = None
         for clause in clauses:
@@ -1164,15 +1651,16 @@ class LiveJevService:
             if receipt is not None:
                 receipts.append(receipt)
                 receipt_clauses.append(clause)
-        self.previous = PreviousChain(tuple(receipts), tuple(receipt_clauses))
+        history = PreviousChain(tuple(receipts), tuple(receipt_clauses))
         decisions = [item.get("decision", {}) for item in results]
-        return {
+        answer = {
             "id": message_id,
             "kind": "result",
             "line": " → ".join(str(item.get("line", "")) for item in results),
             "decision": {"chain": decisions, **({"rewritten": rewritten} if rewritten is not None else {})},
             "ms": self._ms(started, jev_ms, llm_ms, bridge_ms + sum(int(item.get("ms", {}).get("bridge", 0)) for item in results)),
         }
+        return self._record_execution_history(answer, history)
 
     def _device_named_in_text(self, result: IntentResult, text: str, track_named: bool) -> IntentResult:
         """Jev was measured at 0.26-0.38 on "Reverbをオフ" even though the device name is spelled out; match it literally instead of asking."""
@@ -1185,7 +1673,11 @@ class LiveJevService:
             intent = replace(intent, device_name=intent.device.name, device=None, device_conf=0.0, param=None, param_conf=0.0)
             return self._resolve_device_name(replace(result, intent=intent), False)
         folded = text.casefold()
-        names = {device.name for track in self.snapshot.tracks if not is_bridge_track(track) for device in track.devices if device.name and device.name.casefold() in folded}
+        names = {
+            device.name for track in addressable_targets(self.snapshot)
+            if not (isinstance(track, Track) and is_bridge_track(track))
+            for device in track.devices if device.name and device.name.casefold() in folded
+        }
         if len(names) != 1:
             return result
         return self._resolve_device_name(replace(result, intent=replace(intent, device_name=next(iter(names)))), track_named)
@@ -1194,7 +1686,9 @@ class LiveJevService:
         intent = result.intent
         if intent.clip is None or not intent.clip_name or self.snapshot is None or intent.named_evidence >= TRACK_UNSTATED_MAX:
             return result
-        owner = next((track for track in self.snapshot.tracks if track.index == intent.track), None) if isinstance(intent.track, int) else None
+        owner = target_for_intent(self.snapshot, intent)
+        if not isinstance(owner, Track):
+            owner = None
         matches = [clip for clip in owner.clips if clip.slot == intent.clip] if owner and intent.target_origin is TargetOrigin.SELECTED else []
         if not matches:
             matches = [clip for clip in owner.clips if clip.name.casefold() == intent.clip_name.casefold()] if owner else []
@@ -1215,55 +1709,69 @@ class LiveJevService:
         intent = result.intent
         if not intent.device_name or self.snapshot is None:
             return result
-        owner = next((track for track in self.snapshot.tracks if track.index == intent.track), None) if isinstance(intent.track, int) else None
+        owner = self.snapshot.target(intent.track) if isinstance(intent.track, (int, TargetRef)) else None
         matches = [device for device in owner.devices if device.name.casefold() == intent.device_name.casefold()] if owner else []
         if not matches and intent.named_evidence < TRACK_UNSTATED_MAX:
             global_matches = [
-                (track, device) for track in self.snapshot.tracks if not is_bridge_track(track)
+                (track, device) for track in addressable_targets(self.snapshot) if not (isinstance(track, Track) and is_bridge_track(track))
                 for device in track.devices if device.name.casefold() == intent.device_name.casefold()
             ]
             if len(global_matches) == 1:
                 owner, device = global_matches[0]
                 matches = [device]
-                intent = replace(intent, track=owner.index, track_conf=1.0, target_origin=TargetOrigin.OWNER)
+                intent = replace(intent, track=target_ref(owner), track_conf=1.0, target_origin=TargetOrigin.OWNER)
         if len(matches) != 1:
             return replace(result, intent=replace(intent, device=None, device_conf=0.0, param=None, param_conf=0.0))
         device = matches[0]
         parameter = next((item for item in device.params if item.index == 0), None)
         return replace(result, intent=replace(intent, device=device, device_conf=1.0, param=parameter, param_conf=1.0 if parameter else 0.0))
 
-    def _decision(self, result: IntentResult, message_id: Any) -> dict[str, Any] | None:
+    def _decision(
+        self,
+        result: IntentResult,
+        message_id: Any,
+        *,
+        trusted_fields: frozenset[str] = frozenset(),
+    ) -> dict[str, Any] | None:
         intent = result.intent
-        spec = ACTIONS[intent.action]
         if intent.compound > 0.7:
             self.pending = None
             return {"id": message_id, "kind": "info", "line": self._m("info.one_at_a_time")}
         if intent.action is Action.NONE and intent.needs_generation > 0.5:
             return {"id": message_id, "kind": "info", "line": self._m("info.freeform")}
-        if intent.action_conf < 0.6 or intent.action is Action.NONE:
+        if (intent.action_conf < 0.6 and "action" not in trusted_fields) or intent.action is Action.NONE:
             return self._ask_for_action(result, message_id)
+        dispatched = self._dispatch_only_action(intent.action, message_id)
+        if dispatched is not None:
+            return dispatched
+        spec = ACTIONS[intent.action]
         if intent.target_origin in MULTI_TARGET_ORIGINS:
             self.pending = None
             return self._authorize_target(intent)
         if isinstance(intent.track, int) and not any(track.index == intent.track for track in self.snapshot.tracks):
             self.pending = None
             return {"id": message_id, "kind": "error", "line": self._m("error.named_track_missing")}
+        if isinstance(intent.track, TargetRef) and self.snapshot.target(intent.track) is None:
+            self.pending = None
+            return {"id": message_id, "kind": "error", "line": self._m("error.named_track_missing")}
         if spec.needs_track and intent.track is None and intent.track_stated >= TRACK_STATED_MIN:
             self.pending = None
             return {"id": message_id, "kind": "error", "line": self._m("error.named_track_missing")}
-        if intent.track == "master" and intent.action is not Action.VOLUME:
+        unsupported = target_capability_error(self.snapshot, intent)
+        if unsupported is not None:
             self.pending = None
-            return {"id": message_id, "kind": "error", "line": self._m("error.master_unsupported")}
+            target_name, action_name = unsupported
+            return {"id": message_id, "kind": "error", "line": self._m("error.target_capability", target=target_name, action=action_name)}
         named_track_uncertain = (
             intent.track_stated >= TRACK_UNSTATED_MAX
-            and isinstance(intent.track, int)
+            and isinstance(intent.track, (int, TargetRef))
             and intent.track_conf < NAMED_TRACK_CONF_MIN
         )
         track_is_uncertain = intent.track is None or named_track_uncertain
         if spec.needs_track and track_is_uncertain:
             self.pending = Pending(result, "track", self._clock(), message_id)
             return {"id": message_id, "kind": "ask", "line": self._m("ask.track"), "options": self._localized_options(result.track_options)}
-        if spec.needs_param and (intent.param is None or intent.param_conf < 0.6):
+        if spec.needs_param and (intent.param is None or (intent.param_conf < 0.6 and "param" not in trusted_fields)):
             if intent.target_origin is TargetOrigin.CLARIFIED:
                 self.pending = None
                 return {"id": message_id, "kind": "error", "line": self._m("error.target_changed")}
@@ -1272,13 +1780,13 @@ class LiveJevService:
         if spec.kind == "structure_device" and (intent.native_device is None or intent.native_device_conf < 0.6):
             self.pending = Pending(result, "native_device", self._clock(), message_id)
             return {"id": message_id, "kind": "ask", "line": self._m("ask.device_native"), "options": ["Operator", "Wavetable", "Drum Rack", "Reverb", "EQ Eight"]}
-        if spec.needs_send and (intent.send is None or intent.send_conf < 0.6):
+        if spec.needs_send and (intent.send is None or (intent.send_conf < 0.6 and "send" not in trusted_fields)):
             self.pending = Pending(result, "send", self._clock(), message_id)
             return {"id": message_id, "kind": "ask", "line": self._m("ask.send"), "options": list(result.send_options)}
-        if spec.needs_scene and (intent.scene is None or intent.scene_conf < 0.6):
+        if spec.needs_scene and (intent.scene is None or (intent.scene_conf < 0.6 and "scene" not in trusted_fields)):
             self.pending = Pending(result, "scene", self._clock(), message_id)
             return {"id": message_id, "kind": "ask", "line": self._m("ask.scene"), "options": list(result.scene_options)}
-        if spec.needs_clip and (intent.clip is None or intent.clip_conf < 0.6):
+        if spec.needs_clip and (intent.clip is None or (intent.clip_conf < 0.6 and "clip" not in trusted_fields)):
             if intent.target_origin is TargetOrigin.CLARIFIED:
                 self.pending = None
                 return {"id": message_id, "kind": "error", "line": self._m("error.target_changed")}
@@ -1287,13 +1795,20 @@ class LiveJevService:
         if spec.needs_device and intent.device_name and intent.track_stated >= TRACK_STATED_MIN and intent.device is None:
             self.pending = None
             return {"id": message_id, "kind": "error", "line": self._m("error.named_device_missing")}
-        if spec.needs_device and (intent.device is None or intent.device_conf < 0.6 or intent.param is None):
+        if spec.needs_device and (
+            intent.device is None
+            or (intent.device_conf < 0.6 and "device" not in trusted_fields)
+            or intent.param is None
+        ):
             if intent.target_origin is TargetOrigin.CLARIFIED:
                 self.pending = None
                 return {"id": message_id, "kind": "error", "line": self._m("error.target_changed")}
             self.pending = Pending(result, "device", self._clock(), message_id)
             return {"id": message_id, "kind": "ask", "line": self._m("ask.device"), "options": list(result.device_options)}
-        if spec.needs_step and intent.number is None and (intent.step in {Step.NONE, Step.SET} or intent.step_conf < 0.6):
+        if spec.needs_step and intent.number is None and (
+            intent.step in {Step.NONE, Step.SET}
+            or (intent.step_conf < 0.6 and "step" not in trusted_fields)
+        ):
             self.pending = Pending(result, "step", self._clock(), message_id)
             return {"id": message_id, "kind": "ask", "line": self._m("ask.direction"), "options": [self._m("option.up_small"), self._m("option.down_small")]}
         self.pending = None
@@ -1410,16 +1925,15 @@ class LiveJevService:
 
     @staticmethod
     def _value_before(snapshot: Snapshot, intent: Intent) -> Any:
+        target = snapshot.target(intent.track) if isinstance(intent.track, (int, TargetRef)) or intent.track == "master" else None
         if intent.action is Action.VOLUME:
-            if intent.track == "master":
-                return snapshot.master_volume
-            return next(track.volume for track in snapshot.tracks if track.index == intent.track)
+            return target.volume if target is not None else snapshot.master_volume
         if intent.action is Action.PAN:
-            return next(track.pan for track in snapshot.tracks if track.index == intent.track)
+            return target.pan
         if intent.action in {Action.MUTE, Action.UNMUTE}:
-            return next(track.mute for track in snapshot.tracks if track.index == intent.track)
+            return target.mute
         if intent.action in {Action.SOLO, Action.UNSOLO}:
-            return next(track.solo for track in snapshot.tracks if track.index == intent.track)
+            return target.solo
         if intent.action is Action.TEMPO:
             return snapshot.tempo
         if intent.action in {Action.PLAY, Action.STOP}:
@@ -1427,14 +1941,14 @@ class LiveJevService:
         if ACTIONS[intent.action].kind == "param" and intent.param is not None:
             return next(
                 parameter.value
-                for track in snapshot.tracks
+                for track in addressable_targets(snapshot)
                 for device in track.devices
                 for parameter in device.params
                 if parameter.path == intent.param.path
             )
         spec = ACTIONS[intent.action]
-        if spec.kind in {"track_bool", "track_int"} and isinstance(intent.track, int) and spec.prop:
-            return getattr(next(track for track in snapshot.tracks if track.index == intent.track), spec.prop)
+        if spec.kind in {"track_bool", "track_int"} and target is not None and spec.prop:
+            return getattr(target, spec.prop)
         if spec.kind == "song_bool" and spec.prop:
             return bool(snapshot.song.get(spec.prop))
         if spec.kind == "jump":
@@ -1444,8 +1958,8 @@ class LiveJevService:
         if spec.kind == "send" and isinstance(intent.track, int) and intent.send is not None:
             track = next(item for item in snapshot.tracks if item.index == intent.track)
             return track.sends[intent.send] if intent.send < len(track.sends) else 0.0
-        if spec.kind == "rename" and isinstance(intent.track, int):
-            return next(track.name for track in snapshot.tracks if track.index == intent.track)
+        if spec.kind == "rename" and target is not None:
+            return target.name
         if spec.kind in {"structure", "structure_device", "plugin", "plugin_track"}:
             return float(len(snapshot.tracks))
         if spec.kind == "clip_prop" and isinstance(intent.track, int) and intent.clip is not None and spec.prop:
@@ -1457,7 +1971,7 @@ class LiveJevService:
             return float(raw or 0.0)
         raise ValueError("直前の値を保存できません")
 
-    def _fill_pending(self, text: str) -> IntentResult | None:
+    def _fill_pending(self, text: str) -> IntentResult | None | object:
         pending = self.pending
         self.pending = None
         if pending is None or self.snapshot is None:
@@ -1465,13 +1979,13 @@ class LiveJevService:
         normalized = _normalize(text)
         intent = pending.result.intent
         if pending.field == "track":
-            for track in self.snapshot.tracks:
-                if is_bridge_track(track):
+            for track in addressable_targets(self.snapshot):
+                if isinstance(track, Track) and is_bridge_track(track):
                     continue
                 if normalized == _normalize(track.name):
                     device_name = intent.device.name if intent.device is not None else None
                     if device_name is None and intent.param is not None:
-                        device_name = next((d.name for t in self.snapshot.tracks for d in t.devices if intent.param in d.params), None)
+                        device_name = next((d.name for t in addressable_targets(self.snapshot) for d in t.devices if intent.param in d.params), None)
                     param_name = intent.param.name if intent.param is not None else None
                     clip_name = None
                     if isinstance(intent.track, int) and intent.clip is not None:
@@ -1479,18 +1993,31 @@ class LiveJevService:
                         clip_name = next((c.name for c in old.clips if c.slot == intent.clip), None) if old else None
                     device = next((d for d in track.devices if device_name and d.name.casefold() == device_name.casefold()), None)
                     param = next((p for p in device.params if param_name and p.name.casefold() == param_name.casefold()), None) if device else None
-                    clip = next((c for c in track.clips if clip_name and c.name.casefold() == clip_name.casefold()), None)
+                    clip = next((c for c in getattr(track, "clips", ()) if clip_name and c.name.casefold() == clip_name.casefold()), None)
                     return replace(pending.result, intent=replace(
-                        intent, track=track.index, track_conf=1.0, target_origin=TargetOrigin.CLARIFIED,
+                        intent, track=target_ref(track), track_conf=1.0, target_origin=TargetOrigin.CLARIFIED,
                         device=device, device_conf=1.0 if device else 0.0,
                         param=param, param_conf=1.0 if param else 0.0,
                         clip=clip.slot if clip else None, clip_conf=1.0 if clip else 0.0,
                         clip_name=clip.name if clip else None, clip_path=clip.path if clip else None,
                     ))
-            if normalized in {_normalize("マスター"), _normalize("master"), _normalize("master track")}:
-                return replace(pending.result, intent=replace(intent, track="master", track_conf=1.0, target_origin=TargetOrigin.CLARIFIED, utterance=f"{intent.utterance} {text}"))
-        elif pending.field == "param" and isinstance(intent.track, int):
-            track = next((item for item in self.snapshot.tracks if item.index == intent.track), None)
+                if isinstance(track, ReturnTrack):
+                    letter = chr(ord("A") + track.index)
+                    number = track.index + 1
+                    ordinal = f"{number}{'st' if number % 10 == 1 and number % 100 != 11 else 'nd' if number % 10 == 2 and number % 100 != 12 else 'rd' if number % 10 == 3 and number % 100 != 13 else 'th'}"
+                    aliases = (
+                        f"リターン{letter}", f"return {letter}", f"リターン{number}",
+                        f"リターントラック{number}", f"{number}番目のリターン", f"リターンの{number}番",
+                        f"return {number}", f"return track {number}", f"{ordinal} return", f"the {ordinal} return",
+                    )
+                    if number <= 3:
+                        aliases += (f"{('first', 'second', 'third')[number - 1]} return",)
+                    if normalized in {_normalize(alias) for alias in aliases}:
+                        return replace(pending.result, intent=replace(intent, track=track.ref, track_conf=1.0, target_origin=TargetOrigin.CLARIFIED, utterance=f"{intent.utterance} {text}"))
+                if track.path == "live_set master_track" and normalized in {_normalize("マスター"), _normalize("master"), _normalize("master track")}:
+                    return replace(pending.result, intent=replace(intent, track=track.ref, track_conf=1.0, target_origin=TargetOrigin.CLARIFIED, utterance=f"{intent.utterance} {text}"))
+        elif pending.field == "param" and isinstance(intent.track, (int, TargetRef)):
+            track = self.snapshot.target(intent.track)
             candidates = candidate_params(self.snapshot).get(intent.track, {})
             for parameter in candidates.values():
                 device = next((item for item in track.devices if parameter in item.params), None) if track else None
@@ -1503,11 +2030,16 @@ class LiveJevService:
             resolved = resolve_native_device(text)
             if resolved is not None:
                 return replace(pending.result, intent=replace(intent, native_device=resolved, native_device_conf=1.0))
+        elif pending.field == "plugin":
+            for option in pending.options:
+                if normalized == _normalize(option):
+                    return replace(pending.result, intent=replace(intent, plugin=option, utterance=f"{intent.utterance} {text}".strip()))
         elif pending.field == "send":
-            for index, name in enumerate(self.snapshot.returns):
-                letter = chr(ord("A") + index)
+            for returned in self.snapshot.returns:
+                letter = chr(ord("A") + returned.index)
+                name = returned.name
                 if normalized in {_normalize(name), _normalize(letter), _normalize(f"センド{letter}"), _normalize(f"send {letter}"), _normalize(f"{letter}（{name}）"), _normalize(f"{letter} ({name})")}:
-                    return replace(pending.result, intent=replace(intent, send=index, send_conf=1.0))
+                    return replace(pending.result, intent=replace(intent, send=returned.index, send_conf=1.0))
         elif pending.field == "scene":
             for scene in self.snapshot.scenes:
                 if normalized in {_normalize(scene.name), _normalize(f"シーン{scene.index + 1}"), _normalize(f"scene {scene.index + 1}"), str(scene.index + 1)}:
@@ -1517,8 +2049,8 @@ class LiveJevService:
             for clip in track.clips if track else ():
                 if normalized in {_normalize(clip.name), _normalize(f"スロット{clip.slot + 1}"), _normalize(f"slot {clip.slot + 1}"), str(clip.slot + 1)}:
                     return replace(pending.result, intent=replace(intent, clip=clip.slot, clip_conf=1.0))
-        elif pending.field == "device" and isinstance(intent.track, int):
-            track = next((item for item in self.snapshot.tracks if item.index == intent.track), None)
+        elif pending.field == "device" and isinstance(intent.track, (int, TargetRef)):
+            track = self.snapshot.target(intent.track)
             for device in track.devices if track else ():
                 if normalized in {_normalize(device.name), str(device.index + 1)}:
                     on_param = next((p for p in device.params if p.index == 0), None)
@@ -1538,6 +2070,35 @@ class LiveJevService:
             for name, label in ACTION_LABELS.items():
                 if normalized in {_normalize(label), _normalize(action_label(name, lang="en"))} and name != "none":
                     return replace(pending.result, intent=replace(intent, action=Action(name), action_conf=1.0))
+            local = parse_local(text, self.snapshot)
+            carries_command_detail = local is not None and (
+                local.track is not None
+                or bool(local.tracks)
+                or local.target_origin is not TargetOrigin.NONE
+                or local.named_evidence >= TRACK_UNSTATED_MAX
+                or local.track_stated >= TRACK_UNSTATED_MAX
+                or local.number is not None
+                or local.text is not None
+                or local.device is not None
+                or local.device_name is not None
+                or local.send is not None
+                or local.scene is not None
+                or local.clip is not None
+                or local.plugin is not None
+                or local.native_device is not None
+            )
+            if local is not None and local.action is not Action.NONE and not carries_command_detail:
+                return replace(pending.result, intent=replace(intent, action=local.action, action_conf=1.0))
+            if carries_command_detail:
+                return _REPROCESS_PENDING
+            if extract_plugin_request(text, self.snapshot) is not None or len(split_compound(text, self.snapshot)) > 1:
+                return _REPROCESS_PENDING
+        if pending.field != "action" and (
+            len(split_compound(text, self.snapshot)) > 1
+            or extract_plugin_request(text, self.snapshot) is not None
+            or ((local := parse_local(text, self.snapshot)) is not None and local.action is not Action.NONE)
+        ):
+            return _REPROCESS_PENDING
         return None
 
     pending_confirm: tuple[Any, ...] | None = None
@@ -1551,10 +2112,17 @@ class LiveJevService:
         started: float,
         utterance: str,
         rewritten: list[str] | None,
+        force_confirm: bool = False,
+        trusted_fields: frozenset[str] = frozenset(),
     ) -> dict[str, Any]:
+        if not self._ensure_script_current():
+            return self._outdated_response(message_id, started)
+        dispatched = self._dispatch_only_action(intent.action, message_id, started)
+        if dispatched is not None:
+            return dispatched
         spec = ACTIONS[intent.action]
-        if (spec.confirm or intent.target_origin in MULTI_TARGET_ORIGINS) and REQUIRE_CONFIRM:
-            self.pending_confirm = (intent, jev_ms, llm_ms, utterance, rewritten, message_id)
+        if force_confirm or ((spec.confirm or intent.target_origin in MULTI_TARGET_ORIGINS) and REQUIRE_CONFIRM):
+            self.pending_confirm = (intent, jev_ms, llm_ms, utterance, rewritten, force_confirm, trusted_fields, message_id)
             self.pending_confirm_created = self._clock()
             label = action_label(intent.action.value, lang=self.lang)
             target = ""
@@ -1567,11 +2135,30 @@ class LiveJevService:
                 detail = f"（名前: {intent.text}）" if self.lang == "ja" else f" named {intent.text}"
             else:
                 detail = ""
+            if force_confirm:
+                parts = []
+                if intent.param is not None:
+                    parts.append(self._param_label(self.snapshot, intent) or intent.param.name)
+                if intent.step is not Step.NONE:
+                    parts.append(step_label(intent.step.value, lang=self.lang))
+                if intent.number is not None:
+                    parts.append(f"{intent.number.value:g} {intent.number.unit}")
+                if intent.send is not None:
+                    parts.append(f"Send {intent.send + 1}")
+                if intent.clip is not None:
+                    slot = self._m("readback.slot", slot=intent.clip + 1)
+                    parts.append(f"{intent.clip_name} ({slot})" if intent.clip_name else slot)
+                if intent.scene is not None:
+                    scene = next((item for item in self.snapshot.scenes if item.index == intent.scene), None) if self.snapshot else None
+                    ordinal = f"シーン{intent.scene + 1}" if self.lang == "ja" else f"Scene {intent.scene + 1}"
+                    parts.append(f"{scene.name} ({ordinal})" if scene else ordinal)
+                if parts:
+                    detail += f" ({' / '.join(parts)})"
             if intent.action is Action.ADD_TRACK_WITH_DEVICE:
-                kind_label = self._m("kind.audio_track" if intent.track_kind == "audio" else "kind.midi_track")
+                kind_label = self._m("kind.return_track" if intent.track_kind == "return" else "kind.audio_track" if intent.track_kind == "audio" else "kind.midi_track")
                 label = f"「{intent.native_device}」入りの{kind_label}追加" if self.lang == "ja" else f"add {kind_label} with {intent.native_device}"
             if intent.action is Action.ADD_TRACK_WITH_PLUGIN:
-                kind_label = self._m("kind.audio_track" if intent.track_kind == "audio" else "kind.midi_track")
+                kind_label = self._m("kind.return_track" if intent.track_kind == "return" else "kind.audio_track" if intent.track_kind == "audio" else "kind.midi_track")
                 label = f"「{intent.plugin}」入りの{kind_label}追加" if self.lang == "ja" else f"add {kind_label} with {intent.plugin}"
             if intent.action is Action.INSERT_PLUGIN:
                 label = f"「{intent.plugin}」の挿入" if self.lang == "ja" else f"insert {intent.plugin}"
@@ -1583,8 +2170,15 @@ class LiveJevService:
                 "ms": self._ms(started, jev_ms, llm_ms, 0),
             }
         result, receipt = self._execute_now(intent, message_id, jev_ms, llm_ms, started, utterance, rewritten)
-        if receipt is not None:
-            self.previous = receipt
+        return self._record_execution_history(result, receipt)
+
+    def _record_execution_history(
+        self,
+        result: dict[str, Any],
+        history: Receipt | PreviousChain | None,
+    ) -> dict[str, Any]:
+        if history is not None:
+            self.previous = history
             self._history_kind = "receipt"
         elif result.get("kind") == "result":
             self.previous = None
@@ -1614,9 +2208,21 @@ class LiveJevService:
             self._plugin_names_cache = names
         return names
 
-    def _process_plugin_request(self, request: PluginRequest, text: str, message_id: Any, started: float, jev_ms: int = 0) -> dict[str, Any]:
+    def _process_plugin_request(
+        self,
+        request: PluginRequest,
+        text: str,
+        message_id: Any,
+        started: float,
+        jev_ms: int = 0,
+        *,
+        initial_result: IntentResult | None = None,
+    ) -> dict[str, Any]:
         """Handle an external plug-in request by resolving its name and selected track, then executing it."""
         catalog = self._plugin_names()
+        native = resolve_native_device(request.raw_name)
+        if native is not None and native not in catalog:
+            catalog = catalog + (native,)
         if request.target_text:
             whole_names = (
                 f"{request.target_text}に{request.raw_name}",
@@ -1636,12 +2242,44 @@ class LiveJevService:
                 request = replace(request, raw_name=whole_plugin, track=None, target_text=None, target_missing=False)
         if request.target_missing:
             return {"id": message_id, "kind": "error", "line": self._m("error.named_track_missing"), "ms": self._ms(started, jev_ms, 0, 0)}
-        plugin = resolve_plugin_name(request.raw_name, catalog)
+        candidates = plugin_name_candidates(request.raw_name, catalog)
+        if len(candidates) > 1:
+            unresolved = replace(plugin_intent(request, request.raw_name), plugin=None, utterance=text)
+            if request.action is Action.INSERT_PLUGIN and (request.track is None or request.track == "selected"):
+                original = initial_result.intent if initial_result is not None else None
+                unresolved = replace(
+                    unresolved,
+                    target_origin=TargetOrigin.SELECTED,
+                    named_evidence=original.named_evidence if original is not None else 0.0,
+                    track_stated=original.track_stated if original is not None else 0.0,
+                )
+            self.pending = Pending(IntentResult(unresolved, (), (), ()), "plugin", self._clock(), message_id, candidates)
+            answer = self._plugin_candidate_question(message_id, candidates)
+            answer["ms"] = self._ms(started, jev_ms, 0, 0)
+            return answer
+        plugin = candidates[0] if candidates else None
         if plugin is None and catalog and self.key:
-            plugin, picked_ms = self._pick_plugin_with_jev(request.raw_name, catalog)
+            try:
+                plugin, picked_ms = self._pick_plugin_with_jev(request.raw_name, catalog)
+            except JevRequestTooLarge:
+                return {"id": message_id, "kind": "error", "line": self._m("error.jev_too_large")}
             jev_ms += picked_ms
         if plugin is None:
-            return {"id": message_id, "kind": "info", "line": self._m("plugin.not_found", name=request.raw_name), "ms": self._ms(started, jev_ms, 0, 0)}
+            not_found = {"id": message_id, "kind": "info", "line": self._m("plugin.not_found", name=request.raw_name)}
+            unknown = {"id": message_id, "kind": "info", "line": self._m("llm.response")}
+            if initial_result is None:
+                unresolved = plugin_intent(request, request.raw_name)
+                unresolved = replace(unresolved, utterance=text)
+                initial_result = IntentResult(unresolved, (), (), ())
+            return self._rewrite_and_process(
+                text,
+                initial_result,
+                not_found,
+                message_id,
+                jev_ms,
+                started,
+                semantic_fallback=unknown,
+            )
         selected_target = request.action is Action.INSERT_PLUGIN and (request.track is None or request.track == "selected")
         if selected_target:
             index = self._selected_track_index()
@@ -1650,11 +2288,18 @@ class LiveJevService:
             request = replace(request, track=index)
         plugin_target = plugin_intent(request, plugin)
         if selected_target:
-            plugin_target = replace(plugin_target, target_origin=TargetOrigin.SELECTED, named_evidence=0.0, track_stated=0.0, utterance=text)
+            original = initial_result.intent if initial_result is not None else None
+            plugin_target = replace(
+                plugin_target,
+                target_origin=TargetOrigin.SELECTED,
+                named_evidence=original.named_evidence if original is not None else 0.0,
+                track_stated=original.track_stated if original is not None else 0.0,
+                utterance=text,
+            )
         else:
             plugin_target = replace(
                 plugin_target, utterance=text,
-                target_origin=TargetOrigin.NAMED if request.target_text else plugin_target.target_origin,
+                target_origin=plugin_target.target_origin if isinstance(plugin_target.track, TargetRef) and plugin_target.track.kind is TargetKind.MASTER else TargetOrigin.NAMED if request.target_text else plugin_target.target_origin,
                 named_evidence=1.0 if request.target_text else plugin_target.named_evidence,
                 track_stated=1.0 if request.target_text else plugin_target.track_stated,
             )
@@ -1667,7 +2312,7 @@ class LiveJevService:
 
     def _short_line(self, line: str) -> str:
         """Remove the leading "<track name>: " from result text. The target remains in decision.track, so users do not need it repeated."""
-        names = [track.name for track in self.snapshot.tracks if track.name] if self.snapshot else []
+        names = [track.name for track in addressable_targets(self.snapshot) if track.name] if self.snapshot else []
         for name in sorted(names + ["マスター", "Master", "Main"], key=len, reverse=True):
             if line.startswith(f"{name}: "):
                 return line[len(name) + 2:]
@@ -1745,7 +2390,15 @@ class LiveJevService:
             "ms": {"jev": 0, "llm": 0, "bridge": script_ms, "total": round((time.perf_counter() - started) * 1000)},
         }
 
-    def _bare_plugin_request(self, text: str, message_id: Any, started: float, jev_ms: int) -> dict[str, Any] | None:
+    def _bare_plugin_request(
+        self,
+        text: str,
+        message_id: Any,
+        started: float,
+        jev_ms: int,
+        *,
+        initial_result: IntentResult | None = None,
+    ) -> dict[str, Any] | None:
         """Handle verb-free requests equivalent to "Serum 2, please" only when the action is otherwise unresolved.
         Match the remaining words to a plug-in alias, exact name, or partial name without Jev, then insert a match on the selected track."""
         from intent import detect_language, normalize_phrase
@@ -1754,20 +2407,73 @@ class LiveJevService:
             name = re.sub(r"^(?:the|a|an|some)\s+", "", normalize_english_phrase(text)).strip()
         else:
             name = re.sub(r"(?:を|が|も)$", "", normalize_phrase(text)).strip()
-        if not name or len(name) > 40 or name.casefold() in {word.casefold() for word in GENERIC_DEVICE_WORDS}:
+        if not name or len(name) > 40:
+            return None
+        name = resolve_device_request_name(name)
+        if name is None:
+            return None
+        normalized = re.sub(r"[ \-_.\u2010-\u2015\u2212\u30fc\uff0d\u3000]", "", name.casefold())
+        if len(normalized) < 3:
             return None
         catalog = self._plugin_names()
-        if not catalog or resolve_bare_plugin_name(name, catalog) is None:
+        if not catalog or not plugin_name_candidates(name, catalog):
             return None
-        return self._process_plugin_request(PluginRequest(Action.INSERT_PLUGIN, name, "selected", None), text, message_id, started, jev_ms)
+        return self._process_plugin_request(
+            PluginRequest(Action.INSERT_PLUGIN, name, "selected", None),
+            text,
+            message_id,
+            started,
+            jev_ms,
+            initial_result=initial_result,
+        )
 
-    def _plugin_fallback(self, text: str, message_id: Any, started: float, jev_ms: int) -> dict[str, Any] | None:
+    def _plugin_candidate_question(self, message_id: Any, candidates: tuple[str, ...]) -> dict[str, Any]:
+        shown = list(candidates[:5])
+        remaining = len(candidates) - len(shown)
+        key = "ask.plugin_more" if remaining else "ask.plugin"
+        return {"id": message_id, "kind": "ask", "line": self._m(key, count=remaining), "options": shown}
+
+    def _local_bare_plugin_request(self, text: str, message_id: Any, started: float) -> dict[str, Any] | None:
+        from intent import detect_language, load_aliases, normalize_phrase
+        if detect_language(text) == "en":
+            from intent_en import normalize_english_phrase
+            name = re.sub(r"^(?:the|a|an|some)\s+", "", normalize_english_phrase(text)).strip()
+        else:
+            name = re.sub(r"(?:を|が|も)$", "", normalize_phrase(text)).strip()
+            if re.search(r"(?:を|に|へ|で|と|から|まで|が|も|は|して|してる|する|した|してね|してください)$", normalize_phrase(text)):
+                return None
+        track_names = []
+        aliases = load_aliases()
+        for track in self.snapshot.tracks:
+            track_names.extend((track.name, *aliases.get(track.name, ())))
+        if any(value and re.sub(r"[\W_]", "", value.casefold()).startswith(re.sub(r"[\W_]", "", name.casefold())) for value in track_names):
+            return None
+        request_name = resolve_device_request_name(name)
+        if request_name is None:
+            return None
+        normalized = re.sub(r"[ \-_.\u2010-\u2015\u2212\u30fc\uff0d\u3000]", "", request_name.casefold())
+        if len(normalized) < 3:
+            return None
+        return self._bare_plugin_request(text, message_id, started, 0)
+
+    def _plugin_fallback(
+        self,
+        text: str,
+        message_id: Any,
+        started: float,
+        jev_ms: int,
+        *,
+        initial_result: IntentResult | None = None,
+    ) -> dict[str, Any] | None:
         """Fallback before Jev asks about a suspected built-in-device request.
         Ask Jev to choose one catalog plug-in from the full utterance, then continue a match such as Omnisphere as an external plug-in request."""
         catalog = self._plugin_names()
         if not catalog or not self.key:
             return None
-        plugin, picked_ms = self._pick_plugin_with_jev(text, catalog)
+        try:
+            plugin, picked_ms = self._pick_plugin_with_jev(text, catalog)
+        except JevRequestTooLarge:
+            return {"id": message_id, "kind": "error", "line": self._m("error.jev_too_large")}
         if plugin is None:
             return None
         wants_new_track = re.search(r"新しい|新規|あたらしい|トラック\s*(?:を)?\s*(?:作|追加|足|増や)|\b(?:new|another|fresh)\s+(?:midi\s+|audio\s+|instrument\s+)?track\b|\b(?:create|make|add)\s+(?:a\s+)?(?:midi\s+|audio\s+|instrument\s+)?track\b", text, re.IGNORECASE) is not None
@@ -1776,7 +2482,14 @@ class LiveJevService:
             request = PluginRequest(Action.ADD_TRACK_WITH_PLUGIN, plugin, None, audio)
         else:
             request = PluginRequest(Action.INSERT_PLUGIN, plugin, "selected", None)
-        return self._process_plugin_request(request, text, message_id, started, jev_ms + picked_ms)
+        return self._process_plugin_request(
+            request,
+            text,
+            message_id,
+            started,
+            jev_ms + picked_ms,
+            initial_result=initial_result,
+        )
 
     def _pick_plugin_with_jev(self, raw_name: str, catalog: tuple[str, ...]) -> tuple[str | None, int]:
         """Use Jev to match katakana or abbreviations to catalog names in batches of 250, returning the most likely match."""
@@ -1793,6 +2506,8 @@ class LiveJevService:
             }
             try:
                 response = self.requester(payload, self.key)
+            except JevRequestTooLarge:
+                raise
             except RuntimeError:
                 continue
             answer = response.get("answers", {}).get("plugin", {}) if isinstance(response, Mapping) else {}
@@ -1839,46 +2554,68 @@ class LiveJevService:
         parsed = parse_local(text, self.snapshot)
         return parsed is not None and parsed.action is Action.UNDO
 
+    def _is_redo_request(self, text: str) -> bool:
+        if self.snapshot is None:
+            return re.fullmatch(r"\s*(?:やり直し(?:て)?|リドゥ|redo(?:\s+that)?)\s*", text, re.IGNORECASE) is not None
+        parsed = parse_local(text, self.snapshot)
+        return parsed is not None and parsed.action is Action.REDO
+
+    def _refuse_native_history(self, message_id: Any, started: float | None = None) -> dict[str, Any]:
+        started = started or time.perf_counter()
+        return {"id": message_id, "kind": "info", "line": self._m("info.cannot_undo"), "ms": self._ms(started, 0, 0, 0)}
+
+    def _refuse_redo(self, message_id: Any, started: float | None = None) -> dict[str, Any]:
+        started = started or time.perf_counter()
+        return {"id": message_id, "kind": "info", "line": self._m("info.cannot_redo"), "ms": self._ms(started, 0, 0, 0)}
+
+    def _dispatch_only_action(
+        self,
+        action: Action,
+        message_id: Any,
+        started: float | None = None,
+        *,
+        dispatch: bool = True,
+    ) -> dict[str, Any] | None:
+        if action not in DISPATCH_ONLY_ACTIONS:
+            return None
+        if dispatch and action is Action.UNDO and not self._ensure_script_current():
+            return self._outdated_response(message_id, started or time.perf_counter())
+        if not dispatch:
+            return {"id": message_id, "kind": "dispatch_only"}
+        self.pending = None
+        if action is Action.UNDO:
+            return self._dispatch_undo(message_id, started)
+        if action is Action.REDO:
+            return self._refuse_redo(message_id, started)
+        raise RuntimeError(f"unhandled dispatch-only action {action.value!r}")
+
     def _dispatch_undo(self, message_id: Any, started: float | None = None) -> dict[str, Any]:
         started = started or time.perf_counter()
+        if self._history_kind == "nonreceipt":
+            return {"id": message_id, "kind": "info", "line": self._m("info.cannot_undo"), "ms": self._ms(started, 0, 0, 0)}
         if isinstance(self.previous, PreviousChain):
             return self._undo_previous_chain(message_id, started)
         if isinstance(self.previous, PreviousIntent):
             prior = self.previous
-            unresolved = self._restore_receipt(prior)
+            unresolved_values: list[Any] = []
+            unresolved = self._restore_receipt(prior, unresolved_values)
             self.previous = unresolved or prior
             self._history_kind = "receipt" if unresolved is not None else "nonreceipt"
             if unresolved is not None:
-                return {"id": message_id, "kind": "info", "line": self._m("info.changed_manually", value="?"), "ms": self._ms(started, 0, 0, 0)}
-            return {"id": message_id, "kind": "result", "line": self._m("readback.text.undo"), "decision": {"track": self._track_label(self.snapshot, prior)}, "ms": self._ms(started, 0, 0, 0)}
-        if self._history_kind == "nonreceipt":
-            return {"id": message_id, "kind": "info", "line": self._m("info.cannot_undo"), "ms": self._ms(started, 0, 0, 0)}
+                value = unresolved_values[-1] if unresolved_values else "?"
+                return {"id": message_id, "kind": "info", "line": self._m("info.changed_manually", value=value), "ms": self._ms(started, 0, 0, 0)}
+            track = self._track_label(self.snapshot, prior)
+            line = self._m("readback.text.undo_detail", track=track, action=action_label(prior.action.value, lang=self.lang)) if track else self._m("readback.text.undo")
+            return {"id": message_id, "kind": "result", "line": line, "decision": {"track": track}, "ms": self._ms(started, 0, 0, 0)}
         return self._undo_button(message_id)
 
     def _undo_button(self, message_id: Any) -> dict[str, Any]:
-        """Handle the window's Undo command. Restore the last change tracked by Live Jev, or use Live's undo for unsupported change types."""
-        if self.snapshot is None:
-            return {"id": message_id, "kind": "error", "line": self._m("error.live")}
+        """Handle Undo when no receipt is available without touching Live's shared undo history."""
         started = time.perf_counter()
-        from intent import _local_intent
-            # Adding a new track and optional device takes two or three Live undo steps in observed runs; the count varies.
-            # Instead of assuming a count, undo up to four times until the track count returns to its previous value.
-        target = self._undo_target_tracks
         self._undo_target_tracks = None
-        if target is not None and len(self.snapshot.tracks) == target[1]:
-            for _ in range(4):
-                try:
-                    self.bridge.run(["--write", "--api-call", "live_set", "undo", "[]", request_id("undo")])
-                    time.sleep(0.35)
-                    self.snapshot, _ = self.reader.read()
-                except BridgeError:
-                    return {"id": message_id, "kind": "error", "line": self._m("error.live")}
-                if len(self.snapshot.tracks) <= target[0]:
-                    break
-            self.previous = None
-            self._history_kind = "nonreceipt"
-            return {"id": message_id, "kind": "result", "line": self._m("readback.text.undo"), "ms": self._ms(started, 0, 0, 0)}
-        return self._execute(_local_intent(Action.UNDO), message_id, 0, 0, started, "元に戻す", None)
+        self.previous = None
+        self._history_kind = "nonreceipt"
+        return {"id": message_id, "kind": "info", "line": self._m("info.cannot_undo"), "ms": self._ms(started, 0, 0, 0)}
 
     def _undo_previous_chain(self, message_id: Any, started: float) -> dict[str, Any]:
         previous = self.previous
@@ -1892,18 +2629,47 @@ class LiveJevService:
         return {"id": message_id, "kind": "result", "line": self._m("readback.text.undo"), "ms": self._ms(started, 0, 0, 0)}
 
     def _answer_confirm(self, message_id: Any, confirmed: bool) -> dict[str, Any]:
+        if confirmed and not self._ensure_script_current():
+            return self._outdated_response(message_id, time.perf_counter())
         pending = self.pending_confirm
         self.pending_confirm = None
         self.pending_confirm_created = None
         if pending is None:
             return {"id": message_id, "kind": "info", "line": self._m("info.no_confirmation")}
+        if len(pending) == 8:
+            intent, jev_ms, llm_ms, utterance, rewritten, forced, trusted_fields, _creator_id = pending
+        elif len(pending) == 7:
+            intent, jev_ms, llm_ms, utterance, rewritten, forced, _creator_id = pending
+            trusted_fields = frozenset()
+        else:
+            intent, jev_ms, llm_ms, utterance, rewritten, _creator_id = pending
+            forced = False
+            trusted_fields = frozenset()
         if not confirmed:
-            return {"id": message_id, "kind": "info", "line": self._m("info.cancelled")}
-        intent, jev_ms, llm_ms, utterance, rewritten, _creator_id = pending
+            answer = {"id": message_id, "kind": "info", "line": self._m("info.cancelled")}
+            if forced:
+                answer["via"] = "gemini"
+            return answer
+        dispatched = self._dispatch_only_action(intent.action, message_id)
+        if dispatched is not None:
+            return dispatched
+        if forced:
+            if ACTIONS[intent.action].kind in {"plugin", "plugin_track"}:
+                catalog = tuple(sorted(set(self._plugin_names()) | set(NATIVE_DEVICES)))
+                if resolve_exact_plugin_name(intent.plugin or "", catalog) != intent.plugin:
+                    return {"id": message_id, "kind": "error", "line": self._m("llm.response"), "via": "gemini"}
+            checked = IntentResult(intent, (), (), ())
+            decision = self._decision(checked, message_id, trusted_fields=trusted_fields)
+            if decision is not None:
+                decision["via"] = "gemini"
+                return decision
+            denied = self._authorize_target(intent)
+            if denied is not None:
+                return {"id": message_id, **denied, "via": "gemini"}
         result, receipt = self._execute_now(intent, message_id, jev_ms, llm_ms, time.perf_counter(), utterance, rewritten)
-        if receipt is not None:
-            self.previous = receipt
-        return result
+        if forced:
+            result["via"] = "gemini"
+        return self._record_execution_history(result, receipt)
 
     def _confirm_multi_track_names(self, indices: tuple[int, ...]) -> int:
         assert self.snapshot is not None
@@ -1983,6 +2749,9 @@ class LiveJevService:
         utterance: str,
     ) -> tuple[dict[str, Any], Receipt | None]:
         assert self.snapshot is not None
+        dispatched = self._dispatch_only_action(intent.action, message_id, started)
+        if dispatched is not None:
+            return dispatched, None
         bridge_ms = 0
         prop, requested = self._multi_property(intent.action)
         restoring = False
@@ -2052,6 +2821,9 @@ class LiveJevService:
         rewritten: list[str] | None,
     ) -> tuple[dict[str, Any], Receipt | None]:
         assert self.snapshot is not None
+        dispatched = self._dispatch_only_action(intent.action, message_id, started)
+        if dispatched is not None:
+            return dispatched, None
         denied = self._authorize_target(intent)
         if denied is not None:
             return {"id": message_id, **denied, "ms": self._ms(started, jev_ms, llm_ms, 0)}, None
@@ -2096,11 +2868,23 @@ class LiveJevService:
                 bridge_ms += plugin_ms
                 confirmed = True
                 if ACTIONS[intent.action].kind == "plugin_track":
-                    self._undo_target_tracks = (len(before.tracks), len(self.snapshot.tracks))
-            elif ACTIONS[intent.action].kind in {"structure", "structure_device"} and self._script_available():
+                    self._undo_target_tracks = (
+                        (len(before.returns), len(self.snapshot.returns))
+                        if intent.track_kind == "return"
+                        else (len(before.tracks), len(self.snapshot.tracks))
+                    )
+            elif ACTIONS[intent.action].kind in {"structure", "structure_device"} and (
+                intent.action is Action.ADD_RETURN_TRACK or intent.track_kind == "return" or self._script_available()
+            ):
+                if (intent.action is Action.ADD_RETURN_TRACK or intent.track_kind == "return") and not self._script_available():
+                    raise ValueError(self._m("error.live"))
                 bridge_ms += self._run_add_track_via_script(intent)
                 confirmed = True
-                self._undo_target_tracks = (len(before.tracks), len(self.snapshot.tracks))
+                self._undo_target_tracks = (
+                    (len(before.returns), len(self.snapshot.returns))
+                    if intent.action is Action.ADD_RETURN_TRACK or intent.track_kind == "return"
+                    else (len(before.tracks), len(self.snapshot.tracks))
+                )
             elif intent.action is Action.VOLUME and intent.number and intent.number.unit == "db":
                 self._current_transaction = transaction
                 db_result = self._set_volume_db(replace(intent, step=step_from_words(intent.step, utterance)))
@@ -2108,8 +2892,11 @@ class LiveJevService:
                     self.snapshot, write_ms, write_unknown = db_result
                     old = self._value_before(before, intent)
                     after_value = self._value_before(self.snapshot, intent)
-                    path = "live_set master_track mixer_device volume" if intent.track == "master" else f"live_set tracks {intent.track} mixer_device volume"
-                    owner = "master" if intent.track == "master" else str(self._track_label(before, intent))
+                    receipt_target = target_for_intent(before, intent)
+                    if receipt_target is None:
+                        raise StaleSnapshot()
+                    path = f"{receipt_target.path} mixer_device volume"
+                    owner = "master" if receipt_target.path == "live_set master_track" else receipt_target.name
                     receipt = Receipt(intent.action, intent.track, intent.param, old, after_value, intent.step, not write_unknown, target_origin=intent.target_origin, utterance=utterance, entries=(ReceiptEntry(path, "value", owner, old, after_value, True),))
                 else:
                     self.snapshot, write_ms, write_unknown, receipt = db_result
@@ -2124,8 +2911,10 @@ class LiveJevService:
                 expected_after = next((value for value in expected_values if value is not None), None)
                 if intent.action is Action.RENAME:
                     expected_after = str(intent.text or "")
-                    track = next(item for item in before.tracks if item.index == intent.track)
-                    receipt = Receipt(intent.action, intent.track, intent.param, old, expected_after, intent.step, False, target_origin=intent.target_origin, utterance=utterance, entries=(ReceiptEntry(track.path, "name", expected_after, old, expected_after, write_kind="rename"),))
+                    target = target_for_intent(before, intent)
+                    if target is None:
+                        raise StaleSnapshot()
+                    receipt = Receipt(intent.action, intent.track, intent.param, old, expected_after, intent.step, False, target_origin=intent.target_origin, utterance=utterance, entries=(ReceiptEntry(target.path, "name", expected_after, old, expected_after, write_kind="rename"),))
                 elif expected_after is not None and ACTIONS[intent.action].kind in receipt_kinds:
                     change_batch = next(batch for batch in batches if self._expected_batch_value(batch) is not None)
                     if "--tempo" in change_batch:
@@ -2136,10 +2925,11 @@ class LiveJevService:
                         path = change_batch[at + 1]
                         prop = "value" if marker == "--api-parameter-set" else change_batch[at + 2]
                         parameter, write_kind = marker == "--api-parameter-set", "set"
-                    owner = "master" if intent.track == "master" else (self._track_label(before, intent) or "song")
+                    receipt_target = target_for_intent(before, intent)
+                    owner = receipt_target.name if intent.param is not None and receipt_target is not None else "master" if receipt_target is not None and receipt_target.path == "live_set master_track" else (self._track_label(before, intent) or "song")
                     device_owner = None
                     if intent.param is not None:
-                        device_owner = next((device.name for track in before.tracks for device in track.devices if intent.param.path.startswith(device.path + " ")), None)
+                        device_owner = next((device.name for track in addressable_targets(before) for device in track.devices if intent.param.path.startswith(device.path + " ")), None)
                     receipt = Receipt(intent.action, intent.track, intent.param, old, expected_after, intent.step, False, clip=intent.clip, scene=intent.scene, send=intent.send, device=intent.device, target_origin=intent.target_origin, utterance=utterance, entries=(ReceiptEntry(path, prop, owner, old, expected_after, parameter, device_owner, write_kind),))
                 if ACTIONS[intent.action].kind in {"mixer", "send", "param", "tempo"} and receipt is not None and expected_after is not None and self._same_restored_value(old, expected_after):
                     return {"id": message_id, "kind": "info", "line": self._m("info.already_state"), "ms": self._ms(started, jev_ms, llm_ms, bridge_ms)}, None
@@ -2187,18 +2977,12 @@ class LiveJevService:
                     )
                     if receipt is not None and expected_after is not None and not confirmed:
                         raise ValueError(self._m("error.live"))
-            if intent.action in {Action.UNDO, Action.REDO}:
-            # Live's undo/redo does not report what changed. Refresh the snapshot or the next relative adjustment may use a stale value, as observed in testing.
-                try:
-                    self.snapshot, read_ms = self.reader.read()
-                    bridge_ms += read_ms
-                except Exception:
-                    pass
             line = self._short_line(ACTIONS[intent.action].readback(self.snapshot, intent))
             if not confirmed and not write_unknown and ACTIONS[intent.action].kind in {"clip_prop", "song_bool", "track_bool", "track_int"}:
                 line += self._m("info.unchanged")
             if intent.action is Action.VOLUME:
-                old_display = before.master_display if intent.track == "master" else next(track.volume_display for track in before.tracks if track.index == intent.track)
+                old_target = target_for_intent(before, intent)
+                old_display = old_target.volume_display if old_target is not None else before.master_display
                 # After an undo request, the snapshot may contain a raw value such as 0.805391. Omit it because it is not useful to users.
                 if "dB" in str(old_display) or "inf" in str(old_display):
                     line += self._m("info.from_value", value=old_display)
@@ -2215,7 +2999,7 @@ class LiveJevService:
             unresolved = self._restore_receipt(receipt) if receipt is not None else None
             restored = receipt is not None and unresolved is None
             line = self._m("error.chain_rolled_back" if restored else "error.chain_partial", **({} if restored else {"clause": utterance}))
-            return self._execution_failure(message_id, "error" if restored else "unknown", line, intent, before, utterance, rewritten, jev_ms, llm_ms, bridge_ms, started), unresolved or receipt
+            return self._execution_failure(message_id, "error" if restored else "unknown", line, intent, before, utterance, rewritten, jev_ms, llm_ms, bridge_ms, started), unresolved
         except BridgeError:
             receipt = receipt or (transaction.pairs[-1][1] if transaction.pairs else None)
             self.live = False
@@ -2244,7 +3028,7 @@ class LiveJevService:
     def _rebind_refreshed_intent(self, snapshot: Snapshot, intent: Intent) -> Intent:
         if intent.action is not Action.PARAM or intent.param is None:
             return intent
-        refreshed_param = next((param for track in snapshot.tracks for device in track.devices for param in device.params if param.path == intent.param.path and param.name == intent.param.name), None)
+        refreshed_param = next((param for track in addressable_targets(snapshot) for device in track.devices for param in device.params if param.path == intent.param.path and param.name == intent.param.name), None)
         if refreshed_param is None:
             raise ValueError(self._m("error.current_value"))
         return replace(intent, param=refreshed_param)
@@ -2305,21 +3089,40 @@ class LiveJevService:
             allowed = {TargetOrigin.SELECTED, TargetOrigin.OWNER, TargetOrigin.PREVIOUS, TargetOrigin.CLARIFIED}
         if intent.target_origin not in allowed:
             return {"kind": "error", "line": self._m("error.named_track_missing")}
-        if intent.track == "master":
+        is_master = intent.track == "master" or (isinstance(intent.track, TargetRef) and intent.track.kind is TargetKind.MASTER)
+        if is_master:
             literal = re.search(r"マスター|全体|\bmaster\b|\bwhole\s+mix\b|\bthe\s+mix\b|\bmain(?:\s+out)?\b|\beverything\b", intent.utterance, re.IGNORECASE)
-            if (literal is None and intent.target_origin is not TargetOrigin.PREVIOUS) or intent.target_origin not in {TargetOrigin.MASTER, TargetOrigin.CLARIFIED, TargetOrigin.PREVIOUS}:
+            selected_master = intent.target_origin is TargetOrigin.SELECTED and self._selected_track_index() == TargetRef(TargetKind.MASTER)
+            if (literal is None and intent.target_origin not in {TargetOrigin.PREVIOUS, TargetOrigin.OWNER} and not selected_master) or intent.target_origin not in {TargetOrigin.MASTER, TargetOrigin.CLARIFIED, TargetOrigin.PREVIOUS, TargetOrigin.SELECTED, TargetOrigin.OWNER} or intent.target_origin is TargetOrigin.SELECTED and not selected_master:
                 return {"kind": "error", "line": self._m("error.named_track_missing")}
-            return None
-        if not isinstance(intent.track, int):
+        if not is_master and not isinstance(intent.track, (int, TargetRef)):
             return {"kind": "error", "line": self._m("error.named_track_missing")}
-        track = next((item for item in self.snapshot.tracks if item.index == intent.track), None)
+        track = target_for_intent(self.snapshot, intent)
         if track is None:
             return {"kind": "error", "line": self._m("error.named_track_missing")}
+        unsupported = target_capability_error(self.snapshot, intent)
+        if unsupported is not None:
+            target_name, action_name = unsupported
+            return {"kind": "error", "line": self._m("error.target_capability", target=target_name, action=action_name)}
+        literal_utterance = intent.utterance
+        ignored_literals: tuple[str | None, ...] = ()
+        if intent.action is Action.RENAME:
+            ignored_literals = (intent.text,)
+        elif intent.action is Action.INSERT_PLUGIN:
+            ignored_literals = (intent.plugin, intent.native_device)
+        for ignored in ignored_literals:
+            if ignored:
+                literal_utterance = re.sub(re.escape(str(ignored)), "", literal_utterance, flags=re.IGNORECASE)
         literal_tracks = [
-            item for item in self.snapshot.tracks
-            if item.name and re.search(rf"(?<![A-Za-z0-9_]){re.escape(item.name)}(?![A-Za-z0-9_])", intent.utterance, re.IGNORECASE)
+            item for item in addressable_targets(self.snapshot)
+            if item.name and re.search(rf"(?<![A-Za-z0-9_]){re.escape(item.name)}(?![A-Za-z0-9_])", literal_utterance, re.IGNORECASE)
         ]
-        if len(literal_tracks) == 1 and literal_tracks[0].index != intent.track:
+        if intent.action is Action.SEND and intent.send is not None:
+            literal_tracks = [
+                item for item in literal_tracks
+                if not (isinstance(item, ReturnTrack) and item.index == intent.send)
+            ]
+        if literal_tracks and all(item.path != track.path for item in literal_tracks):
             return {"kind": "error", "line": self._m("error.named_track_missing")}
         prefix = track.path + " "
         device = intent.device
@@ -2337,6 +3140,8 @@ class LiveJevService:
         elif intent.param is not None:
             return {"kind": "error", "line": self._m("error.target_changed")}
         if intent.clip is not None:
+            if not isinstance(track, Track):
+                return {"kind": "error", "line": self._m("error.target_changed")}
             current_clip = next((item for item in track.clips if item.slot == intent.clip), None)
             if current_clip is None or not current_clip.path.startswith(prefix):
                 return {"kind": "error", "line": self._m("error.target_changed")}
@@ -2345,16 +3150,20 @@ class LiveJevService:
         return None
 
     def _confirm_track_name(self, intent: Intent) -> int:
-        if not isinstance(intent.track, int):
+        if not isinstance(intent.track, (int, TargetRef)):
             return 0
         assert self.snapshot is not None
-        track = next(item for item in self.snapshot.tracks if item.index == intent.track)
-        name_id = request_id("name")
-        result = self.bridge.run(["--api-get", track.path, "name", name_id])
-        name = _find(result, name_id).payload
-        if str(name) != track.name:
+        track = target_for_intent(self.snapshot, intent)
+        if track is None:
             raise StaleSnapshot()
-        elapsed = result.elapsed_ms
+        elapsed = 0
+        if not (isinstance(intent.track, TargetRef) and intent.track.kind is TargetKind.MASTER):
+            name_id = request_id("name")
+            result = self.bridge.run(["--api-get", track.path, "name", name_id])
+            name = _find(result, name_id).payload
+            if str(name) != track.name:
+                raise StaleSnapshot()
+            elapsed = result.elapsed_ms
         device = intent.device
         if device is None and intent.param is not None:
             device = next((item for item in track.devices if intent.param.path.startswith(item.path + " ")), None)
@@ -2367,7 +3176,7 @@ class LiveJevService:
         return elapsed
 
     @staticmethod
-    def _expected_batch_value(arguments: list[str]) -> float | bool | None:
+    def _expected_batch_value(arguments: list[str]) -> float | bool | str | None:
         if "--api-parameter-set" in arguments:
             at = arguments.index("--api-parameter-set")
             return float(arguments[at + 2])
@@ -2378,6 +3187,8 @@ class LiveJevService:
                 return int(raw)
             if prop in {"current_song_time", "gain"}:
                 return float(raw)
+            if prop == "name":
+                return str(json.loads(raw))
             return bool(int(raw))
         if "--tempo" in arguments:
             return float(arguments[arguments.index("--tempo") + 1])
@@ -2463,8 +3274,8 @@ class LiveJevService:
 
     def _shown_value(self, snapshot: Snapshot, intent: Intent) -> str | None:
         spec = ACTIONS[intent.action]
-        if spec.kind == "track_bool" and isinstance(intent.track, int) and spec.prop:
-            track = next((item for item in snapshot.tracks if item.index == intent.track), None)
+        if spec.kind == "track_bool" and spec.prop:
+            track = target_for_intent(snapshot, intent)
             return self._m("state.on" if track and getattr(track, spec.prop) else "state.off")
         if spec.kind == "track_int" and isinstance(intent.track, int) and spec.prop:
             track = next((item for item in snapshot.tracks if item.index == intent.track), None)
@@ -2488,25 +3299,23 @@ class LiveJevService:
             raw = clip.props.get(spec.prop) if clip else None
             return self._m("state.on" if raw else "state.off") if spec.prop in {"looping", "warping"} else str(raw)
         if intent.action is Action.VOLUME:
-            if intent.track == "master":
-                return snapshot.master_display
-            track = next((item for item in snapshot.tracks if item.index == intent.track), None)
-            return track.volume_display if track else None
+            target = target_for_intent(snapshot, intent)
+            return target.volume_display if target else None
         if intent.action is Action.PAN:
-            track = next((item for item in snapshot.tracks if item.index == intent.track), None)
-            return track.pan_display if track else None
+            target = target_for_intent(snapshot, intent)
+            return target.pan_display if target and hasattr(target, "pan_display") else None
         if intent.action in {Action.MUTE, Action.UNMUTE}:
-            track = next((item for item in snapshot.tracks if item.index == intent.track), None)
+            track = target_for_intent(snapshot, intent)
             return self._m("state.on" if track and track.mute else "state.off")
         if intent.action in {Action.SOLO, Action.UNSOLO}:
-            track = next((item for item in snapshot.tracks if item.index == intent.track), None)
+            track = target_for_intent(snapshot, intent)
             return self._m("state.on" if track and track.solo else "state.off")
         if intent.action is Action.TEMPO:
             return f"{snapshot.tempo:g} BPM"
         if intent.action in {Action.PLAY, Action.STOP}:
             return self._m("state.playing" if snapshot.playing else "state.stopped")
         if ACTIONS[intent.action].kind == "param" and intent.param is not None:
-            for track in snapshot.tracks:
+            for track in addressable_targets(snapshot):
                 for device in track.devices:
                     for parameter in device.params:
                         if parameter.path == intent.param.path:
@@ -2514,9 +3323,9 @@ class LiveJevService:
         return None
 
     def _track_label(self, snapshot: Snapshot, intent: Intent) -> str | None:
-        if intent.track == "master":
+        if intent.track == "master" or (isinstance(intent.track, TargetRef) and intent.track.kind is TargetKind.MASTER):
             return self._m("label.master")
-        track = next((item for item in snapshot.tracks if item.index == intent.track), None)
+        track = target_for_intent(snapshot, intent)
         return track.name if track else None
 
     @staticmethod
@@ -2561,14 +3370,15 @@ class LiveJevService:
     def _set_volume_db(self, intent: Intent, utterance: str = "", transaction: Transaction | None = None) -> tuple[Snapshot, int, bool, Receipt]:
         assert self.snapshot is not None and intent.number is not None
         transaction = transaction or getattr(self, "_current_transaction", None)
-        if intent.track == "master":
-            path, track_ref = "live_set master_track mixer_device volume", "master"
-            current_display = self.snapshot.master_display
-        else:
-            track = next(item for item in self.snapshot.tracks if item.index == intent.track)
-            path, track_ref = f"{track.path} mixer_device volume", str(track.index)
-            current_display = track.volume_display
+        target_owner = target_for_intent(self.snapshot, intent)
+        if target_owner is None:
+            raise StaleSnapshot()
+        path = f"{target_owner.path} mixer_device volume"
+        track_ref = "master" if target_owner.path == "live_set master_track" else str(target_owner.index) if isinstance(target_owner, Track) else target_owner.path
+        current_display = target_owner.volume_display
         target = relative_db_target(intent.number.value, intent.step, current_display)
+        if target < -100.0:
+            raise ValueError(self._m("error.value_range"))
         # Search with str_for_value only. Writing every probe made the fader sweep audibly through up to twelve
         # values (overshooting the target on the way) and stopped at +-0.05 dB, so "0dBにして" landed on -0.015 dB.
         low, high = 0.0, 1.0
@@ -2638,8 +3448,8 @@ class LiveJevService:
         error, best_value, best_display = min(attempts, key=lambda item: item[0])
         if error > 0.05 and endpoints[0][0] != endpoints[1][0]:
             raise BridgeError(self._m("error.live"))
-        before_value = self.snapshot.master_volume if intent.track == "master" else next(track.volume for track in self.snapshot.tracks if track.index == intent.track)
-        owner = "master" if intent.track == "master" else next(track.name for track in self.snapshot.tracks if track.index == intent.track)
+        before_value = target_owner.volume
+        owner = "master" if target_owner.path == "live_set master_track" else target_owner.name
         receipt = Receipt(intent.action, intent.track, intent.param, before_value, best_value, intent.step, False, target_origin=intent.target_origin, utterance=utterance, entries=(ReceiptEntry(path, "value", owner, before_value, best_value, True),))
         if transaction is not None:
             transaction.register(utterance, receipt)
@@ -2656,10 +3466,7 @@ class LiveJevService:
         updated = self._update_from_result(self.snapshot, intent, BridgeResult(tuple(mixer.acks) + (display_ack,), mixer.elapsed_ms, 0, False))
         if not self._same_value(self._value_before(updated, intent), best_value):
             raise ValueError(self._m("error.live"))
-        if intent.track == "master":
-            updated = replace(updated, master_display=best_display)
-        else:
-            updated = replace_track(updated, int(intent.track), volume_display=best_display)
+        updated = replace_target(updated, intent.track, volume_display=best_display)
         return updated, elapsed, False, receipt
 
     def _refresh_target(self, intent: Intent) -> tuple[Snapshot, int]:
@@ -2738,7 +3545,19 @@ class LiveJevService:
         "plugin_not_found": "その名前のデバイスがLiveのブラウザに見つかりません",
         "browser_item_missing": "その名前のデバイスがLiveのブラウザに見つかりません",
         "track_not_found": "指定したトラックが見つかりません",
+        "load_rejected": "plugin.load_rejected",
+        "load_created_track": "plugin.load_created_track",
+        "instrument_on_non_midi": "plugin.instrument_on_non_midi",
+        "return_limit": "error.return_limit",
     }
+
+    def _script_load_error(self, error: Exception) -> str:
+        value = self.SCRIPT_LOAD_ERRORS.get(str(error), str(error))
+        return self._m(value) if value.startswith(("plugin.", "error.")) else value
+
+    def _plugin_verification_error(self, plugin: str, loading: bool = False) -> str:
+        key = "plugin.verify_loading" if loading else "plugin.verify_failed"
+        return self._m(key, plugin=plugin)
 
     def _run_plugin_flow(self, intent: Intent, before: Snapshot) -> tuple[int, Intent]:
         """Insert a plug-in on an existing track or add a track and insert it, following Live's behavior.
@@ -2747,24 +3566,36 @@ class LiveJevService:
         started = time.perf_counter()
         plugin = str(intent.plugin)
         uri = getattr(self, "_plugin_uris", {}).get(plugin, "")
+        target = target_for_intent(before, intent)
         try:
             if ACTIONS[intent.action].kind == "plugin_track":
-                audio = intent.track_kind == "audio"
+                kind = intent.track_kind or "midi"
+                if kind == "return" and not self._script_available():
+                    raise ValueError(self._m("error.live"))
                 name = intent.text or None
                 if uri:
                     # Add the track first, then load by browser URI so the preferred format is used.
-                    added = plugin_script.add_track("audio" if audio else "midi", name, None)
-                    answer = dict(plugin_script.load(plugin, int(added["track_index"]), uri))
-                    answer.setdefault("track_index", added["track_index"])
+                    added = plugin_script.add_track(kind, name, None)
+                    destination = str(added["target_path"]) if kind == "return" else int(added["track_index"])
+                    answer = dict(plugin_script.load(plugin, destination, uri))
+                    if kind == "return":
+                        answer.setdefault("return_index", added["return_index"])
+                        answer.setdefault("target_path", added["target_path"])
+                    else:
+                        answer.setdefault("track_index", added["track_index"])
                 else:
-                    answer = plugin_script.add_track("audio" if audio else "midi", name, plugin)
+                    answer = plugin_script.add_track(kind, name, plugin)
             else:
-                answer = plugin_script.load(plugin, int(intent.track), uri)
+                if target is None:
+                    raise ValueError(self._m("error.named_track_missing"))
+                destination: int | str = target.index if isinstance(intent.track, int) else target.path
+                answer = plugin_script.load(plugin, destination, uri)
         except plugin_script.ScriptError as error:
             if "main_thread_timeout" not in str(error):
-                raise ValueError(self.SCRIPT_LOAD_ERRORS.get(str(error), str(error))) from error
+                raise ValueError(self._script_load_error(error)) from error
             answer = {}  # Large instruments may simply need more loading time. Keep rereading below until the device appears.
         track_index = answer.get("track_index")
+        return_index = answer.get("return_index")
         loaded = [str(name) for name in answer.get("devices_after") or []]
         deadline = time.monotonic() + PLUGIN_LOAD_WAIT_SECONDS
         while True:
@@ -2772,43 +3603,40 @@ class LiveJevService:
                 self.snapshot, _ = self.reader.read()
             except BridgeError:
                 if time.monotonic() >= deadline:
-                    raise ValueError(f"{plugin} が載ったことを確認できませんでした（Liveが読み込み中かもしれません）")
+                    raise ValueError(self._plugin_verification_error(plugin, loading=True))
                 time.sleep(0.5)
                 continue
             if any(plugin.casefold() in name.casefold() or name.casefold() in plugin.casefold() for name in loaded):
                 break
             index = track_index if isinstance(track_index, int) else (int(intent.track) if isinstance(intent.track, int) else None)
-            current = next((item for item in self.snapshot.tracks if item.index == index), None) if index is not None else None
+            if isinstance(return_index, int):
+                current = next((item for item in self.snapshot.returns if item.index == return_index), None)
+            else:
+                current = next((item for item in self.snapshot.tracks if item.index == index), None) if index is not None else target_for_intent(self.snapshot, intent)
             names = [device.name for device in current.devices] if current else []
             if any(plugin.casefold() in name.casefold() or name.casefold() in plugin.casefold() for name in names):
                 break
             if time.monotonic() >= deadline:
-                raise ValueError(f"{plugin} が載ったことを確認できませんでした")
+                raise ValueError(self._plugin_verification_error(plugin))
             time.sleep(0.5)
-        if isinstance(track_index, int):
+        if isinstance(track_index, int) and isinstance(intent.track, int):
             intent = replace(intent, track=track_index, target_origin=TargetOrigin.SELECTED)
+        elif isinstance(return_index, int):
+            intent = replace(intent, track=TargetRef(TargetKind.RETURN, return_index), target_origin=TargetOrigin.SELECTED)
         return round((time.perf_counter() - started) * 1000), intent
 
     def _run_add_track_via_script(self, intent: Intent) -> int:
         """Add a track and optional built-in device through the component inside Live, following Live's positioning and naming behavior."""
         started = time.perf_counter()
-        audio = intent.action is Action.ADD_AUDIO_TRACK or intent.track_kind == "audio"
+        kind = "return" if intent.action is Action.ADD_RETURN_TRACK or intent.track_kind == "return" else "audio" if intent.action is Action.ADD_AUDIO_TRACK or intent.track_kind == "audio" else "midi"
         name = intent.text or None
         device = str(intent.native_device) if intent.action is Action.ADD_TRACK_WITH_DEVICE else None
         try:
-            plugin_script.add_track("audio" if audio else "midi", name, device)
+            plugin_script.add_track(kind, name, device)
         except plugin_script.ScriptError as error:
-            raise ValueError(self.SCRIPT_LOAD_ERRORS.get(str(error), str(error))) from error
+            raise ValueError(self._script_load_error(error)) from error
         self.snapshot, _ = self.reader.read()
         return round((time.perf_counter() - started) * 1000)
-
-    def _rollback_added_track(self) -> None:
-        """If adding a plug-in after a new track fails midway, remove the added track with Live's undo."""
-        try:
-            self.bridge.run(["--write", "--api-call", "live_set", "undo", "[]", request_id("undo")])
-            self.snapshot, _ = self.reader.read()
-        except Exception:
-            pass
 
     def _refresh_structure(self, _intent: Intent) -> tuple[Snapshot, int]:
         return self.reader.read()
@@ -2825,10 +3653,10 @@ class LiveJevService:
 
     def _update_rename(self, snapshot: Snapshot, intent: Intent, result: BridgeResult) -> Snapshot:
         ack = next((item for item in reversed(result.acks) if item.event == "api_get" and item.property == "name"), None)
-        if ack is None or not isinstance(intent.track, int):
+        if ack is None:
             return snapshot
         raw = ack.payload[-1] if isinstance(ack.payload, list) and ack.payload else ack.payload
-        return replace_track(snapshot, intent.track, name=str(raw))
+        return replace_target(snapshot, intent.track, name=str(raw))
 
     def _refresh_song_prop(self, intent: Intent) -> tuple[Snapshot, int]:
         assert self.snapshot is not None
@@ -2861,7 +3689,9 @@ class LiveJevService:
 
     def _refresh_track_bool(self, intent: Intent) -> tuple[Snapshot, int]:
         assert self.snapshot is not None
-        track = next(item for item in self.snapshot.tracks if item.index == intent.track)
+        track = target_for_intent(self.snapshot, intent)
+        if track is None:
+            raise StaleSnapshot()
         prop = ACTIONS[intent.action].prop or "mute"
         value_id = request_id(prop)
         result = self.bridge.run(["--api-get", track.path, prop, value_id])
@@ -2871,12 +3701,16 @@ class LiveJevService:
         valid = isinstance(raw, str) if ACTIONS[intent.action].kind == "rename" else isinstance(raw, (bool, int, float))
         if not valid or (isinstance(raw, float) and not math.isfinite(raw)):
             raise ValueError(self._m("error.current_value"))
-        elapsed = result.elapsed_ms + self._confirm_track_name(intent)
+        if ACTIONS[intent.action].kind == "rename" and str(raw) != track.name:
+            raise StaleSnapshot()
+        elapsed = result.elapsed_ms if ACTIONS[intent.action].kind == "rename" else result.elapsed_ms + self._confirm_track_name(intent)
         return self._update_from_result(self.snapshot, intent, result), elapsed
 
     def _refresh_param(self, intent: Intent) -> tuple[Snapshot, int]:
         assert self.snapshot is not None and intent.param is not None
-        track = next(item for item in self.snapshot.tracks if item.index == intent.track)
+        track = target_for_intent(self.snapshot, intent)
+        if track is None:
+            raise StaleSnapshot()
         device = next(item for item in track.devices if intent.param.path.startswith(item.path + " "))
         device_path = intent.param.path.rsplit(" parameters ", 1)[0]
         result = self.bridge.run(["--api-device-parameters", device_path, request_id("params")])
@@ -2892,7 +3726,10 @@ class LiveJevService:
 
     def _refresh_mixer(self, intent: Intent) -> tuple[Snapshot, int]:
         assert self.snapshot is not None
-        target = "master" if intent.track == "master" else str(intent.track)
+        owner = target_for_intent(self.snapshot, intent)
+        if owner is None:
+            raise StaleSnapshot()
+        target = "master" if owner.path == "live_set master_track" else str(owner.index) if isinstance(owner, Track) else owner.path
         result = self.bridge.run(["--api-mixer-status", target, request_id("mixer")])
         _require_readback(result, "api_mixer_status")
         owner_ms = self._confirm_track_name(intent)
@@ -2908,7 +3745,7 @@ class LiveJevService:
             display_ack = Ack("api_call", request_id("display"), str(payload_display), str(parameter.get("path") or ""), "str_for_value")
             combined = BridgeResult(tuple(result.acks) + (display_ack,), result.elapsed_ms, 0, False)
             return self._update_from_result(self.snapshot, intent, combined), combined.elapsed_ms + owner_ms
-        path = "live_set master_track mixer_device volume" if intent.track == "master" else f"live_set tracks {intent.track} mixer_device {field}"
+        path = f"{owner.path} mixer_device {field}"
         display = self.bridge.run(["--write", "--api-call", path, "str_for_value", json.dumps([value]), request_id("display")])
         _require_readback(display, "api_call", "str_for_value")
         combined = BridgeResult(tuple(result.acks) + tuple(display.acks), result.elapsed_ms + display.elapsed_ms, 0, False)
@@ -2974,7 +3811,7 @@ class LiveJevService:
         if isinstance(raw, list) and raw:
             raw = raw[-1]
         value: Any = int(float(raw)) if spec.kind == "track_int" else bool(raw)
-        return replace_track(snapshot, int(intent.track), **{prop: value})
+        return replace_target(snapshot, intent.track, **{prop: value})
 
     def _update_mixer(self, snapshot: Snapshot, intent: Intent, result: BridgeResult) -> Snapshot:
         ack = next((item for item in reversed(result.acks) if item.event == "api_mixer_status"), None)
@@ -2994,10 +3831,8 @@ class LiveJevService:
         if display_value is None or str(display_value) == "":
             raise ValueError(self._m("error.current_value"))
         shown = str(display_value)
-        if intent.track == "master":
-            return replace(snapshot, master_volume=value, master_display=shown, taken_at=time.time())
         changes = {"volume": value, "volume_display": shown} if field == "volume" else {"pan": value, "pan_display": shown}
-        return replace_track(snapshot, int(intent.track), **changes)
+        return replace_target(snapshot, intent.track, **changes)
 
     def _update_param(self, snapshot: Snapshot, intent: Intent, result: BridgeResult) -> Snapshot:
         if intent.param is None:

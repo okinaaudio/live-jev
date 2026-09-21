@@ -97,8 +97,10 @@ class BridgeError(RuntimeError):
 
 
 _TRACK_PATH = re.compile(r"^live_set tracks (0|[1-9]\d*)$")
+_RETURN_PATH = re.compile(r"^live_set return_tracks (0|[1-9]\d*)$")
+_ADDRESSABLE_PATH = re.compile(r"^live_set (?:(?:tracks|return_tracks) (?:0|[1-9]\d*)|master_track)$")
 _MIXER_PARAMETER_PATH = re.compile(
-    r"^(?:live_set tracks (?:0|[1-9]\d*) mixer_device (?:volume|panning)|live_set master_track mixer_device volume)$"
+    r"^(?:live_set (?:tracks|return_tracks) (?:0|[1-9]\d*) mixer_device (?:volume|panning)|live_set master_track mixer_device volume)$"
 )
 _DEVICE_PARAMETER_PATH = re.compile(
     r"^live_set .+ devices (?:0|[1-9]\d*) parameters (?:0|[1-9]\d*)$"
@@ -123,7 +125,7 @@ SONG_GET_PROPS = frozenset({
 TRACK_SET_PROPS = frozenset({"mute", "solo", "arm", "current_monitoring_state", "fold_state"})
 SONG_SET_PROPS = frozenset({"loop", "metronome", "session_record", "overdub", "current_song_time"})
 SONG_CALL_METHODS = frozenset({
-    "start_playing", "stop_playing", "continue_playing", "undo", "redo",
+    "start_playing", "stop_playing", "continue_playing",
     "capture_midi", "tap_tempo", "stop_all_clips",
 })
 TRACK_CALL_METHODS = frozenset({"stop_all_clips"})
@@ -274,7 +276,8 @@ def _validate_command(flag: str, values: tuple[str, ...]) -> None:
                 raise ValueError("センドは value だけ取得できます")
             return
         if prop in TRACK_GET_PROPS:
-            if not _TRACK_PATH.fullmatch(path):
+            ordinary_only = prop in {"arm", "current_monitoring_state", "fold_state"}
+            if not (_TRACK_PATH.fullmatch(path) or (not ordinary_only and (_RETURN_PATH.fullmatch(path) or path == "live_set master_track" and prop == "name"))):
                 raise ValueError("トラック以外の property は取得できません")
             return
         if prop in SONG_GET_PROPS:
@@ -284,7 +287,7 @@ def _validate_command(flag: str, values: tuple[str, ...]) -> None:
         raise ValueError(f"取得できない property です: {prop}")
     if flag == "--api-mixer-status":
         target = values[0]
-        if target != "master" and not target.isdigit():
+        if target != "master" and not target.isdigit() and not _ADDRESSABLE_PATH.fullmatch(target):
             raise ValueError("mixer-status の対象が不正です")
         return
     if flag == "--api-device-list":
@@ -298,7 +301,7 @@ def _validate_command(flag: str, values: tuple[str, ...]) -> None:
         return
     if flag == "--api-insert-device":
         path, name, position, _request_id = values
-        if not _TRACK_PATH.fullmatch(path):
+        if not _ADDRESSABLE_PATH.fullmatch(path):
             raise ValueError("デバイスを挿せるのはトラックだけです")
         if name not in NATIVE_DEVICES:
             raise ValueError(f"内蔵デバイスの名前ではありません: {name}")
@@ -322,10 +325,21 @@ def _validate_command(flag: str, values: tuple[str, ...]) -> None:
         return
     if flag == "--api-set":
         path, prop, value, _request_id = values
+        if _ADDRESSABLE_PATH.fullmatch(path) and prop == "name":
+            try:
+                name = json.loads(value)
+            except (TypeError, ValueError, json.JSONDecodeError) as error:
+                raise ValueError("名前はJSON文字列で指定してください") from error
+            if not isinstance(name, str) or not name.strip() or len(name) > 64 or any(ord(ch) < 32 for ch in name):
+                raise ValueError("名前は1〜64文字の通常の文字にしてください")
+            return
         if _CLIP_PATH.fullmatch(path) and prop in CLIP_SET_PROPS:
             _check_clip_value(prop, value)
             return
         if _TRACK_PATH.fullmatch(path) and prop in TRACK_SET_PROPS:
+            _check_set_value(prop, value)
+            return
+        if _RETURN_PATH.fullmatch(path) and prop in {"mute", "solo"}:
             _check_set_value(prop, value)
             return
         if path == "live_set" and prop in SONG_SET_PROPS:

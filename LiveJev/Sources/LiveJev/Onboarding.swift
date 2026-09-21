@@ -13,17 +13,28 @@ final class Onboarding: NSObject, NSWindowDelegate {
     private var helps: [NSTextField] = []
     private var buttons: [(NSButton, AppText.Key)] = []
     private let keyField = NSSecureTextField()
+    private let geminiKeyField = NSSecureTextField()
+    private let geminiTitle = NSTextField(labelWithString: "")
+    private let geminiHelp = NSTextField(wrappingLabelWithString: "")
+    private let geminiDisclosure = NSTextField(wrappingLabelWithString: "")
+    private let geminiStatus = NSTextField(labelWithString: "")
     private var installButton: NSButton!
     private var removeButton: NSButton!
+    private var geminiRemoveButton: NSButton!
     private var doneButton: NSButton!
     private var hasKey = false
     private var keyFailed = false
+    private var hasGeminiKey = false
+    private var geminiKeyFailed = false
     private var liveStatus: StatusMessage?
     private var connectionProblem: String?
     private var installProblem = false
+    private var installedThisSession = false
+    private var runningScriptOutdated = false
     private var tried = false
     private var checking = false
     private var tryLine: String?
+    private static let GEMINIKeyURL = URL(string: "https://aistudio.google.com/apikey")!
 
     init(viewModel: ViewModel) {
         self.viewModel = viewModel
@@ -49,8 +60,11 @@ final class Onboarding: NSObject, NSWindowDelegate {
 
     func show() {
         readKey()
+        readGeminiKey()
         liveStatus = nil
         connectionProblem = nil
+        installedThisSession = false
+        runningScriptOutdated = false
         tried = false
         checking = false
         tryLine = nil
@@ -67,6 +81,7 @@ final class Onboarding: NSObject, NSWindowDelegate {
         timer?.invalidate()
         timer = nil
         keyField.stringValue = ""
+        geminiKeyField.stringValue = ""
         NSApp.setActivationPolicy(.accessory)
     }
 
@@ -98,12 +113,25 @@ final class Onboarding: NSObject, NSWindowDelegate {
         stack.alignment = .leading
         stack.spacing = 24
         stack.translatesAutoresizingMaskIntoConstraints = false
-        material.addSubview(stack)
+        let scrollView = NSScrollView()
+        scrollView.hasVerticalScroller = true
+        scrollView.drawsBackground = false
+        scrollView.translatesAutoresizingMaskIntoConstraints = false
+        let document = NSView()
+        document.translatesAutoresizingMaskIntoConstraints = false
+        scrollView.documentView = document
+        material.addSubview(scrollView)
+        document.addSubview(stack)
         NSLayoutConstraint.activate([
-            stack.leadingAnchor.constraint(equalTo: material.leadingAnchor, constant: 28),
-            stack.trailingAnchor.constraint(equalTo: material.trailingAnchor, constant: -28),
-            stack.topAnchor.constraint(equalTo: material.topAnchor, constant: 28),
-            stack.bottomAnchor.constraint(equalTo: material.bottomAnchor, constant: -24)
+            scrollView.leadingAnchor.constraint(equalTo: material.leadingAnchor),
+            scrollView.trailingAnchor.constraint(equalTo: material.trailingAnchor),
+            scrollView.topAnchor.constraint(equalTo: material.topAnchor),
+            scrollView.bottomAnchor.constraint(equalTo: material.bottomAnchor),
+            document.widthAnchor.constraint(equalTo: scrollView.contentView.widthAnchor),
+            stack.leadingAnchor.constraint(equalTo: document.leadingAnchor, constant: 28),
+            stack.trailingAnchor.constraint(equalTo: document.trailingAnchor, constant: -28),
+            stack.topAnchor.constraint(equalTo: document.topAnchor, constant: 28),
+            stack.bottomAnchor.constraint(equalTo: document.bottomAnchor, constant: -24)
         ])
         for index in 0..<4 {
             let glyph = NSImageView()
@@ -143,6 +171,25 @@ final class Onboarding: NSObject, NSWindowDelegate {
             default: break
             }
         }
+        geminiTitle.font = .systemFont(ofSize: 14, weight: .semibold)
+        geminiHelp.font = .systemFont(ofSize: 12)
+        geminiHelp.textColor = .secondaryLabelColor
+        geminiDisclosure.font = .systemFont(ofSize: 12)
+        geminiDisclosure.textColor = .secondaryLabelColor
+        geminiStatus.font = .systemFont(ofSize: 12)
+        geminiStatus.textColor = .secondaryLabelColor
+        geminiKeyField.font = .systemFont(ofSize: 13)
+        geminiKeyField.widthAnchor.constraint(equalToConstant: 290).isActive = true
+        let geminiBody = NSStackView(views: [geminiTitle, geminiHelp, geminiDisclosure])
+        geminiBody.orientation = .vertical
+        geminiBody.alignment = .leading
+        geminiBody.spacing = 8
+        geminiBody.addArrangedSubview(NSStackView(views: [geminiKeyField, button(.saveKey, #selector(saveGeminiKey))]))
+        geminiRemoveButton = button(.removeKey, #selector(removeGeminiKey), secondary: true)
+        geminiBody.addArrangedSubview(NSStackView(views: [button(.getGeminiKey, #selector(getGeminiKey), secondary: true), geminiRemoveButton]))
+        geminiBody.addArrangedSubview(geminiStatus)
+        stack.insertArrangedSubview(geminiBody, at: 3)
+        geminiBody.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
         let footer = NSStackView()
         let spacer = NSView()
         doneButton = button(.finishLater, #selector(finish))
@@ -174,6 +221,11 @@ final class Onboarding: NSObject, NSWindowDelegate {
         }
         keyField.setAccessibilityLabel(text(.addKey))
         keyField.setAccessibilityHelp(text(.keyHelp))
+        geminiTitle.stringValue = text(.geminiKey)
+        geminiHelp.stringValue = text(.geminiHelp)
+        geminiDisclosure.stringValue = text(.geminiDisclosure)
+        geminiKeyField.setAccessibilityLabel(text(.geminiKey))
+        geminiKeyField.setAccessibilityHelp(text(.geminiHelp))
         refresh()
     }
 
@@ -201,23 +253,37 @@ final class Onboarding: NSObject, NSWindowDelegate {
         } catch { hasKey = false; keyFailed = true }
     }
 
+    private func readGeminiKey() {
+        do {
+            hasGeminiKey = try Keychain.read(.gemini) != nil
+            geminiKeyFailed = false
+        } catch {
+            hasGeminiKey = false
+            geminiKeyFailed = true
+        }
+    }
+
     private func refresh() {
         let sourceVersion = version(in: DaemonClient.remoteScriptSource)
         let installedVersion = version(in: destination)
         let exists = FileManager.default.fileExists(atPath: destination.path)
         let older = installedVersion.map { $0.compare(sourceVersion ?? "", options: .numeric) == .orderedAscending } ?? false
-        states[0] = sourceVersion != nil && sourceVersion == installedVersion ? .ok : (exists || sourceVersion == nil ? .problem : .pending)
-        helps[0].stringValue = text(installProblem ? .installFailed : sourceVersion == nil ? .scriptProblem : states[0] == .ok ? .installed : exists ? (installedVersion == nil ? .scriptProblem : older ? .olderScript : .differentScript) : .missingScript)
+        let diskMatches = sourceVersion != nil && sourceVersion == installedVersion
+        let needsRestart = installedThisSession || (diskMatches && runningScriptOutdated)
+        states[0] = needsRestart ? .problem : diskMatches ? .ok : (exists || sourceVersion == nil ? .problem : .pending)
+        helps[0].stringValue = text(installProblem ? .installFailed : installedThisSession ? .installedRestart : diskMatches && runningScriptOutdated ? .runningScriptOutdated : sourceVersion == nil ? .scriptProblem : diskMatches ? .installed : exists ? (installedVersion == nil ? .scriptProblem : older ? .olderScript : .differentScript) : .missingScript)
         if installProblem { states[0] = .problem }
         installButton.title = text(exists ? .update : .install)
         installButton.setAccessibilityLabel(installButton.title)
-        installButton.isEnabled = sourceVersion != nil && states[0] != .ok
+        installButton.isEnabled = sourceVersion != nil && !diskMatches
         installButton.toolTip = destination.path
         states[1] = liveStatus?.live == true ? .ok : (liveStatus != nil || connectionProblem != nil ? .problem : .pending)
         helps[1].stringValue = text(.selectLiveHelp)
         states[2] = hasKey || liveStatus?.jev == true ? .ok : (keyFailed ? .problem : .pending)
         helps[2].stringValue = text(keyFailed ? .keyProblem : !hasKey && liveStatus?.jev == true ? .shellKey : .keyHelp)
         removeButton.isHidden = !hasKey
+        geminiRemoveButton.isHidden = !hasGeminiKey
+        geminiStatus.stringValue = text(geminiKeyFailed ? .geminiSaveFailed : hasGeminiKey ? .geminiSaved : .geminiEmpty)
         states[3] = tried && !checking ? (liveStatus?.live == true && connectionProblem == nil ? .ok : .problem) : .pending
         helps[3].stringValue = tryLine ?? text(.tryHelp)
         for index in 0..<4 {
@@ -239,6 +305,7 @@ final class Onboarding: NSObject, NSWindowDelegate {
             checking = false
             liveStatus = status
             connectionProblem = nil
+            runningScriptOutdated = status.live && status.line.contains("Remote Script") && (status.line.contains("古い版") || status.line.localizedCaseInsensitiveContains("out of date"))
             if tried { tryLine = status.line }
         case .error(let error) where error.id?.hasPrefix("setup-") == true:
             checking = false
@@ -268,6 +335,7 @@ final class Onboarding: NSObject, NSWindowDelegate {
                 try manager.moveItem(at: temporary, to: destination)
             }
             installProblem = false
+            installedThisSession = true
         } catch { installProblem = true }
         refresh()
     }
@@ -305,6 +373,37 @@ final class Onboarding: NSObject, NSWindowDelegate {
         } catch { keyFailed = true; refresh() }
     }
 
+    @objc private func saveGeminiKey() {
+        let key = geminiKeyField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !key.isEmpty else { return }
+        do {
+            try Keychain.save(key, account: .gemini)
+            guard try Keychain.read(.gemini) == key else { throw Keychain.Failure(status: errSecDecode) }
+            geminiKeyField.stringValue = ""
+            geminiKeyChanged()
+        } catch {
+            geminiKeyFailed = true
+            refresh()
+        }
+    }
+
+    @objc private func removeGeminiKey() {
+        do {
+            try Keychain.delete(.gemini)
+            geminiKeyField.stringValue = ""
+            geminiKeyChanged()
+        } catch {
+            geminiKeyFailed = true
+            refresh()
+        }
+    }
+
+    private func geminiKeyChanged() {
+        readGeminiKey()
+        refresh()
+        viewModel.restartDaemon()
+    }
+
     private func keyChanged() {
         readKey()
         liveStatus = nil
@@ -318,6 +417,10 @@ final class Onboarding: NSObject, NSWindowDelegate {
 
     @objc private func getKey() {
         NSWorkspace.shared.open(URL(string: "https://typesafe.ai")!)
+    }
+
+    @objc private func getGeminiKey() {
+        NSWorkspace.shared.open(Self.GEMINIKeyURL)
     }
 
     @objc private func tryConnection() {

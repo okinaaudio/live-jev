@@ -5,19 +5,24 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 
 from daemon import LiveJevService
+from messages import render, resolve_language
 
 
-VERSION = "1.01"
+VERSION = "1.02"
 
 
 def _print(response: dict[str, object]) -> None:
+    lang = resolve_language(os.environ.get("LIVE_JEV_LANG"), default="ja")
     line = str(response.get("line", ""))
     timing = response.get("ms")
     if isinstance(timing, dict) and "total" in timing:
         line += f"  {timing['total']}ms"
     print(line)
+    if response.get("via") == "gemini":
+        print("Gemini")
     decision = response.get("decision")
     if response.get("kind") == "result" and isinstance(decision, dict):
         labels = [decision.get("action_label"), decision.get("track"), decision.get("param"), decision.get("step_label")]
@@ -26,10 +31,11 @@ def _print(response: dict[str, object]) -> None:
         if isinstance(conf, dict):
             scores = [value for value in (conf.get("action"), conf.get("track"), conf.get("param")) if isinstance(value, (int, float))]
             if scores:
-                detail += "（" + "・".join(f"{value:.2f}" for value in scores) + "）"
+                joined = ("・" if lang == "ja" else ", ").join(f"{value:.2f}" for value in scores)
+                detail += f"（{joined}）" if lang == "ja" else f" ({joined})"
         rewritten = decision.get("rewritten")
         if isinstance(rewritten, list) and rewritten:
-            detail += "  言い換え: " + " / ".join(str(item) for item in rewritten)
+            detail += "  " + render("cli.rewritten", lang=lang) + ": " + " / ".join(str(item) for item in rewritten)
         if isinstance(rewritten, list) and rewritten and isinstance(timing, dict) and isinstance(timing.get("llm"), (int, float)):
             detail += f"  +LLM {timing['llm'] / 1000:.1f}s"
         print("Jev: " + detail)
@@ -38,7 +44,8 @@ def _print(response: dict[str, object]) -> None:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="日本語の一言で Ableton Live を操作します")
+    lang = resolve_language(os.environ.get("LIVE_JEV_LANG"), default="ja")
+    parser = argparse.ArgumentParser(description=render("cli.description", lang=lang))
     parser.add_argument("--version", action="version", version=f"Live Jev {VERSION}")
     parser.add_argument("text", nargs="*")
     parser.add_argument("--verbose", action="store_true")

@@ -4,10 +4,45 @@ import unittest
 
 from bridge_client import Ack, BridgeResult
 from daemon import SnapshotReader
-from snapshot import build_snapshot, snapshot_from_script
+from snapshot import TargetCapability, TargetKind, snapshot_from_script, build_snapshot
 
 
 class SnapshotTests(unittest.TestCase):
+    def test_script_snapshot_keeps_returns_and_master_as_first_class_targets(self) -> None:
+        payload = {
+            "schema": 1,
+            "song": {"tempo": 120, "is_playing": False},
+            "tracks": [],
+            "master": {
+                "path": "live_set master_track", "name": "Master",
+                "mixer": {"volume": {"value": 0.8, "display": "-2.0 dB"}},
+                "devices": [{"index": 0, "path": "live_set master_track devices 0", "name": "Limiter", "parameters": []}],
+            },
+            "scenes": [],
+            "returns": [{
+                "index": 0, "path": "live_set return_tracks 0", "name": "Hall",
+                "mute": False, "solo": True,
+                "mixer": {
+                    "volume": {"value": 0.6, "display": "-6.0 dB"},
+                    "panning": {"value": -0.2, "display": "20L"},
+                },
+                "devices": [{"index": 0, "path": "live_set return_tracks 0 devices 0", "name": "Reverb", "parameters": []}],
+            }],
+        }
+
+        snapshot = snapshot_from_script(payload, taken_at=10)
+
+        returned = snapshot.returns[0]
+        self.assertEqual((returned.name, returned.path), ("Hall", "live_set return_tracks 0"))
+        self.assertEqual((returned.volume_display, returned.pan_display, returned.mute, returned.solo), ("-6.0 dB", "20L", False, True))
+        self.assertEqual(returned.devices[0].name, "Reverb")
+        self.assertEqual(snapshot.master.path, "live_set master_track")
+        self.assertEqual(snapshot.master.devices[0].name, "Limiter")
+        self.assertEqual(snapshot.master.ref.kind, TargetKind.MASTER)
+        self.assertIn(TargetCapability.DEVICES, snapshot.master.capabilities)
+        self.assertNotIn(TargetCapability.SOLO, snapshot.master.capabilities)
+        self.assertNotIn(TargetCapability.ARM, returned.capabilities)
+
     def test_script_snapshot_uses_one_capability_call(self) -> None:
         expected = snapshot_from_script({
             "schema": 1,

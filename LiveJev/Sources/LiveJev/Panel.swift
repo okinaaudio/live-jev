@@ -673,10 +673,13 @@ final class PanelController: NSWindowController, NSTextFieldDelegate, NSWindowDe
 
     private func makeResultRow(_ item: ResultItem, isLatest: Bool) -> NSView {
         if let confirmationID = item.confirmationID {
-            return makeConfirmationRow(item, confirmationID: confirmationID, isLatest: isLatest)
+            return withOriginMarker(
+                makeConfirmationRow(item, confirmationID: confirmationID, isLatest: isLatest),
+                item: item
+            )
         }
         if !item.options.isEmpty {
-            return makeAskRow(item, isLatest: isLatest)
+            return withOriginMarker(makeAskRow(item, isLatest: isLatest), item: item)
         }
 
         let line = NSTextField(labelWithString: item.line)
@@ -716,7 +719,9 @@ final class PanelController: NSWindowController, NSTextFieldDelegate, NSWindowDe
         resultLine.alignment = .centerY
         resultLine.spacing = 5
 
-        guard showDetails, let decision = item.decision else { return resultLine }
+        guard showDetails, let decision = item.decision else {
+            return withOriginMarker(resultLine, item: item)
+        }
 
         let detail = NSTextField(labelWithString: decisionLine(decision))
         detail.font = .systemFont(ofSize: 11)
@@ -750,6 +755,22 @@ final class PanelController: NSWindowController, NSTextFieldDelegate, NSWindowDe
         row.spacing = 3
         resultLine.widthAnchor.constraint(equalTo: row.widthAnchor).isActive = true
         detailLine.widthAnchor.constraint(equalTo: row.widthAnchor).isActive = true
+        return withOriginMarker(row, item: item)
+    }
+
+    private func withOriginMarker(_ content: NSView, item: ResultItem) -> NSView {
+        guard item.via == "gemini" else { return content }
+        let marker = NSTextField(labelWithString: "Gemini")
+        marker.font = .systemFont(ofSize: 10, weight: .medium)
+        marker.textColor = .tertiaryLabelColor
+        marker.setContentCompressionResistancePriority(.required, for: .horizontal)
+        marker.setContentHuggingPriority(.required, for: .horizontal)
+
+        let row = NSStackView(views: [content, marker])
+        row.orientation = .vertical
+        row.alignment = .leading
+        row.spacing = 3
+        content.widthAnchor.constraint(equalTo: row.widthAnchor).isActive = true
         return row
     }
 

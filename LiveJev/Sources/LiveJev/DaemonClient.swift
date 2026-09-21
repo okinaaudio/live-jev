@@ -166,6 +166,7 @@ final class DaemonClient: @unchecked Sendable {
         environment["LIVE_JEV_LANG"] = language.rawValue
         environment["PYTHONDONTWRITEBYTECODE"] = "1"
         if let key = try? Keychain.read() { environment["TYPESAFE_API_KEY"] = key }
+        if let key = try? Keychain.read(.gemini) { environment["GEMINI_API_KEY"] = key }
         process.environment = environment
         process.standardInput = stdinPipe
         process.standardOutput = stdoutPipe

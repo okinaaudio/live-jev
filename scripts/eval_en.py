@@ -94,8 +94,9 @@ def main() -> int:
     current = snapshot()
     passed = 0
     for case in CASES:
-        response = request_jev(build_request(current, case.utterance), key)
-        intent = interpret_response(current, case.utterance, response).intent
+        payload = build_request(current, case.utterance)
+        response = request_jev(payload, key)
+        intent = interpret_response(current, case.utterance, response, payload["state"].get("detail_tracks", ())).intent
         ok = intent.action is case.action and intent.track == case.track
         passed += int(ok)
         print(f"{'PASS' if ok else 'FAIL'}\t{case.utterance}\t{intent.action.value}\t{intent.track}")
