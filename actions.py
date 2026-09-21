@@ -9,7 +9,7 @@ from typing import Any, Callable
 
 from intent import Action, Intent, Step
 from messages import LocalizedError, render
-from snapshot import Snapshot, Track
+from snapshot import AddressableTarget, Snapshot, TargetCapability, TargetKind, TargetRef, Track, addressable_targets
 
 
 Apply = Callable[[Snapshot, Intent], list[list[str]]]
@@ -53,14 +53,82 @@ def _track(snapshot: Snapshot, intent: Intent) -> Track:
     return found
 
 
-def _mixer_target(snapshot: Snapshot, intent: Intent, parameter: str) -> tuple[str, str, float]:
+def target_for_intent(snapshot: Snapshot, intent: Intent) -> AddressableTarget | None:
     if intent.track == "master":
+        return snapshot.master
+    return snapshot.target(intent.track) if isinstance(intent.track, (int, TargetRef)) else None
+
+
+ACTION_CAPABILITIES = {
+    Action.VOLUME: TargetCapability.VOLUME,
+    Action.PAN: TargetCapability.PAN,
+    Action.MUTE: TargetCapability.MUTE,
+    Action.UNMUTE: TargetCapability.MUTE,
+    Action.SOLO: TargetCapability.SOLO,
+    Action.UNSOLO: TargetCapability.SOLO,
+    Action.ARM: TargetCapability.ARM,
+    Action.DISARM: TargetCapability.ARM,
+    Action.MONITOR_IN: TargetCapability.MONITOR,
+    Action.MONITOR_AUTO: TargetCapability.MONITOR,
+    Action.MONITOR_OFF: TargetCapability.MONITOR,
+    Action.FOLD: TargetCapability.FOLD,
+    Action.UNFOLD: TargetCapability.FOLD,
+    Action.TRACK_STOP_CLIPS: TargetCapability.CLIPS,
+    Action.LAUNCH_CLIP: TargetCapability.CLIPS,
+    Action.STOP_CLIP: TargetCapability.CLIPS,
+    Action.CLIP_LOOP_ON: TargetCapability.CLIPS,
+    Action.CLIP_LOOP_OFF: TargetCapability.CLIPS,
+    Action.CLIP_WARP_ON: TargetCapability.CLIPS,
+    Action.CLIP_WARP_OFF: TargetCapability.CLIPS,
+    Action.CLIP_PITCH: TargetCapability.CLIPS,
+    Action.CLIP_GAIN: TargetCapability.CLIPS,
+    Action.PARAM: TargetCapability.DEVICES,
+    Action.DEVICE_ON: TargetCapability.DEVICES,
+    Action.DEVICE_OFF: TargetCapability.DEVICES,
+    Action.INSERT_PLUGIN: TargetCapability.INSERT_DEVICE,
+    Action.SEND: TargetCapability.SENDS,
+    Action.RENAME: TargetCapability.RENAME,
+}
+
+
+CAPABILITY_LABEL_KEYS = {
+    TargetCapability.VOLUME: "label.volume",
+    TargetCapability.PAN: "label.pan",
+    TargetCapability.MUTE: "label.mute",
+    TargetCapability.SOLO: "label.solo",
+    TargetCapability.ARM: "label.arm",
+    TargetCapability.MONITOR: "label.monitor",
+    TargetCapability.FOLD: "label.fold",
+    TargetCapability.CLIPS: "label.clip",
+    TargetCapability.SENDS: "label.send",
+    TargetCapability.RENAME: "label.rename",
+    TargetCapability.DEVICES: "label.device",
+    TargetCapability.INSERT_DEVICE: "label.device",
+}
+
+
+def target_capability_error(snapshot: Snapshot, intent: Intent) -> tuple[str, str] | None:
+    capability = ACTION_CAPABILITIES.get(intent.action)
+    if capability is None:
+        return None
+    target = target_for_intent(snapshot, intent)
+    if target is None or capability in getattr(target, "capabilities", frozenset()):
+        return None
+    return target.name, render(CAPABILITY_LABEL_KEYS[capability])
+
+
+def _mixer_target(snapshot: Snapshot, intent: Intent, parameter: str) -> tuple[str, str, float]:
+    if intent.track == "master" or (isinstance(intent.track, TargetRef) and intent.track.kind is TargetKind.MASTER):
         if parameter != "volume":
             raise LocalizedError("error.master_volume_only")
-        return "live_set master_track mixer_device volume", "master", snapshot.master_volume
-    track = _track(snapshot, intent)
+        assert snapshot.master is not None
+        return f"{snapshot.master.path} mixer_device volume", "master", snapshot.master.volume
+    track = target_for_intent(snapshot, intent)
+    if track is None:
+        raise LocalizedError("error.track_required")
     value = track.volume if parameter == "volume" else track.pan
-    return f"{track.path} mixer_device {parameter}", str(track.index), value
+    read_target = str(track.index) if isinstance(track, Track) else track.path
+    return f"{track.path} mixer_device {parameter}", read_target, value
 
 
 def _step_delta(step: Step, small: float, big: float) -> float:
@@ -115,7 +183,9 @@ def apply_pan(snapshot: Snapshot, intent: Intent) -> list[list[str]]:
 
 def _apply_track_bool(property_name: str, value: bool) -> Apply:
     def apply(snapshot: Snapshot, intent: Intent) -> list[list[str]]:
-        track = _track(snapshot, intent)
+        track = target_for_intent(snapshot, intent)
+        if track is None:
+            raise LocalizedError("error.track_required")
         write_id = request_id("set")
         read_id = request_id("read")
         return [
@@ -159,23 +229,27 @@ def apply_param(_snapshot: Snapshot, intent: Intent) -> list[list[str]]:
 
 
 def _track_name(snapshot: Snapshot, intent: Intent) -> str:
-    if intent.track == "master":
+    if intent.track == "master" or (isinstance(intent.track, TargetRef) and intent.track.kind is TargetKind.MASTER):
         return render("label.master")
-    return _track(snapshot, intent).name
+    target = target_for_intent(snapshot, intent)
+    return target.name if target is not None else render("label.master")
 
 
 def read_volume(snapshot: Snapshot, intent: Intent) -> str:
-    shown = snapshot.master_display if intent.track == "master" else _track(snapshot, intent).volume_display
+    target = target_for_intent(snapshot, intent)
+    shown = target.volume_display if target is not None else snapshot.master_display
     return render("readback.track_value", track=_track_name(snapshot, intent), label=render("label.volume"), value=shown)
 
 
 def read_pan(snapshot: Snapshot, intent: Intent) -> str:
-    return render("readback.track_value", track=_track_name(snapshot, intent), label=render("label.pan"), value=_track(snapshot, intent).pan_display)
+    target = target_for_intent(snapshot, intent)
+    return render("readback.track_value", track=_track_name(snapshot, intent), label=render("label.pan"), value=target.pan_display if target is not None else "")
 
 
 def _read_bool(label: str, property_name: str) -> Readback:
     def read(snapshot: Snapshot, intent: Intent) -> str:
-        value = getattr(_track(snapshot, intent), property_name)
+        target = target_for_intent(snapshot, intent)
+        value = getattr(target, property_name) if target is not None else False
         state = render("state.on" if value else "state.off")
         return render("readback.track_state", track=_track_name(snapshot, intent), label=render(label), state=state)
     return read
@@ -192,7 +266,7 @@ def read_playing(snapshot: Snapshot, _intent: Intent) -> str:
 def read_param(snapshot: Snapshot, intent: Intent) -> str:
     if intent.param is None:
         return render("readback.param_missing")
-    for track in snapshot.tracks:
+    for track in addressable_targets(snapshot):
         for device in track.devices:
             for parameter in device.params:
                 if parameter.path == intent.param.path:
@@ -380,7 +454,7 @@ def read_scene(snapshot: Snapshot, intent: Intent) -> str:
 def read_device_state(snapshot: Snapshot, intent: Intent) -> str:
     if intent.device is None or intent.param is None:
         return render("readback.device_missing")
-    for track in snapshot.tracks:
+    for track in addressable_targets(snapshot):
         for device in track.devices:
             for parameter in device.params:
                 if parameter.path == intent.param.path:
@@ -418,17 +492,27 @@ def read_send(snapshot: Snapshot, intent: Intent) -> str:
 
 
 def apply_rename(snapshot: Snapshot, intent: Intent) -> list[list[str]]:
-    track = _track(snapshot, intent)
+    target = target_for_intent(snapshot, intent)
+    if target is None:
+        raise LocalizedError("error.track_required")
     if not intent.text:
         raise LocalizedError("error.name_required")
+    if not isinstance(target, Track):
+        return [
+            ["--write", "--api-set", target.path, "name", json.dumps(intent.text, ensure_ascii=False), request_id("rename")],
+            ["--api-get", target.path, "name", request_id("read")],
+        ]
     return [
-        ["--write", "--rename-track-index", str(track.index), "--rename-track-name", intent.text],
-        ["--api-get", track.path, "name", request_id("read")],
+        ["--write", "--rename-track-index", str(target.index), "--rename-track-name", intent.text],
+        ["--api-get", target.path, "name", request_id("read")],
     ]
 
 
 def read_rename(snapshot: Snapshot, intent: Intent) -> str:
-    return render("readback.rename", name=_track(snapshot, intent).name)
+    target = target_for_intent(snapshot, intent)
+    if target is None:
+        raise LocalizedError("error.track_required")
+    return render("readback.rename", name=target.name)
 
 
 def _apply_add_track(flag: str, name_flag: str) -> Apply:
@@ -444,6 +528,12 @@ def _read_track_count(kind_key: str) -> Readback:
     def read(snapshot: Snapshot, _intent: Intent) -> str:
         return render("readback.add_track", kind=render(kind_key))
     return read
+
+
+def read_add_return(snapshot: Snapshot, _intent: Intent) -> str:
+    if not snapshot.returns:
+        raise LocalizedError("error.track_missing")
+    return render("readback.add_return", name=snapshot.returns[-1].name)
 
 
 def _clip(snapshot: Snapshot, intent: Intent):
@@ -528,6 +618,8 @@ def apply_add_track_with_device(_snapshot: Snapshot, intent: Intent) -> list[lis
 
 
 def read_add_track_with_device(snapshot: Snapshot, intent: Intent) -> str:
+    if intent.track_kind == "return":
+        return read_add_return(snapshot, intent)
     return render("readback.add_device", device=intent.native_device)
 
 
@@ -540,10 +632,24 @@ def apply_plugin_noop(_snapshot: Snapshot, intent: Intent) -> list[list[str]]:
 def read_plugin(snapshot: Snapshot, intent: Intent) -> str:
     if intent.action is Action.INSERT_PLUGIN:
         return render("readback.insert_plugin", plugin=intent.plugin)
+    if intent.track_kind == "return":
+        return read_add_return(snapshot, intent)
     return render("readback.add_plugin", plugin=intent.plugin)
 
 
-ACTIONS: dict[Action, ActionSpec] = {
+DISPATCH_ONLY_ACTIONS = frozenset({Action.UNDO, Action.REDO})
+
+
+class ActionRegistry(dict[Action, ActionSpec]):
+    def __getitem__(self, action: Action) -> ActionSpec:
+        if action in DISPATCH_ONLY_ACTIONS:
+            raise RuntimeError(
+                f"dispatch-only action {action.value!r} reached the execution registry"
+            )
+        return super().__getitem__(action)
+
+
+ACTIONS: ActionRegistry = ActionRegistry({
     Action.INSERT_PLUGIN: ActionSpec(True, False, False, apply_plugin_noop, read_plugin, kind="plugin", confirm=True, readback_event=("api_device_list", None)),
     Action.ADD_TRACK_WITH_PLUGIN: ActionSpec(False, False, False, apply_add_track_with_device, read_plugin, kind="plugin_track", confirm=True, readback_event=("api_children", None)),
     Action.ADD_TRACK_WITH_DEVICE: ActionSpec(False, False, False, apply_add_track_with_device, read_add_track_with_device, kind="structure_device", confirm=True, readback_event=("api_children", None)),
@@ -557,6 +663,7 @@ ACTIONS: dict[Action, ActionSpec] = {
     Action.RENAME: ActionSpec(True, False, False, apply_rename, read_rename, kind="rename", prop="name", confirm=True, readback_event=("api_get", "name")),
     Action.ADD_MIDI_TRACK: ActionSpec(False, False, False, _apply_add_track("--add-midi-tracks", "--midi-name"), _read_track_count("kind.midi_track"), kind="structure", confirm=True, readback_event=("api_children", None)),
     Action.ADD_AUDIO_TRACK: ActionSpec(False, False, False, _apply_add_track("--add-audio-tracks", "--audio-prefix"), _read_track_count("kind.audio_track"), kind="structure", confirm=True, readback_event=("api_children", None)),
+    Action.ADD_RETURN_TRACK: ActionSpec(False, False, False, lambda _snapshot, _intent: [], read_add_return, kind="structure", confirm=True, readback_event=("api_children", None)),
     Action.LAUNCH_CLIP: ActionSpec(True, False, False, _apply_slot_call("fire"), read_clip_launch, kind="clip_call", prop="fire", readback_event=("api_get", "is_playing"), needs_clip=True),
     Action.STOP_CLIP: ActionSpec(True, False, False, _apply_slot_call("stop"), read_clip_stop, kind="clip_call", prop="stop", readback_event=("api_get", "is_playing"), needs_clip=True),
     Action.LAUNCH_SCENE: ActionSpec(False, False, False, apply_launch_scene, read_scene, kind="scene_call", prop="fire", readback_event=("api_get", "is_playing"), needs_scene=True),
@@ -587,8 +694,6 @@ ACTIONS: dict[Action, ActionSpec] = {
     Action.LOOP_OFF: _song_bool("loop", False, "label.loop"),
     Action.METRONOME_ON: _song_bool("metronome", True, "label.metronome"),
     Action.METRONOME_OFF: _song_bool("metronome", False, "label.metronome"),
-    Action.UNDO: _song_call("undo", "readback.text.undo"),
-    Action.REDO: _song_call("redo", "readback.text.redo"),
     Action.CAPTURE_MIDI: _song_call("capture_midi", "readback.text.capture"),
     Action.TAP_TEMPO: _song_call("tap_tempo", "readback.text.tap"),
     Action.STOP_ALL_CLIPS: _song_call("stop_all_clips", "readback.text.stop_all"),
@@ -596,4 +701,4 @@ ACTIONS: dict[Action, ActionSpec] = {
     Action.JUMP_TO_BAR: ActionSpec(False, False, True, apply_jump, read_position, kind="jump", prop="current_song_time", readback_event=("api_get", "current_song_time")),
     Action.PARAM: ActionSpec(True, True, True, apply_param, read_param, kind="param", readback_event=("api_device_parameters", None)),
     Action.NONE: ActionSpec(False, False, False, _unused, _none_readback, kind="none"),
-}
+})

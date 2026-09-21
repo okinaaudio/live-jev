@@ -18,7 +18,7 @@ class PathStep:
     index: int = None
 
 
-_INDEX = re.compile(r"0|[1-9][0-9]*")
+_INDEX = re.compile(r"0|[1-9][0-9]{0,5}")
 
 GET_MEMBERS = {
     "song": frozenset((
@@ -30,6 +30,8 @@ GET_MEMBERS = {
         "name", "mute", "solo", "arm", "current_monitoring_state",
         "fold_state",
     )),
+    "return_track": frozenset(("name", "mute", "solo")),
+    "master_track": frozenset(("name",)),
     "clip_slot": frozenset(("has_clip", "is_playing", "is_triggered")),
     "clip": frozenset((
         "name", "is_playing", "is_triggered", "looping", "length",
@@ -45,26 +47,30 @@ SET_MEMBERS = {
         "current_song_time",
     )),
     "track": frozenset((
-        "mute", "solo", "arm", "current_monitoring_state", "fold_state",
+        "name", "mute", "solo", "arm", "current_monitoring_state", "fold_state",
     )),
+    "return_track": frozenset(("name", "mute", "solo")),
+    "master_track": frozenset(("name",)),
     "clip": frozenset(("looping", "warping", "pitch_coarse", "gain")),
 }
 
 CALL_MEMBERS = {
     "song": frozenset((
-        "start_playing", "stop_playing", "continue_playing", "undo",
-        "redo", "capture_midi", "tap_tempo", "stop_all_clips",
+        "start_playing", "stop_playing", "continue_playing",
+        "capture_midi", "tap_tempo", "stop_all_clips",
     )),
     "track": frozenset(("stop_all_clips",)),
     "clip_slot": frozenset(("fire", "stop")),
     "scene": frozenset(("fire",)),
     "track_volume": frozenset(("str_for_value",)),
     "track_panning": frozenset(("str_for_value",)),
+    "return_track_volume": frozenset(("str_for_value",)),
+    "return_track_panning": frozenset(("str_for_value",)),
     "master_volume": frozenset(("str_for_value",)),
 }
 
 PARAMETER_KINDS = frozenset((
-    "track_volume", "track_panning", "master_volume", "track_send",
+    "track_volume", "track_panning", "return_track_volume", "return_track_panning", "master_volume", "track_send",
     "device_parameter",
 ))
 
@@ -193,7 +199,7 @@ def resolve_lom_path(song, path):
             current = getattr(current, step.attribute)
             if step.index is not None:
                 current = current[step.index]
-        except (AttributeError, IndexError, KeyError, TypeError):
+        except (AttributeError, IndexError, KeyError, RuntimeError, TypeError):
             raise LomPathError("path_not_found")
         if current is None:
             raise LomPathError("path_not_found")

@@ -158,7 +158,6 @@ class ApplyAndAllowlistTests(unittest.TestCase):
         samples = [
             (Action.LOOP_ON, None, Step.NONE, None),
             (Action.METRONOME_OFF, None, Step.NONE, None),
-            (Action.UNDO, None, Step.NONE, None),
             (Action.CONTINUE, None, Step.NONE, None),
             (Action.STOP_ALL_CLIPS, None, Step.NONE, None),
             (Action.MONITOR_AUTO, 1, Step.NONE, None),
@@ -166,6 +165,8 @@ class ApplyAndAllowlistTests(unittest.TestCase):
             (Action.TRACK_STOP_CLIPS, 2, Step.NONE, None),
             (Action.JUMP_TO_BAR, None, Step.SET, Number(17.0, "raw")),
         ]
+        # Undo and redo are dispatched by the service, not executed through ACTIONS.
+        self.assertEqual({action for action in (Action.UNDO, Action.REDO) if action in ACTIONS}, set())
         for action, track, step, number in samples:
             with self.subTest(action=action):
                 intent = parse_local("再生", snapshot)
@@ -301,7 +302,7 @@ class ClipSceneDeviceTests(unittest.TestCase):
 
     def test_request_adds_scene_clip_device_heads(self) -> None:
         from intent import build_request
-        questions = build_request(self._snapshot(), "x")["questions"]
+        questions = build_request(self._snapshot(), "Bass Pad", 0)["questions"]
         self.assertIn("scene", questions)
         self.assertEqual(set(questions["scene"]["criteria"]), {"s0", "s1", "none"})
         self.assertEqual(set(questions["clip_t1"]["criteria"]), {"c0", "c2", "none"})
@@ -343,7 +344,7 @@ class ClipSceneDeviceTests(unittest.TestCase):
             "step": choice("none", 0.9, none=0.9),
             "clip_t1": choice("c2", 0.93, c2=0.93),
         }
-        result = interpret_response(snapshot, "ベースフィル鳴らして", {"answers": answers})
+        result = interpret_response(snapshot, "ベースフィル鳴らして", {"answers": answers}, (1,))
         self.assertEqual((result.intent.track, result.intent.clip), (1, 2))
         device_answers = {
             "action": choice("device_off", 0.95, device_off=0.95),
@@ -351,7 +352,7 @@ class ClipSceneDeviceTests(unittest.TestCase):
             "step": choice("none", 0.9, none=0.9),
             "device_t0": choice("d0", 0.97, d0=0.97),
         }
-        result = interpret_response(snapshot, "リバーブ切って", {"answers": device_answers})
+        result = interpret_response(snapshot, "リバーブ切って", {"answers": device_answers}, (0,))
         self.assertIs(result.intent.action, Action.DEVICE_OFF)
         self.assertEqual(result.intent.device.name, "Reverb")
         self.assertIsNotNone(result.intent.param)
@@ -384,7 +385,7 @@ class SendRenameAddTests(unittest.TestCase):
             "send": choice("send0", 0.92, send0=0.92),
             "track_stated": {"type": "noul", "noul": 0.9},
         }
-        result = interpret_response(snapshot, "ベースのセンドA少し上げて", {"answers": answers})
+        result = interpret_response(snapshot, "ベースのセンドA少し上げて", {"answers": answers}, ())
         self.assertEqual((result.intent.track, result.intent.send), (1, 0))
         batches = ACTIONS[Action.SEND].apply(snapshot, result.intent)
         self.assertEqual(batches[0][:3], ["--write", "--api-parameter-set", "live_set tracks 1 mixer_device sends 0"])
@@ -608,17 +609,73 @@ class PluginNoticeTests(unittest.TestCase):
         service = LiveJevService(bridge=bridge, snapshot=_snapshot_with_song(), key="x",
                                  requester=lambda *_: (_ for _ in ()).throw(AssertionError("Jev")), llm_key=None,
                                  rewriter=lambda *_: (_ for _ in ()).throw(AssertionError("LLM")))
-        with mock.patch.object(D, "load_plugin_catalog", return_value=("Serum2", "ValhallaVintageVerb", "Altiverb 8")), \
+        with mock.patch.object(D, "load_plugin_catalog", return_value=("Serum2", "EQ Eight", "FabFilter Pro-Q 3")), \
              mock.patch.object(D.plugin_script, "ping", return_value=False):
-            generic = service.process({"id": "1", "text": "リバーブ入りのトラック作って"})
+            generic = service.process({"id": "1", "text": "イコライザー入りのトラック作って"})
             self.assertEqual(generic["kind"], "info")
-            self.assertIn("Altiverb 8", generic["line"])
+            self.assertIn("EQ Eight", generic["line"])
             plugin = service.process({"id": "2", "text": "Serum2入りのMIDIトラック作って"})
             self.assertEqual(plugin["kind"], "confirm")
             self.assertIn("Serum2", plugin["line"])
             service.process({"id": "3", "confirm": False})
         self.assertEqual(bridge.calls, [])
-        self.assertIsNone(parse_local("リバーブ入りのトラック作って", _snapshot_with_song()))
+        self.assertIsNone(parse_local("イコライザー入りのトラック作って", _snapshot_with_song()))
+
+    def test_echo_spellings_insert_the_builtin_device(self) -> None:
+        from unittest import mock
+        from tests.support import choice
+
+        catalog = (
+            "Echo", "EchoBoy", "Reverb", "RX 10 De-reverb", "Delay", "Objeq Delay",
+            "Compressor", "Neutron 5 Compressor",
+        )
+        cases = {
+            "echo入れて": "Echo",
+            "エコー入れて": "Echo",
+            "リバーブ入れて": "Reverb",
+            "ディレイ入れて": "Delay",
+            "コンプ入れて": "Compressor",
+        }
+        decoys = {
+            "エコー": "EchoBoy",
+            "リバーブ": "RX 10 De-reverb",
+            "ディレイ": "Objeq Delay",
+            "コンプ": "Neutron 5 Compressor",
+        }
+
+        for index, (text, expected) in enumerate(cases.items()):
+            def requester(payload, _key):
+                raw_name = payload["state"]["utterance"]
+                decoy = next((name for spelling, name in decoys.items() if spelling in raw_name), "none")
+                return {"answers": {"plugin": choice(decoy, 0.95)}}
+
+            service = LiveJevService(
+                bridge=SelectedTrackTests.SelectedBridge(), snapshot=_snapshot_with_song(), key="x",
+                requester=requester, llm_key=None,
+                rewriter=lambda *_: (_ for _ in ()).throw(AssertionError("LLM")),
+            )
+
+            with self.subTest(text=text), \
+                 mock.patch.object(service, "_plugin_names", return_value=catalog):
+                answer = service.process({"id": str(index), "text": text})
+                self.assertEqual(answer["kind"], "confirm", answer)
+                self.assertIsNotNone(service.pending_confirm)
+                chosen = service.pending_confirm[0]
+                self.assertIs(chosen.action, Action.INSERT_PLUGIN)
+                self.assertEqual(chosen.plugin, expected)
+
+    def test_still_generic_device_word_shows_candidates(self) -> None:
+        from unittest import mock
+        import daemon as D
+
+        service = LiveJevService(
+            bridge=RecordingBridge(), snapshot=_snapshot_with_song(), key="x",
+            requester=lambda *_: (_ for _ in ()).throw(AssertionError("Jev")),
+        )
+        with mock.patch.object(D, "load_plugin_catalog", return_value=("EQ Eight", "FabFilter Pro-Q 3")):
+            answer = service.process({"id": "eq", "text": "イコライザー入りのトラック作って"})
+        self.assertEqual(answer["kind"], "info")
+        self.assertIn("EQ Eight", answer["line"])
 
 
 class PluginFlowTests(unittest.TestCase):
@@ -657,6 +714,15 @@ class PluginFlowTests(unittest.TestCase):
 
 
 class NoConfirmByDefaultTests(unittest.TestCase):
+    REALISTIC_PLUGIN_CATALOG = (
+        "EQ Eight", "EQ Three", "Echo", "EchoBoy", "RP-Distort2", "Serum 2", "Diva", "Sylenth1",
+        "ValhallaShimmer", "ValhallaVintageVerb", "ValhallaDelay", "UADx Pultec EQP-1A EQ",
+        "UADx Pultec MEQ-5 EQ", "Repro-1", "Repro-5", "FabFilter Pro-Q 3", "FabFilter Pro-C 2",
+        "Kontakt 7", "Massive X", "Pigments", "Phase Plant", "Omnisphere", "Decapitator", "Pro-L 2",
+        "Pro-R 2", "RC-20 Retro Color", "Soundtoys Little Plate", "TrackSpacer", "Kickstart 2",
+        "Ozone 11", "Neutron 4", "Gullfoss", "Soothe2", "ShaperBox 3", "Portal", "Thermal",
+    )
+
     def test_loop_and_record_run_without_confirmation_by_default(self) -> None:
         import daemon as D
         self.assertFalse(D.REQUIRE_CONFIRM)
@@ -672,11 +738,90 @@ class NoConfirmByDefaultTests(unittest.TestCase):
         from unittest import mock
         import intent as I
         catalog = ("Serum 2", "Serum 2 FX", "ValhallaVintageVerb", "ValhallaRoom")
-        self.assertEqual(I.resolve_plugin_name("serum", catalog), "Serum 2")
+        self.assertIsNone(I.resolve_plugin_name("serum", catalog))
+        self.assertEqual(I.plugin_name_candidates("serum", catalog), ("Serum 2", "Serum 2 FX"))
         with mock.patch.object(I, "load_plugin_aliases", return_value={"セラム": "Serum 2", "バルハラ": "ValhallaVintageVerb"}):
             self.assertEqual(I.resolve_plugin_name("セラム", catalog), "Serum 2")
             self.assertEqual(I.resolve_plugin_name("バルハラ", catalog), "ValhallaVintageVerb")
         self.assertIsNone(I.resolve_plugin_name("コンタクト", catalog))
+
+    def test_plugin_name_ignores_product_name_separators(self) -> None:
+        import intent as I
+        catalog = ("RP-Distort2", "Echo")
+        self.assertEqual(I.resolve_plugin_name("rp distort", catalog), "RP-Distort2")
+        self.assertEqual(I.resolve_plugin_name("distort", catalog), "RP-Distort2")
+        self.assertEqual(I.resolve_plugin_name("RP-Distort2", catalog), "RP-Distort2")
+        self.assertEqual(I.resolve_plugin_name("echo", catalog), "Echo")
+        for separator in (" ", "-", "_", ".", "‐", "‑", "‒", "–", "—", "―", "−", "ー", "－", "　"):
+            with self.subTest(separator=separator):
+                self.assertEqual(I.resolve_plugin_name(f"rp{separator}distort", catalog), "RP-Distort2")
+
+    def test_bare_plugin_name_ignores_product_name_separators(self) -> None:
+        import intent as I
+        for separator in (" ", "-", "_", ".", "‐", "‑", "‒", "–", "—", "―", "−", "ー", "－", "　"):
+            with self.subTest(separator=separator):
+                catalog = (f"RP{separator}Distort2", "Echo")
+                self.assertEqual(I.resolve_bare_plugin_name("rp distort", catalog), catalog[0])
+
+    def test_plugin_name_fuzzy_fallback_accepts_clear_typo(self) -> None:
+        import intent as I
+        for typo in ("eq eiget", "eq eigth", "eq eightt"):
+            with self.subTest(typo=typo, resolver="request"):
+                self.assertEqual(I.resolve_plugin_name(typo, self.REALISTIC_PLUGIN_CATALOG), "EQ Eight")
+            with self.subTest(typo=typo, resolver="bare"):
+                self.assertEqual(I.resolve_bare_plugin_name(typo, self.REALISTIC_PLUGIN_CATALOG), "EQ Eight")
+
+    def test_plugin_name_fuzzy_fallback_rejects_ambiguity_short_and_unrelated_queries(self) -> None:
+        import intent as I
+        for resolver in (I.resolve_plugin_name, I.resolve_bare_plugin_name):
+            with self.subTest(resolver=resolver.__name__, case="ambiguous"):
+                self.assertIsNone(resolver("Repro-3", self.REALISTIC_PLUGIN_CATALOG))
+            with self.subTest(resolver=resolver.__name__, case="three characters"):
+                self.assertIsNone(resolver("eho", self.REALISTIC_PLUGIN_CATALOG))
+            for unrelated in ("ミュート", "再生", "Lead Vocals"):
+                with self.subTest(resolver=resolver.__name__, case=unrelated):
+                    self.assertIsNone(resolver(unrelated, self.REALISTIC_PLUGIN_CATALOG))
+
+    def test_plugin_name_fuzzy_fallback_preserves_existing_resolution_precedence(self) -> None:
+        from unittest import mock
+        import intent as I
+        aliases = {"myserum": "Serum 2"}
+        with mock.patch.object(I, "load_plugin_aliases", return_value=aliases):
+            self.assertEqual(I.resolve_plugin_name("myserum", self.REALISTIC_PLUGIN_CATALOG), "Serum 2")
+            self.assertEqual(I.resolve_plugin_name("eq eight", self.REALISTIC_PLUGIN_CATALOG), "EQ Eight")
+            self.assertEqual(I.resolve_plugin_name("distort", self.REALISTIC_PLUGIN_CATALOG), "RP-Distort2")
+            self.assertEqual(I.resolve_plugin_name("echo", self.REALISTIC_PLUGIN_CATALOG), "Echo")
+            self.assertEqual(I.resolve_bare_plugin_name("myserum", self.REALISTIC_PLUGIN_CATALOG), "Serum 2")
+            self.assertEqual(I.resolve_bare_plugin_name("eq eight", self.REALISTIC_PLUGIN_CATALOG), "EQ Eight")
+            self.assertIsNone(I.resolve_bare_plugin_name("valhalla", self.REALISTIC_PLUGIN_CATALOG))
+
+    def test_bare_plugin_name_resolves_distinctive_inner_fragments(self) -> None:
+        import intent as I
+        self.assertEqual(I.resolve_bare_plugin_name("vintageverb", self.REALISTIC_PLUGIN_CATALOG), "ValhallaVintageVerb")
+        self.assertEqual(I.resolve_bare_plugin_name("shimmer", self.REALISTIC_PLUGIN_CATALOG), "ValhallaShimmer")
+        self.assertEqual(I.resolve_bare_plugin_name("distort", self.REALISTIC_PLUGIN_CATALOG), "RP-Distort2")
+
+    def test_bare_plugin_name_refuses_ambiguous_prefixes(self) -> None:
+        import intent as I
+        self.assertIsNone(I.resolve_bare_plugin_name("valhalla", self.REALISTIC_PLUGIN_CATALOG))
+        self.assertIsNone(I.resolve_bare_plugin_name("repro", self.REALISTIC_PLUGIN_CATALOG))
+
+    def test_bare_plugin_name_uses_only_a_uniquely_shortest_substring_match(self) -> None:
+        import intent as I
+        self.assertIsNone(I.resolve_bare_plugin_name("pultec", ("UADx Pultec EQ", "UADx Pultec MEQ-5 EQ")))
+        self.assertIsNone(I.resolve_bare_plugin_name("pultec", ("Alpha Pultec", "Bravo Pultec")))
+
+    def test_plugin_candidates_use_one_ambiguity_rule_for_prefix_substring_and_fuzzy_matches(self) -> None:
+        import intent as I
+        catalog = (
+            "Serum 2 FX", "ValhallaShimmer", "Repro-5", "ShimmerVerb", "Serum 2", "Repro-1",
+        )
+        self.assertEqual(I.plugin_name_candidates("serum", catalog), ("Serum 2", "Serum 2 FX"))
+        self.assertEqual(I.plugin_name_candidates("shimmer", catalog), ("ShimmerVerb", "ValhallaShimmer"))
+        self.assertEqual(I.plugin_name_candidates("Repro-3", catalog), ("Repro-1", "Repro-5"))
+        self.assertEqual(I.resolve_plugin_name("Serum 2", catalog), "Serum 2")
+        self.assertEqual(I.resolve_plugin_name("eq eiget", ("EQ Eight", "Echo")), "EQ Eight")
+
 
 
 class UndoButtonTests(unittest.TestCase):
@@ -686,8 +831,9 @@ class UndoButtonTests(unittest.TestCase):
                                  requester=lambda *_: (_ for _ in ()).throw(AssertionError("Jev")), llm_key=None,
                                  rewriter=lambda *_: (_ for _ in ()).throw(AssertionError("LLM")))
         first = service.process({"id": "0", "cmd": "undo"})
-        self.assertEqual(first["kind"], "result")
-        self.assertTrue(any("--api-call" in call and "undo" in call for call in bridge.calls))
+        self.assertEqual(first["kind"], "info")
+        self.assertEqual(first["line"], "これはLive Jevでは戻せません。Liveの取り消し（⌘Z）をお使いください。")
+        self.assertFalse(any("--api-call" in call and "undo" in call for call in bridge.calls))
         service.process({"id": "1", "text": "ループして"})
         bridge.calls.clear()
         back = service.process({"id": "2", "cmd": "undo"})
@@ -992,7 +1138,7 @@ class SelectedTrackTests(unittest.TestCase):
 
         confident_set = self._stated(response("pan", "none", "set"), 0.0)
         confident_set["answers"]["step"] = choice("set", 0.8)
-        result = service._step_from_utterance(interpret_response(service.snapshot, "pan right", confident_set), "pan right")
+        result = service._step_from_utterance(interpret_response(service.snapshot, "pan right", confident_set, ()), "pan right")
         self.assertIs(result.intent.step, Step.SET)
 
     def test_named_but_missing_track_errors_instead_of_selected(self) -> None:
@@ -1210,8 +1356,8 @@ class SelectedTrackTests(unittest.TestCase):
         clip_pick["answers"]["clip_t0"] = choice("c0", 0.96)
         bridge, service = self._service(lambda *_: clip_pick, snapshot=clip_snapshot)
         answer = service.process({"id": "clip", "text": "クリップのループを解除して"})
-        self.assertEqual(answer["decision"]["track"], "Bass")
-        self.assertTrue(any("live_set tracks 1 clip_slots 0 clip" in call for call in bridge.calls))
+        self.assertEqual(answer["kind"], "ask")
+        self.assertFalse(any("--write" in call for call in bridge.calls))
 
         guessed = self._stated(response("mute", "t0", track_conf=0.96), 0.10)
         bridge, service = self._service(lambda *_: guessed)
@@ -1850,6 +1996,204 @@ class InsertVerbCoverageTests(unittest.TestCase):
         self.assertEqual(seen, [("Serum 2", 1)])
         self.assertEqual(other["kind"], "ask")
 
+    def test_bare_plugin_names_skip_jev_and_keep_local_routes(self) -> None:
+        from unittest import mock
+        import intent as I
+        import daemon as D
+        seen: list[tuple[str, int]] = []
+        jev_calls = 0
+
+        def requester(*_args):
+            nonlocal jev_calls
+            jev_calls += 1
+            from tests.support import response
+            return response("none", action_conf=0.3)
+
+        service = LiveJevService(
+            bridge=SelectedTrackTests.SelectedBridge(),
+            snapshot=_snapshot_with_song(),
+            key="x",
+            requester=requester,
+            llm_key=None,
+            rewriter=lambda *_: (_ for _ in ()).throw(AssertionError("LLM")),
+        )
+        catalog = ("RP-Distort2", "Serum 2", "UADx Pultec EQP-1A EQ")
+        with mock.patch.object(service, "_plugin_names", return_value=catalog), \
+             mock.patch.object(I, "load_plugin_aliases", return_value={"セラム": "Serum 2"}), \
+             mock.patch.object(service, "_run_plugin_flow", side_effect=lambda intent, before: seen.append((intent.plugin, intent.track)) or 0):
+            for index, text in enumerate(("rp distort", "Serum 2", "UADx Pultec EQP-1A EQ", "セラム")):
+                with self.subTest(text=text):
+                    self.assertEqual(service.process({"id": str(index), "text": text})["kind"], "result")
+            self.assertEqual(jev_calls, 0)
+            self.assertEqual(service.process({"id": "track", "text": "Bass"})["line"], "何をしますか？")
+            self.assertNotEqual(service.process({"id": "short", "text": "RP"})["kind"], "result")
+            calls_before_local = jev_calls
+            self.assertEqual(service.process({"id": "play", "text": "再生して"})["kind"], "result")
+            service.process({"id": "tempo", "text": "テンポを120に"})
+            self.assertEqual(jev_calls, calls_before_local)
+        self.assertEqual(seen, [("RP-Distort2", 1), ("Serum 2", 1), ("UADx Pultec EQP-1A EQ", 1), ("Serum 2", 1)])
+
+    def test_bare_inner_plugin_fragments_skip_jev_and_gemini(self) -> None:
+        from unittest import mock
+
+        seen: list[tuple[str, int]] = []
+        jev_calls = 0
+        gemini_calls = 0
+
+        def requester(*_args):
+            nonlocal jev_calls
+            jev_calls += 1
+            raise AssertionError("Jev was called")
+
+        def rewriter(*_args):
+            nonlocal gemini_calls
+            gemini_calls += 1
+            raise AssertionError("Gemini was called")
+
+        service = LiveJevService(
+            bridge=SelectedTrackTests.SelectedBridge(), snapshot=_snapshot_with_song(), key="jev-key",
+            requester=requester, llm_key="gemini-key", rewriter=rewriter,
+        )
+        with mock.patch.object(service, "_plugin_names", return_value=NoConfirmByDefaultTests.REALISTIC_PLUGIN_CATALOG), \
+             mock.patch.object(service, "_run_plugin_flow", side_effect=lambda intent, before: seen.append((intent.plugin, intent.track)) or 0):
+            for index, text in enumerate(("vintageverb", "distort", "eq eiget")):
+                with self.subTest(text=text):
+                    answer = service.process({"id": str(index), "text": text})
+                    self.assertEqual(answer["kind"], "result")
+                    self.assertNotIn("via", answer)
+        self.assertEqual(seen, [("ValhallaVintageVerb", 1), ("RP-Distort2", 1), ("EQ Eight", 1)])
+        self.assertEqual(jev_calls, 0)
+        self.assertEqual(gemini_calls, 0)
+
+    def test_ambiguous_bare_plugin_prefixes_ask_instead_of_inserting(self) -> None:
+        from unittest import mock
+        from tests.support import response
+
+        inserted: list[str] = []
+        service = LiveJevService(
+            bridge=SelectedTrackTests.SelectedBridge(), snapshot=_snapshot_with_song(), key="jev-key",
+            requester=lambda *_: response("none", action_conf=0.3), llm_key=None,
+            rewriter=lambda *_: (_ for _ in ()).throw(AssertionError("Gemini was called")),
+        )
+        catalog = (
+            "Serum 2 FX", "Serum 2", "ShimmerVerb", "ValhallaShimmer",
+            "ValhallaRoom", "ValhallaDelay", "ValhallaPlate", "ValhallaVintageVerb", "ValhallaSupermassive",
+            "ValhallaSpaceModulator", "Repro-1", "Repro-5",
+        )
+        expected = {
+            "serum": ["Serum 2", "Serum 2 FX"],
+            "shimmer": ["ShimmerVerb", "ValhallaShimmer"],
+            "repro-3": ["Repro-1", "Repro-5"],
+            "valhalla": ["ValhallaRoom", "ValhallaDelay", "ValhallaPlate", "ValhallaShimmer", "ValhallaVintageVerb"],
+        }
+        for index, (text, options) in enumerate(expected.items()):
+            with self.subTest(text=text), \
+                 mock.patch.object(service, "_plugin_names", return_value=catalog), \
+                 mock.patch.object(service, "_run_plugin_flow", side_effect=lambda intent, before: inserted.append(intent.plugin) or 0):
+                service.pending = None
+                answer = service.process({"id": str(index), "text": text})
+                self.assertEqual(answer["kind"], "ask")
+                self.assertEqual(answer["options"], options)
+                if text == "valhalla":
+                    self.assertIn("2", answer["line"])
+        self.assertEqual(inserted, [])
+
+        service.pending = None
+        with mock.patch.object(service, "_plugin_names", return_value=catalog):
+            explicit = service.process({"id": "explicit", "text": "serumを入れて"})
+        self.assertEqual(explicit["kind"], "ask")
+        self.assertEqual(explicit["options"], ["Serum 2", "Serum 2 FX"])
+
+        service.pending = None
+        with mock.patch.object(service, "_plugin_names", return_value=catalog), \
+             mock.patch.object(service, "_run_plugin_flow", side_effect=lambda intent, before: inserted.append(intent.plugin) or 0):
+            question = service.process({"id": "pick", "text": "serum"})
+            answer = service.process({"id": "answer", "answering": question["id"], "text": "Serum 2"})
+        self.assertEqual(answer["kind"], "result")
+        self.assertEqual(inserted, ["Serum 2"])
+
+    def test_bare_builtin_names_resolve_locally_without_model_calls(self) -> None:
+        from unittest import mock
+
+        seen: list[tuple[str, int]] = []
+        jev_calls = 0
+        gemini_calls = 0
+
+        def requester(*_args):
+            nonlocal jev_calls
+            jev_calls += 1
+            raise AssertionError("Jev was called")
+
+        def rewriter(*_args):
+            nonlocal gemini_calls
+            gemini_calls += 1
+            raise AssertionError("Gemini was called")
+
+        service = LiveJevService(
+            bridge=SelectedTrackTests.SelectedBridge(),
+            snapshot=_snapshot_with_song(),
+            key="jev-key",
+            requester=requester,
+            llm_key="gemini-key",
+            rewriter=rewriter,
+        )
+        cases = {
+            "echo": "Echo",
+            "エコー": "Echo",
+            "reverb": "Reverb",
+            "リバーブ": "Reverb",
+            "delay": "Delay",
+            "ディレイ": "Delay",
+            "compressor": "Compressor",
+            "コンプ": "Compressor",
+            "コンプレッサー": "Compressor",
+        }
+        with mock.patch.object(service, "_plugin_names", return_value=tuple(set(cases.values()))), \
+             mock.patch.object(service, "_run_plugin_flow", side_effect=lambda intent, before: seen.append((intent.plugin, intent.track)) or 0):
+            for index, (text, expected) in enumerate(cases.items()):
+                with self.subTest(text=text):
+                    answer = service.process({"id": str(index), "text": text})
+                    self.assertEqual(answer["kind"], "result", answer)
+                    self.assertEqual(seen[-1], (expected, 1))
+        self.assertEqual(jev_calls, 0)
+        self.assertEqual(gemini_calls, 0)
+
+    def test_bare_category_names_do_not_insert(self) -> None:
+        from unittest import mock
+        from tests.support import response
+
+        seen: list[str] = []
+        service = LiveJevService(
+            bridge=SelectedTrackTests.SelectedBridge(),
+            snapshot=_snapshot_with_song(),
+            key="x",
+            requester=lambda *_: response("none", action_conf=0.3),
+            llm_key=None,
+        )
+        with mock.patch.object(service, "_plugin_names", return_value=("EQ Eight", "Chorus-Ensemble", "Wavetable")), \
+             mock.patch.object(service, "_run_plugin_flow", side_effect=lambda intent, before: seen.append(intent.plugin) or 0):
+            for index, text in enumerate(("eq", "イコライザー", "コーラス", "シンセ")):
+                with self.subTest(text=text):
+                    self.assertNotEqual(service.process({"id": str(index), "text": text})["kind"], "result")
+        self.assertEqual(seen, [])
+
+    def test_pending_answer_is_not_treated_as_a_bare_plugin(self) -> None:
+        from unittest import mock
+        from daemon import Pending
+        from intent import Intent, IntentResult, Step
+        service = LiveJevService(
+            bridge=SelectedTrackTests.SelectedBridge(), snapshot=_snapshot_with_song(), key="x",
+            requester=lambda *_: (_ for _ in ()).throw(AssertionError("Jev was called")),
+        )
+        intent = Intent(
+            action=Action.VOLUME, action_conf=0.95, track=None, track_conf=0.2, track_stated=0.9,
+            param=None, param_conf=0.0, step=Step.DOWN_SMALL, step_conf=0.9, number=None, needs_generation=0.0,
+        )
+        service.pending = Pending(IntentResult(intent, (), (), ()), "track", request_id="ask")
+        with mock.patch.object(service, "_plugin_names", return_value=("Bass Station",)), \
+             mock.patch.object(service, "_run_plugin_flow", side_effect=AssertionError("plug-in flow called")):
+            self.assertEqual(service.process({"id": "answer", "text": "Bass", "answering": "ask"})["kind"], "result")
+
 
 class AmbiguousInsertVerbTests(unittest.TestCase):
     """Insertion verbs also describe other actions. Try normal parsing first when the name is absent from the catalog."""
@@ -2032,12 +2376,12 @@ class RoundThreeRegressionTests(unittest.TestCase):
         device = response("device_off", "none", track_conf=0.67)
         device["answers"]["track_stated"] = choice("named", 0.77, named=0.77, absent=0.23)
         device["answers"]["device_t0"] = choice("d0", 0.95)
-        parsed = interpret_response(snapshot, "Ghostのリバーブをオフにして", device).intent
+        parsed = interpret_response(snapshot, "Ghostのリバーブをオフにして", device, (0,)).intent
         self.assertIsNone(parsed.track)
 
         parameter = response("param", "none", "set", track_conf=0.67, param="d0p0", param_conf=0.95)
         parameter["answers"]["track_stated"] = choice("named", 0.77, named=0.77, absent=0.23)
-        parsed = interpret_response(snapshot, "GhostのリバーブのDry/Wetを50%にして", parameter).intent
+        parsed = interpret_response(snapshot, "GhostのリバーブのDry/Wetを50%にして", parameter, (0,)).intent
         self.assertIsNone(parsed.track)
 
     def test_setting_only_utterances_can_only_lower_track_stated(self) -> None:
@@ -2050,7 +2394,7 @@ class RoundThreeRegressionTests(unittest.TestCase):
         self.assertEqual(lower_setting_only_track_stated("パンを真ん中に", 0.0), 0.0)
         outlier = response("pan", "t0", "set", track_conf=0.9)
         outlier["answers"]["track_stated"] = {"type": "noul", "noul": 0.83}
-        self.assertEqual(interpret_response(_snapshot_with_song(), "パンを真ん中に", outlier).intent.track_stated, 0.0)
+        self.assertEqual(interpret_response(_snapshot_with_song(), "パンを真ん中に", outlier, ()).intent.track_stated, 0.0)
 
     def test_named_track_thresholds_use_shared_constants(self) -> None:
         from pathlib import Path

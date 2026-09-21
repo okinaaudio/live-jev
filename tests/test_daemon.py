@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import replace
 import io
 import json
+import os
 import subprocess
 import sys
 import time
@@ -11,8 +12,10 @@ import unittest
 
 from daemon import JevClient, LiveJevService, Pending, StaleSnapshot, run_stdio
 from bridge_client import Ack, BridgeError, BridgeResult
-from intent import Action, interpret_response, _local_intent
-from tests.support import response, sample_snapshot
+from intent import Action, Number, Step, interpret_response, _local_intent
+from llm_rewrite import RewriteFailure
+from snapshot import Clip, Scene
+from tests.support import StatefulLive, choice, response, sample_snapshot
 
 
 class NoWriteBridge:
@@ -60,10 +63,10 @@ class DaemonDecisionTests(unittest.TestCase):
                 return BridgeResult(tuple(acks), 1, 0, False)
             raise AssertionError(arguments)
 
-    def test_llm_rewrite_is_reclassified_and_executed(self) -> None:
+    def test_llm_rewrite_requires_confirmation_before_write(self) -> None:
         bridge = self.BoolBridge()
         jev_replies = iter([
-            response("none", action_conf=0.2),
+            response("none", "t2", action_conf=0.2),
             response("mute", "t2"),
         ])
         rewrite = mock.Mock(return_value="ドラムをミュート")
@@ -75,13 +78,424 @@ class DaemonDecisionTests(unittest.TestCase):
             llm_key="gemini-key",
             rewriter=rewrite,
         )
-        answer = service.process({"text": "ドラムを消しといて"})
-        self.assertEqual(answer["kind"], "result")
-        self.assertTrue(service.snapshot.tracks[2].mute)
-        self.assertEqual(answer["decision"]["utterance"], "ドラムを消しといて")
-        self.assertEqual(answer["decision"]["rewritten"], ["ドラムをミュート"])
+        answer = service.process({"id": "rewrite-1", "text": "ドラムを消しといて"})
+        self.assertEqual(answer["kind"], "confirm")
+        self.assertFalse(service.snapshot.tracks[2].mute)
+        self.assertEqual(bridge.write_count, 0)
         self.assertIn("llm", answer["ms"])
         rewrite.assert_called_once()
+        self.assertEqual(service.pending_confirm[0].action_conf, 0.2)
+
+        applied = service.process({"id": "rewrite-1", "confirm": True})
+        self.assertEqual(applied["kind"], "result")
+        self.assertTrue(service.snapshot.tracks[2].mute)
+        self.assertEqual(applied["decision"]["utterance"], "ドラムを消しといて")
+        self.assertEqual(applied["decision"]["rewritten"], ["ドラムをミュート"])
+
+    def test_llm_rewrite_cannot_produce_dispatch_only_actions(self) -> None:
+        for rewritten, pending_track in (("undo", False), ("redo", False), ("undo", True)):
+            with self.subTest(rewritten=rewritten, pending_track=pending_track):
+                bridge = StatefulLive()
+                service = LiveJevService(
+                    bridge=bridge,
+                    snapshot=sample_snapshot(),
+                    key="x",
+                    requester=lambda *_: response("none", action_conf=0.2),
+                    llm_key="gemini-key",
+                    rewriter=mock.Mock(return_value=rewritten),
+                )
+                self.assertEqual(service.process({"text": "mute Bass"})["kind"], "result")
+                if pending_track:
+                    unresolved = interpret_response(sample_snapshot(), "solo", response("solo", "none"), ())
+                    service.pending = Pending(unresolved, "track", request_id="question")
+                    message = {"id": "answer", "answering": "question", "text": "the low end one"}
+                else:
+                    message = {"id": "rewrite-undo", "text": "put it back how it was before"}
+
+                answer = service.process(message)
+
+                self.assertEqual(answer["kind"], "ask")
+                self.assertTrue(answer["line"].startswith("わかりませんでした。別の言い方で言ってみてください。"))
+                self.assertTrue(bridge.state[(1, "mute")])
+                self.assertIsNone(service.pending_confirm)
+
+    def test_llm_descriptive_plugin_rewrite_requires_named_confirmation(self) -> None:
+        bridge = StatefulLive(selected=0)
+        rewrite = mock.Mock(return_value="EQ Eightを入れて")
+        service = LiveJevService(
+            bridge=bridge,
+            snapshot=sample_snapshot(),
+            key="x",
+            requester=mock.Mock(return_value=response("none", action_conf=0.2)),
+            llm_key="gemini-key",
+            rewriter=rewrite,
+        )
+        with mock.patch.object(service, "_plugin_names", return_value=("FabFilter Pro-Q 3",)):
+            answer = service.process({"id": "descriptive-eq", "text": "8バンドのEQを入れて"})
+
+        self.assertEqual(answer["kind"], "confirm")
+        self.assertIn("EQ Eight", answer["line"])
+        self.assertFalse(any("--write" in call for call in bridge.calls))
+        self.assertEqual(service.pending_confirm[0].plugin, "EQ Eight")
+        args = rewrite.call_args.args
+        self.assertEqual(args[3], ("FabFilter Pro-Q 3",))
+        self.assertIn("EQ Eight", args[4])
+
+    def test_plugin_fallback_does_not_override_missing_named_track_refusal(self) -> None:
+        missing = response("insert_plugin")
+        missing["answers"]["track_stated"]["noul"] = 0.9
+        requester = mock.Mock(side_effect=[
+            missing,
+            {"answers": {"plugin": choice("Operator")}},
+        ])
+        service = LiveJevService(
+            bridge=StatefulLive(selected=0),
+            snapshot=sample_snapshot(),
+            key="x",
+            requester=requester,
+        )
+
+        with mock.patch.object(service, "_plugin_names", return_value=("Operator",)), \
+             mock.patch.object(service, "_run_plugin_flow") as run_plugin:
+            answer = service.process({"id": "missing-plugin-track", "text": "Ghost needs a synth"})
+
+        self.assertEqual(answer["kind"], "error")
+        self.assertEqual(answer["line"], "指定したトラックが見つかりません")
+        self.assertNotIn("via", answer)
+        requester.assert_called_once()
+        run_plugin.assert_not_called()
+
+    def test_bare_plugin_route_preserves_jev_named_target_refusal(self) -> None:
+        snapshot = sample_snapshot()
+        tracks = list(snapshot.tracks)
+        tracks[0] = replace(tracks[0], name="Serum Bass")
+        snapshot = replace(snapshot, tracks=tuple(tracks))
+        answer_from_jev = response("none", "t0", action_conf=0.2)
+        answer_from_jev["answers"]["track_stated"]["noul"] = 0.9
+        service = LiveJevService(
+            bridge=StatefulLive(names=("Serum Bass", "Bass", "Drums"), selected=1),
+            snapshot=snapshot,
+            key="x",
+            requester=mock.Mock(return_value=answer_from_jev),
+        )
+
+        with mock.patch.object(service, "_plugin_names", return_value=("Serum 2",)), \
+             mock.patch.object(service, "_run_plugin_flow") as run_plugin:
+            answer = service.process({"text": "Serum"})
+
+        self.assertNotEqual(answer["kind"], "result")
+        run_plugin.assert_not_called()
+
+    def test_ambiguous_plugin_answer_preserves_jev_named_target_evidence(self) -> None:
+        snapshot = sample_snapshot()
+        tracks = list(snapshot.tracks)
+        tracks[0] = replace(tracks[0], name="Serum Bass")
+        snapshot = replace(snapshot, tracks=tuple(tracks))
+        answer_from_jev = response("none", "t0", action_conf=0.2)
+        answer_from_jev["answers"]["track_stated"]["noul"] = 0.9
+        service = LiveJevService(
+            bridge=StatefulLive(names=("Serum Bass", "Bass", "Drums"), selected=1),
+            snapshot=snapshot,
+            key="x",
+            requester=mock.Mock(return_value=answer_from_jev),
+        )
+
+        with mock.patch.object(service, "_plugin_names", return_value=("Serum 2", "Serum FX")), \
+             mock.patch.object(service, "_run_plugin_flow") as run_plugin:
+            question = service.process({"id": "plugin-question", "text": "Serum"})
+            answer = service.process({"id": "plugin-answer", "answering": question["id"], "text": "Serum 2"})
+
+        self.assertEqual(question["kind"], "ask")
+        self.assertNotEqual(answer["kind"], "result")
+        run_plugin.assert_not_called()
+
+    def test_plugin_rewrite_preserves_uncertain_named_track_evidence(self) -> None:
+        uncertain = response("insert_plugin", track_conf=0.4)
+        uncertain["answers"]["track_stated"]["noul"] = 0.4
+        requester = mock.Mock(side_effect=[
+            uncertain,
+            {"answers": {"plugin": choice("none")}},
+        ])
+        service = LiveJevService(
+            bridge=StatefulLive(selected=0),
+            snapshot=sample_snapshot(),
+            key="x",
+            requester=requester,
+            llm_key="gemini-key",
+            rewriter=mock.Mock(return_value="EQ Eightを入れて"),
+        )
+
+        with mock.patch.object(service, "_plugin_names", return_value=("FabFilter Pro-Q 3",)), \
+             mock.patch.object(service, "_run_plugin_flow") as run_plugin:
+            answer = service.process({"id": "uncertain-plugin-track", "text": "8バンドのEQを入れて"})
+
+        self.assertNotEqual(answer["kind"], "confirm")
+        self.assertIsNone(service.pending_confirm)
+        run_plugin.assert_not_called()
+
+    def test_confirmed_plugin_insertion_replaces_prior_receipt_history(self) -> None:
+        bridge = StatefulLive(selected=0)
+        service = LiveJevService(
+            bridge=bridge,
+            snapshot=sample_snapshot(),
+            key="x",
+            requester=mock.Mock(return_value=response("none", action_conf=0.2)),
+            llm_key="gemini-key",
+            rewriter=mock.Mock(return_value="EQ Eightを入れて"),
+        )
+        self.assertEqual(service.process({"text": "mute Bass"})["kind"], "result")
+        self.assertTrue(bridge.state[(1, "mute")])
+
+        with mock.patch.object(service, "_plugin_names", return_value=("EQ Eight",)), \
+             mock.patch.object(service, "_run_plugin_flow", return_value=0):
+            confirmation = service.process({"id": "confirm-plugin", "text": "8バンドのEQを入れて"})
+            self.assertEqual(confirmation["kind"], "confirm")
+            self.assertEqual(service.process({"id": "confirm-plugin", "confirm": True})["kind"], "result")
+
+        undo = service.process({"cmd": "undo"})
+
+        self.assertEqual(undo["kind"], "info")
+        self.assertTrue(bridge.state[(1, "mute")])
+
+    def test_llm_scene_confirmation_names_resolved_scene(self) -> None:
+        snapshot = replace(
+            sample_snapshot(),
+            scenes=(Scene(0, "Intro", "live_set scenes 0"), Scene(1, "Verse", "live_set scenes 1")),
+        )
+        initial = response("launch_scene")
+        candidate = response("launch_scene")
+        candidate["answers"]["scene"] = choice("s1")
+        service = LiveJevService(
+            bridge=NoWriteBridge(),
+            snapshot=snapshot,
+            key="x",
+            requester=mock.Mock(side_effect=[initial, candidate]),
+            llm_key="gemini-key",
+            rewriter=mock.Mock(return_value="シーン2を再生"),
+        )
+
+        answer = service.process({"id": "scene-rewrite", "text": "Chorus scene please"})
+
+        self.assertEqual(answer["kind"], "confirm")
+        self.assertTrue("Verse" in answer["line"] or "シーン2" in answer["line"], answer["line"])
+
+    def test_forced_confirmation_renders_every_rewrite_target_field(self) -> None:
+        snapshot = sample_snapshot()
+        tracks = list(snapshot.tracks)
+        tracks[0] = replace(
+            tracks[0],
+            clips=(Clip(0, "Pad Loop", "live_set tracks 0 clip_slots 0 clip"),),
+            sends=(0.0,),
+        )
+        snapshot = replace(
+            snapshot,
+            tracks=tuple(tracks),
+            scenes=(Scene(1, "Verse", "live_set scenes 1"),),
+            returns=("Verb",),
+        )
+        service = LiveJevService(bridge=NoWriteBridge(), snapshot=snapshot, key="x", requester=mock.Mock())
+        device = snapshot.tracks[0].devices[0]
+        parameter = device.params[0]
+        cases = (
+            ("track", _local_intent(Action.MUTE, track=0), "Pad"),
+            ("parameter", replace(_local_intent(Action.PARAM, track=0, step=Step.UP_SMALL), param=parameter, param_conf=1.0), "Dry/Wet"),
+            ("device", replace(_local_intent(Action.DEVICE_OFF, track=0), device=device, device_conf=1.0, param=parameter, param_conf=1.0), "Reverb"),
+            ("clip", replace(_local_intent(Action.CLIP_LOOP_OFF, track=0, clip=0), clip_name="Pad Loop"), "Pad Loop"),
+            ("send", _local_intent(Action.SEND, track=0, send=0, step=Step.SET, number=Number(50, "percent")), "Send 1"),
+            ("scene", _local_intent(Action.LAUNCH_SCENE, scene=1), "Verse"),
+            ("plugin", _local_intent(Action.INSERT_PLUGIN, track=0, plugin="EQ Eight"), "EQ Eight"),
+            ("value", _local_intent(Action.TEMPO, step=Step.SET, number=Number(128, "bpm")), "128 bpm"),
+            ("direction", _local_intent(Action.VOLUME, track=0, step=Step.UP_SMALL), "少し上げる"),
+        )
+
+        for name, intent, expected in cases:
+            with self.subTest(field=name):
+                answer = service._execute(intent, name, 0, 0, time.perf_counter(), "rewrite", ["rewrite"], force_confirm=True)
+                self.assertIn(expected, answer["line"])
+
+    def test_llm_rejects_plugin_name_outside_catalog(self) -> None:
+        bridge = StatefulLive(selected=0)
+        rewrite = mock.Mock(return_value="Imaginary Synthを入れて")
+        requester = mock.Mock(side_effect=[
+            response("insert_plugin", action_conf=0.95),
+            {"answers": {"plugin": choice("none")}},
+        ])
+        service = LiveJevService(
+            bridge=bridge,
+            snapshot=sample_snapshot(),
+            key="x",
+            requester=requester,
+            llm_key="gemini-key",
+            rewriter=rewrite,
+        )
+        with mock.patch.object(service, "_plugin_names", return_value=("Serum 2",)):
+            answer = service.process({"text": "ふわっとするリバーブを足して"})
+
+        self.assertEqual(answer["line"], "わかりませんでした。別の言い方で言ってみてください。")
+        self.assertIsNone(service.pending_confirm)
+        self.assertFalse(any("--write" in call for call in bridge.calls))
+        rewrite.assert_called_once()
+
+    def test_unresolved_plugin_after_jev_pick_reaches_llm_once_and_requires_confirmation(self) -> None:
+        bridge = StatefulLive(selected=0)
+        rewrite = mock.Mock(return_value="ValhallaVintageVerbを入れて")
+        requester = mock.Mock(side_effect=[
+            response("insert_plugin", action_conf=0.95),
+            {"answers": {"plugin": choice("none")}},
+        ])
+        service = LiveJevService(
+            bridge=bridge,
+            snapshot=sample_snapshot(),
+            key="x",
+            requester=requester,
+            llm_key="gemini-key",
+            rewriter=rewrite,
+        )
+
+        with mock.patch.object(service, "_plugin_names", return_value=("ValhallaVintageVerb",)):
+            answer = service.process({"id": "descriptive-reverb", "text": "ふわっとするリバーブを足して"})
+
+        self.assertEqual(answer["kind"], "confirm")
+        self.assertIn("ValhallaVintageVerb", answer["line"])
+        self.assertEqual(service.pending_confirm[0].plugin, "ValhallaVintageVerb")
+        self.assertFalse(any("--write" in call for call in bridge.calls))
+        rewrite.assert_called_once()
+
+    def test_locally_resolved_plugin_names_do_not_reach_llm(self) -> None:
+        for utterance in ("EQ Eightを入れて", "eq eigetを入れて"):
+            with self.subTest(utterance=utterance):
+                bridge = StatefulLive(selected=0)
+                rewrite = mock.Mock(return_value="不明")
+                requester = mock.Mock(side_effect=AssertionError("Jev must not be called"))
+                service = LiveJevService(
+                    bridge=bridge,
+                    snapshot=sample_snapshot(),
+                    key="x",
+                    requester=requester,
+                    llm_key="gemini-key",
+                    rewriter=rewrite,
+                )
+
+                with mock.patch.object(service, "_plugin_names", return_value=("EQ Eight",)):
+                    answer = service.process({"text": utterance})
+
+                self.assertEqual(answer["decision"]["action"], "insert_plugin")
+                self.assertNotIn("via", answer)
+                rewrite.assert_not_called()
+                requester.assert_not_called()
+
+    def test_unresolved_plugin_without_gemini_key_keeps_not_found_reply(self) -> None:
+        rewrite = mock.Mock(return_value="ValhallaVintageVerbを入れて")
+        requester = mock.Mock(side_effect=[
+            response("insert_plugin", action_conf=0.95),
+            {"answers": {"plugin": choice("none")}},
+        ])
+        service = LiveJevService(
+            bridge=StatefulLive(selected=0),
+            snapshot=sample_snapshot(),
+            key="x",
+            requester=requester,
+            llm_key=None,
+            rewriter=rewrite,
+        )
+
+        with mock.patch.object(service, "_plugin_names", return_value=("ValhallaVintageVerb",)):
+            answer = service.process({"text": "ふわっとするリバーブを足して"})
+
+        self.assertEqual(answer["kind"], "info")
+        self.assertEqual(answer["line"], "「ふわっとするリバーブ」に当たるプラグインを見つけられませんでした")
+        self.assertNotIn("via", answer)
+        self.assertIsNone(service.pending_confirm)
+        rewrite.assert_not_called()
+
+    def test_no_gemini_key_never_calls_rewriter_for_local_and_unresolved_requests(self) -> None:
+        def fail_rewriter(*_args):
+            raise AssertionError("Gemini was called without a key")
+
+        with mock.patch.dict("os.environ", {}, clear=True):
+            self.assertNotIn("LIVE_JEV_LLM", os.environ)
+            mixer = LiveJevService(
+                bridge=self.BoolBridge(), snapshot=sample_snapshot(), key="x",
+                requester=mock.Mock(), llm_key=None, rewriter=fail_rewriter,
+            )
+            mixer_answer = mixer.process({"text": "Bassをミュート"})
+            self.assertEqual(mixer_answer["kind"], "result")
+            self.assertNotIn("via", mixer_answer)
+
+            bare = LiveJevService(
+                bridge=StatefulLive(selected=0), snapshot=sample_snapshot(), key="x",
+                requester=mock.Mock(side_effect=AssertionError("Jev was called")), llm_key=None, rewriter=fail_rewriter,
+            )
+            with mock.patch.object(bare, "_plugin_names", return_value=("Serum 2",)), \
+                 mock.patch.object(bare, "_run_plugin_flow", return_value=0):
+                bare_answer = bare.process({"text": "Serum 2"})
+            self.assertEqual(bare_answer["kind"], "result")
+            self.assertNotIn("via", bare_answer)
+
+            unresolved = LiveJevService(
+                bridge=NoWriteBridge(), snapshot=sample_snapshot(), key="x",
+                requester=lambda *_: response("none", action_conf=0.2), llm_key=None, rewriter=fail_rewriter,
+            )
+            unresolved_answer = unresolved.process({"text": "ドラムをいい感じにして"})
+            self.assertEqual(unresolved_answer["kind"], "ask")
+            self.assertNotIn("via", unresolved_answer)
+
+            insertion = LiveJevService(
+                bridge=StatefulLive(selected=0), snapshot=sample_snapshot(), key="x",
+                requester=mock.Mock(side_effect=[
+                    response("insert_plugin", action_conf=0.95),
+                    {"answers": {"plugin": choice("none")}},
+                ]),
+                llm_key=None, rewriter=fail_rewriter,
+            )
+            with mock.patch.object(insertion, "_plugin_names", return_value=("ValhallaVintageVerb",)):
+                answer = insertion.process({"text": "ふわっとするリバーブを足して"})
+            self.assertEqual(answer["kind"], "info")
+            self.assertIn("見つけられませんでした", answer["line"])
+
+    def test_llm_descriptive_builtin_on_new_track_keeps_stated_scope(self) -> None:
+        bridge = StatefulLive(selected=0)
+        service = LiveJevService(
+            bridge=bridge,
+            snapshot=sample_snapshot(),
+            key="x",
+            requester=mock.Mock(return_value=response("none", action_conf=0.2)),
+            llm_key="gemini-key",
+            rewriter=mock.Mock(return_value="EQ Eight入りの新しいトラックを作る"),
+        )
+        with mock.patch.object(service, "_plugin_names", return_value=("Serum 2",)):
+            answer = service.process({"text": "8バンドのEQ入りの新しいトラックを作って"})
+
+        self.assertEqual(answer["kind"], "confirm")
+        self.assertEqual(answer["via"], "gemini")
+        self.assertIn("EQ Eight", answer["line"])
+        self.assertIn("トラック", answer["line"])
+        self.assertFalse(any("--write" in call for call in bridge.calls))
+
+    def test_llm_plugin_rewrite_cannot_add_unstated_scope_direction_or_number(self) -> None:
+        rewrites = (
+            "EQ Eight入りの新しいトラックを作る",
+            "EQ Eightを入れて、音量を上げる",
+            "EQ Eightを3個入れて",
+        )
+        for rewritten in rewrites:
+            with self.subTest(rewritten=rewritten):
+                bridge = StatefulLive(selected=0)
+                service = LiveJevService(
+                    bridge=bridge,
+                    snapshot=sample_snapshot(),
+                    key="x",
+                    requester=mock.Mock(return_value=response("none", action_conf=0.2)),
+                    llm_key="gemini-key",
+                    rewriter=mock.Mock(return_value=rewritten),
+                )
+                with mock.patch.object(service, "_plugin_names", return_value=("EQ Eight",)):
+                    answer = service.process({"text": "8バンドのEQを入れて"})
+
+                self.assertTrue(answer["line"].startswith("わかりませんでした。別の言い方で言ってみてください。"))
+                self.assertEqual(answer["via"], "gemini")
+                self.assertIsNone(service.pending_confirm)
+                self.assertFalse(any("--write" in call for call in bridge.calls))
 
     def test_llm_unknown_falls_back_to_ask(self) -> None:
         bridge = NoWriteBridge()
@@ -96,7 +510,8 @@ class DaemonDecisionTests(unittest.TestCase):
         )
         answer = service.process({"text": "いい感じにして"})
         self.assertEqual(answer["kind"], "ask")
-        self.assertEqual(answer["line"], "何をしますか？")
+        self.assertEqual(answer["line"], "わかりませんでした。別の言い方で言ってみてください。 何をしますか？")
+        self.assertEqual(answer["via"], "gemini")
         self.assertEqual([call for call in bridge.calls if "--api-session-context" not in call], [])
         rewrite.assert_called_once()
 
@@ -107,19 +522,18 @@ class DaemonDecisionTests(unittest.TestCase):
             key="x",
             requester=lambda _payload, _key: response("none", action_conf=0.2),
             llm_key="gemini-key",
-            rewriter=mock.Mock(side_effect=RuntimeError("Geminiの回数制限（429）")),
+            rewriter=mock.Mock(side_effect=RewriteFailure("quota")),
         )
         answer = service.process({"id": "m1", "text": "いい感じにして"})
-        self.assertEqual(answer["kind"], "error")
-        self.assertEqual(answer["line"], "Geminiの回数制限（429）")
+        self.assertEqual(answer["kind"], "ask")
+        self.assertEqual(answer["line"], "Geminiの利用上限に達しました。 何をしますか？")
+        self.assertEqual(answer["id"], "m1")
+        self.assertEqual(answer["via"], "gemini")
+        self.assertIsNotNone(service.pending)
 
-    def test_llm_rewriter_chain_rolls_back_when_second_clause_fails(self) -> None:
-        bridge = self.BoolBridge(fail_on_write=2)
-        jev_replies = iter([
-            response("none", compound=0.71, action_conf=0.2),
-            response("mute", "t2"),
-            response("solo", "t1"),
-        ])
+    def test_llm_rewriter_rejects_multiple_commands(self) -> None:
+        bridge = self.BoolBridge()
+        jev_replies = iter([response("none", "t2", action_conf=0.2)])
         service = LiveJevService(
             bridge=bridge,
             snapshot=sample_snapshot(),
@@ -128,12 +542,264 @@ class DaemonDecisionTests(unittest.TestCase):
             llm_key="gemini-key",
             rewriter=lambda _snapshot, _text, _key: "ドラムをミュート\nベースをソロ",
         )
-        answer = service.process({"text": "ドラム消してベースだけ聞かせて"})
-        self.assertEqual(answer["kind"], "error")
+        answer = service.process({"text": "ドラムをいい感じにして"})
+        self.assertEqual(answer["kind"], "ask")
+        self.assertEqual(answer["line"], "わかりませんでした。別の言い方で言ってみてください。 何をしますか？")
+        self.assertEqual(answer["via"], "gemini")
         self.assertFalse(service.snapshot.tracks[2].mute)
-        self.assertEqual(bridge.write_count, 3)
-        self.assertIn("変更は残っていません", answer["line"])
-        self.assertEqual(answer["decision"]["rewritten"], ["ドラムをミュート", "ベースをソロ"])
+        self.assertEqual(bridge.write_count, 0)
+
+    def test_llm_corrects_misspelled_track_then_requires_confirmation(self) -> None:
+        bridge = self.BoolBridge()
+        missing = response("mute")
+        missing["answers"]["track_stated"]["noul"] = 0.9
+        rewrite = mock.Mock(return_value="Drumsをミュート")
+        requester = mock.Mock(side_effect=[missing, response("mute", "t2")])
+        service = LiveJevService(
+            bridge=bridge,
+            snapshot=sample_snapshot(),
+            key="x",
+            requester=requester,
+            llm_key="gemini-key",
+            rewriter=rewrite,
+        )
+
+        answer = service.process({"id": "typo", "text": "Dromsをミュート"})
+
+        self.assertEqual(answer["kind"], "confirm")
+        self.assertEqual(answer["via"], "gemini")
+        self.assertIn("Drums", answer["line"])
+        self.assertEqual(bridge.write_count, 0)
+        rewrite.assert_called_once()
+        applied = service.process({"id": "typo", "confirm": True})
+        self.assertEqual(applied["kind"], "result")
+        self.assertEqual(applied["via"], "gemini")
+        self.assertEqual(bridge.write_count, 1)
+
+    def test_llm_rejects_track_not_in_snapshot(self) -> None:
+        bridge = self.BoolBridge()
+        missing = response("mute")
+        missing["answers"]["track_stated"]["noul"] = 0.9
+        rewrite = mock.Mock(return_value="Ghostをミュート")
+        service = LiveJevService(
+            bridge=bridge,
+            snapshot=sample_snapshot(),
+            key="x",
+            requester=mock.Mock(side_effect=[missing, response("mute", "t99")]),
+            llm_key="gemini-key",
+            rewriter=rewrite,
+        )
+
+        answer = service.process({"text": "Gohstをミュート"})
+
+        self.assertEqual(answer["kind"], "error")
+        self.assertTrue(answer["line"].startswith("わかりませんでした。別の言い方で言ってみてください。"))
+        self.assertEqual(bridge.write_count, 0)
+        rewrite.assert_called_once()
+
+    def test_llm_rejects_direction_the_owner_did_not_say(self) -> None:
+        bridge = self.BoolBridge()
+        rewrite = mock.Mock(return_value="Drumsの音量を上げる")
+        service = LiveJevService(
+            bridge=bridge,
+            snapshot=sample_snapshot(),
+            key="x",
+            requester=mock.Mock(side_effect=[response("volume", "t2"), response("volume", "t2", "up_small")]),
+            llm_key="gemini-key",
+            rewriter=rewrite,
+        )
+
+        answer = service.process({"text": "Drumsの音量を調整して"})
+
+        self.assertEqual(answer["kind"], "ask")
+        self.assertTrue(answer["line"].startswith("わかりませんでした。別の言い方で言ってみてください。"))
+        self.assertEqual(bridge.write_count, 0)
+        rewrite.assert_called_once()
+
+    def test_llm_rejects_number_the_owner_did_not_say(self) -> None:
+        bridge = self.BoolBridge()
+        rewrite = mock.Mock(return_value="テンポを120に")
+        service = LiveJevService(
+            bridge=bridge,
+            snapshot=sample_snapshot(),
+            key="x",
+            requester=mock.Mock(return_value=response("tempo")),
+            llm_key="gemini-key",
+            rewriter=rewrite,
+        )
+
+        answer = service.process({"text": "テンポを調整して"})
+
+        self.assertEqual(answer["kind"], "ask")
+        self.assertTrue(answer["line"].startswith("わかりませんでした。別の言い方で言ってみてください。"))
+        self.assertEqual(bridge.write_count, 0)
+        rewrite.assert_called_once()
+
+    def test_llm_unknown_uses_plain_english_reply(self) -> None:
+        service = LiveJevService(
+            bridge=NoWriteBridge(),
+            snapshot=sample_snapshot(),
+            key="x",
+            requester=lambda _payload, _key: response("none", action_conf=0.2),
+            llm_key="gemini-key",
+            rewriter=mock.Mock(return_value="不明"),
+        )
+        service.lang = "en"
+
+        answer = service.process({"text": "make it nice"})
+
+        self.assertEqual(answer["line"], "I could not work that out. Please try saying it another way. What should I do?")
+        self.assertEqual(answer["via"], "gemini")
+
+    def test_llm_connection_failure_has_distinct_reply(self) -> None:
+        service = LiveJevService(
+            bridge=NoWriteBridge(),
+            snapshot=sample_snapshot(),
+            key="x",
+            requester=lambda _payload, _key: response("none", action_conf=0.2),
+            llm_key="gemini-key",
+            rewriter=mock.Mock(side_effect=RewriteFailure("unavailable")),
+        )
+
+        answer = service.process({"text": "いい感じにして"})
+
+        self.assertEqual(answer["line"], "Geminiに接続できませんでした。 何をしますか？")
+        self.assertEqual(answer["via"], "gemini")
+
+    def test_llm_is_tried_once_for_unresolved_parameter_device_and_clip(self) -> None:
+        snapshot = sample_snapshot()
+        tracks = list(snapshot.tracks)
+        tracks[0] = replace(
+            tracks[0],
+            clips=(Clip(0, "Pad Loop", "live_set tracks 0 clip_slots 0 clip", {"looping": True}),),
+        )
+        snapshot = replace(snapshot, tracks=tuple(tracks))
+
+        param_initial = response("param", "t0", "up_small", param="none")
+        param_candidate = response("param", "t0", "up_small", param="d0p0")
+        device_initial = response("device_off", "t0")
+        device_candidate = response("device_off", "t0")
+        device_candidate["answers"]["device_t0"] = choice("d0")
+        clip_initial = response("clip_loop_off", "t0")
+        clip_candidate = response("clip_loop_off", "t0")
+        clip_candidate["answers"]["clip_t0"] = choice("c0")
+
+        cases = (
+            ("parameter", "PadのReverbのDry/Wetを上げる", param_initial, param_candidate),
+            ("device", "PadのReverbをオフ", device_initial, device_candidate),
+            ("clip", "PadのPad Loopのループをオフ", clip_initial, clip_candidate),
+        )
+        for name, rewritten, initial, candidate in cases:
+            with self.subTest(name=name):
+                bridge = self.BoolBridge()
+                rewrite = mock.Mock(return_value=rewritten)
+                service = LiveJevService(
+                    bridge=bridge,
+                    snapshot=snapshot,
+                    key="x",
+                    requester=mock.Mock(side_effect=[initial, candidate]),
+                    llm_key="gemini-key",
+                    rewriter=rewrite,
+                )
+
+                answer = service.process({"id": name, "text": "Padの対象を調整して"})
+
+                self.assertEqual(answer["kind"], "confirm")
+                self.assertEqual(bridge.write_count, 0)
+                rewrite.assert_called_once()
+
+    def test_llm_rewrite_cannot_widen_uncertain_target_authority(self) -> None:
+        uncertain = response("none", action_conf=0.2)
+        uncertain["answers"]["track_stated"]["noul"] = 0.35
+        bridge = self.BoolBridge()
+        rewrite = mock.Mock(return_value="ベースをミュート")
+        service = LiveJevService(
+            bridge=bridge,
+            snapshot=sample_snapshot(),
+            key="x",
+            requester=mock.Mock(side_effect=[uncertain, response("mute", "t1")]),
+            llm_key="gemini-key",
+            rewriter=rewrite,
+        )
+
+        answer = service.process({"id": "authority", "text": "ベルを消しといて"})
+
+        self.assertEqual(answer["kind"], "ask")
+        self.assertIsNone(service.pending_confirm)
+        self.assertEqual(bridge.write_count, 0)
+
+    def test_llm_requires_key_and_respects_kill_switch(self) -> None:
+        for llm_key, environment in [(None, {}), ("gemini-key", {"LIVE_JEV_LLM": "0"})]:
+            with self.subTest(llm_key=llm_key, environment=environment):
+                rewrite = mock.Mock(return_value="ドラムをミュート")
+                service = LiveJevService(
+                    bridge=NoWriteBridge(),
+                    snapshot=sample_snapshot(),
+                    key="x",
+                    requester=lambda _payload, _key: response("none", "t2", action_conf=0.2),
+                    llm_key=llm_key,
+                    rewriter=rewrite,
+                )
+                with mock.patch.dict("os.environ", environment, clear=False):
+                    answer = service.process({"text": "ドラムをいい感じにして"})
+                self.assertEqual(answer["kind"], "ask")
+                self.assertNotIn("via", answer)
+                rewrite.assert_not_called()
+
+    def test_llm_is_not_a_replacement_for_missing_jev_key_or_failure(self) -> None:
+        for key, requester, expected in (
+            (None, mock.Mock(), "Jevの鍵が見つかりません"),
+            ("x", mock.Mock(side_effect=RuntimeError("offline")), "Jevに繋がりません。少し待ってから試してください"),
+        ):
+            with self.subTest(key=key):
+                rewrite = mock.Mock(return_value="Drumsをミュート")
+                service = LiveJevService(
+                    bridge=NoWriteBridge(),
+                    snapshot=sample_snapshot(),
+                    key=key,
+                    requester=requester,
+                    llm_key="gemini-key",
+                    rewriter=rewrite,
+                )
+
+                answer = service.process({"text": "いい感じにして"})
+
+                self.assertEqual(answer["line"], expected)
+                rewrite.assert_not_called()
+
+    def test_llm_attempt_and_burst_limits_are_preserved(self) -> None:
+        rewrite = mock.Mock(return_value="不明")
+        service = LiveJevService(
+            bridge=NoWriteBridge(),
+            snapshot=sample_snapshot(),
+            key="x",
+            requester=lambda _payload, _key: response("none", action_conf=0.2),
+            llm_key="gemini-key",
+            rewriter=rewrite,
+        )
+
+        service.process({"text": "same"})
+        service.process({"text": "same"})
+        for index in range(1, 6):
+            service.process({"text": f"different {index}"})
+
+        self.assertEqual(rewrite.call_count, 5)
+
+    def test_non_action_clarification_never_calls_llm(self) -> None:
+        rewrite = mock.Mock(return_value="ベースをミュート")
+        service = LiveJevService(
+            bridge=NoWriteBridge(),
+            snapshot=sample_snapshot(),
+            key="x",
+            requester=lambda _payload, _key: response("mute"),
+            llm_key="gemini-key",
+            rewriter=rewrite,
+        )
+
+        answer = service.process({"text": "ベルをミュート"})
+
+        self.assertIn(answer["kind"], {"ask", "error"})
+        rewrite.assert_not_called()
 
     def test_multi_track_batch_skips_matching_values_and_undo_restores_without_live_undo(self) -> None:
         snapshot = sample_snapshot()
@@ -175,6 +841,7 @@ class DaemonDecisionTests(unittest.TestCase):
         answer = service.process({"text": "ドラムをミュート"})
         self.assertEqual(answer["kind"], "result")
         self.assertEqual(answer["ms"]["llm"], 0)
+        self.assertNotIn("via", answer)
 
     def test_local_template_calls_neither_jev_nor_llm(self) -> None:
         class TempoBridge:
@@ -204,6 +871,7 @@ class DaemonDecisionTests(unittest.TestCase):
         self.assertFalse(any("--tempo" in call for call in bridge.calls))
         self.assertEqual(answer["ms"]["jev"], 0)
         self.assertEqual(answer["ms"]["llm"], 0)
+        self.assertNotIn("via", answer)
 
     def test_track_name_is_checked_before_write(self) -> None:
         class RenamedBridge:
@@ -337,8 +1005,8 @@ class DaemonDecisionTests(unittest.TestCase):
 
     def test_invalid_track_and_master_action_are_input_errors(self) -> None:
         cases = [
-            (response("mute", "master"), "その操作はマスターに対応していません"),
-            (response("pan", "master", "up_small"), "その操作はマスターに対応していません"),
+            (response("mute", "master"), "Masterはミュートに対応していません"),
+            (response("pan", "master", "up_small"), "Masterはパンに対応していません"),
             (response("mute", "t999"), "指定したトラックが見つかりません"),
         ]
         for mocked, line in cases:
@@ -465,7 +1133,7 @@ class DaemonDecisionTests(unittest.TestCase):
         snapshot = sample_snapshot()
         track = replace(snapshot.tracks[0], devices=(Device(0, "Huge", params, "live_set tracks 0 devices 0"),))
         snapshot = replace(snapshot, tracks=(track, *snapshot.tracks[1:]))
-        result = interpret_response(snapshot, "つまみを上げて", response("param", "t0", "up_small", param="none", param_conf=0.2))
+        result = interpret_response(snapshot, "つまみを上げて", response("param", "t0", "up_small", param="none", param_conf=0.2), (0,))
         service = LiveJevService(bridge=NoWriteBridge(), snapshot=snapshot, key="x")
         service.pending = Pending(result, "param")
         self.assertIsNone(service._fill_pending("P250"))
@@ -680,6 +1348,204 @@ class DaemonDecisionTests(unittest.TestCase):
                 self.assertEqual(service.process({"text": phrase})["kind"], "result")
                 self.assertFalse(bridge.state[(0, "mute")])
                 self.assertFalse(any("--api-call" in call and "undo" in call for call in bridge.calls))
+
+    def test_undo_and_redo_routes_never_reach_action_execution(self) -> None:
+        for phrase in ("アンドゥ", "undo"):
+            with self.subTest(route=phrase):
+                bridge = StatefulLive()
+                service = LiveJevService(bridge=bridge, snapshot=sample_snapshot(), key="x", requester=lambda *_: self.fail("Jev called"))
+                self.assertEqual(service.process({"text": "mute Bass"})["kind"], "result")
+                with mock.patch.object(service, "_execute", side_effect=AssertionError("undo reached _execute")), \
+                     mock.patch.object(service, "_execute_now", side_effect=AssertionError("undo reached _execute_now")):
+                    answer = service.process({"text": phrase})
+                self.assertEqual(answer["kind"], "result")
+
+        for phrase in ("やり直し", "redo"):
+            with self.subTest(route=phrase):
+                service = LiveJevService(bridge=StatefulLive(), snapshot=sample_snapshot(), key="x", requester=lambda *_: self.fail("Jev called"))
+                with mock.patch.object(service, "_execute", side_effect=AssertionError("redo reached _execute")), \
+                     mock.patch.object(service, "_execute_now", side_effect=AssertionError("redo reached _execute_now")):
+                    answer = service.process({"text": phrase})
+                self.assertEqual(answer["kind"], "info")
+                self.assertEqual(answer["line"], "これはLive Jevではやり直せません。Liveのやり直し（⇧⌘Z）をお使いください。")
+
+        service = LiveJevService(bridge=StatefulLive(), snapshot=sample_snapshot(), key="x", requester=lambda *_: self.fail("Jev called"))
+        with mock.patch.object(service, "_execute", side_effect=AssertionError("button reached _execute")), \
+             mock.patch.object(service, "_execute_now", side_effect=AssertionError("button reached _execute_now")):
+            button = service.process({"cmd": "undo"})
+        self.assertEqual(button["kind"], "info")
+
+        service = LiveJevService(bridge=StatefulLive(), snapshot=sample_snapshot(), key="x", requester=lambda *_: self.fail("Jev called"))
+        with mock.patch.object(service, "_execute", side_effect=AssertionError("compound undo reached _execute")), \
+             mock.patch.object(service, "_execute_now", side_effect=AssertionError("compound undo reached _execute_now")):
+            compound = service.process({"text": "mute Bass and undo"})
+        self.assertEqual(compound["kind"], "info")
+
+        bridge = StatefulLive()
+        service = LiveJevService(bridge=bridge, snapshot=sample_snapshot(), key="x", requester=lambda *_: self.fail("Jev called"))
+        self.assertEqual(service.process({"text": "mute Bass"})["kind"], "result")
+        service.pending = Pending(interpret_response(sample_snapshot(), "mute", response("mute", "none"), ()), "track", request_id="question")
+        with mock.patch.object(service, "_execute", side_effect=AssertionError("clarification undo reached _execute")), \
+             mock.patch.object(service, "_execute_now", side_effect=AssertionError("clarification undo reached _execute_now")):
+            clarification = service.process({"id": "answer", "answering": "question", "text": "undo"})
+        self.assertEqual(clarification["kind"], "result")
+
+    def test_jev_classified_undo_restores_receipt(self) -> None:
+        bridge = StatefulLive()
+        service = LiveJevService(
+            bridge=bridge,
+            snapshot=sample_snapshot(),
+            key="x",
+            requester=lambda *_: response("undo"),
+        )
+        self.assertEqual(service.process({"text": "mute Bass"})["kind"], "result")
+
+        undo = service.process({"text": "put it back how it was before"})
+        self.assertEqual(undo["kind"], "result")
+        self.assertFalse(bridge.state[(1, "mute")])
+
+    def test_low_confidence_jev_undo_asks_before_restoring_receipt(self) -> None:
+        bridge = StatefulLive()
+        service = LiveJevService(
+            bridge=bridge,
+            snapshot=sample_snapshot(),
+            key="x",
+            requester=lambda *_: response("undo", action_conf=0.59),
+        )
+        self.assertEqual(service.process({"text": "mute Bass"})["kind"], "result")
+
+        undo = service.process({"text": "put it back how it was before"})
+
+        self.assertEqual(undo["kind"], "ask")
+        self.assertTrue(bridge.state[(1, "mute")])
+        self.assertIsNotNone(service.pending)
+        self.assertEqual(service.pending.field, "action")
+
+    def test_jev_classified_redo_is_refused(self) -> None:
+        bridge = StatefulLive()
+        service = LiveJevService(
+            bridge=bridge,
+            snapshot=sample_snapshot(),
+            key="x",
+            requester=lambda *_: response("redo"),
+        )
+        calls_before_redo = len(bridge.calls)
+        redo = service.process({"text": "repeat the reverted change"})
+        self.assertEqual(redo["kind"], "info")
+        self.assertEqual(redo["line"], "これはLive Jevではやり直せません。Liveのやり直し（⇧⌘Z）をお使いください。")
+        self.assertFalse(any("--api-call" in call and "redo" in call for call in bridge.calls[calls_before_redo:]))
+
+    def test_successful_receipt_undo_is_consumed(self) -> None:
+        bridge = StatefulLive()
+        service = LiveJevService(bridge=bridge, snapshot=sample_snapshot(), key="x", requester=lambda *_: self.fail("Jev called"))
+        self.assertEqual(service.process({"text": "mute Bass"})["kind"], "result")
+        self.assertEqual(service.process({"cmd": "undo"})["kind"], "result")
+
+        bridge.state[(1, "mute")] = True
+        bridge.state[(2, "solo")] = True
+        second = service.process({"cmd": "undo"})
+
+        self.assertEqual(second["kind"], "info")
+        self.assertTrue(bridge.state[(1, "mute")])
+        self.assertTrue(bridge.state[(2, "solo")])
+
+    def test_write_timeout_with_successful_restore_does_not_reactivate_receipt(self) -> None:
+        class TimeoutAfterWrite(StatefulLive):
+            def __init__(self) -> None:
+                super().__init__()
+                self.timeout_next_write = True
+
+            def run(self, arguments):
+                result = super().run(arguments)
+                if self.timeout_next_write and "--api-set" in arguments:
+                    self.timeout_next_write = False
+                    return BridgeResult(result.acks, result.elapsed_ms, -1, True)
+                return result
+
+        bridge = TimeoutAfterWrite()
+        service = LiveJevService(bridge=bridge, snapshot=sample_snapshot(), key="x", requester=lambda *_: self.fail("Jev called"))
+
+        failed = service.process({"text": "mute Bass"})
+        self.assertEqual(failed["kind"], "error")
+        self.assertFalse(bridge.state[(1, "mute")])
+
+        bridge.state[(1, "mute")] = True
+        undo = service.process({"cmd": "undo"})
+
+        self.assertEqual(undo["kind"], "info")
+        self.assertTrue(bridge.state[(1, "mute")])
+
+    def test_compound_success_replaces_consumed_history_with_chain_receipts(self) -> None:
+        bridge = StatefulLive()
+        service = LiveJevService(bridge=bridge, snapshot=sample_snapshot(), key="x", requester=lambda *_: self.fail("Jev called"))
+
+        self.assertEqual(service.process({"text": "mute Bass"})["kind"], "result")
+        self.assertEqual(service.process({"cmd": "undo"})["kind"], "result")
+        self.assertEqual(service.process({"text": "mute Bass and solo Drums"})["kind"], "result")
+
+        undo = service.process({"cmd": "undo"})
+
+        self.assertEqual(undo["kind"], "result")
+        self.assertFalse(bridge.state[(1, "mute")])
+        self.assertFalse(bridge.state[(2, "solo")])
+
+    def test_track_creation_undo_refuses_instead_of_consuming_manual_edit(self) -> None:
+        class TrackUndoBridge(StatefulLive):
+            def __init__(self) -> None:
+                super().__init__()
+                self.track_count = 3
+
+            def run(self, arguments):
+                if "--api-call" in arguments and "undo" in arguments:
+                    self.calls.append(list(arguments))
+                    if self.state[(1, "mute")]:
+                        self.state[(1, "mute")] = False
+                    else:
+                        self.track_count = 3
+                    return BridgeResult((), 1, 0, False)
+                return super().run(arguments)
+
+        bridge = TrackUndoBridge()
+        original = sample_snapshot()
+        added_track = replace(original.tracks[-1], index=3, name="4-MIDI", path="live_set tracks 3")
+
+        def read():
+            tracks = original.tracks if bridge.track_count == 3 else original.tracks + (added_track,)
+            return replace(original, tracks=tracks, taken_at=time.time()), 1
+
+        service = LiveJevService(bridge=bridge, snapshot=original, key="x", requester=lambda *_: self.fail("Jev called"))
+        service.reader = type("Reader", (), {"read": staticmethod(read)})()
+
+        def add_track(*_args, **_kwargs):
+            bridge.track_count = 4
+            return {"ok": True, "track_index": 3, "track": "4-MIDI", "devices_after": []}
+
+        with mock.patch("daemon.plugin_script.ping", return_value=True), \
+             mock.patch("daemon.plugin_script.add_track", side_effect=add_track):
+            self.assertEqual(service.process({"text": "add a midi track"})["kind"], "result")
+
+        bridge.state[(1, "mute")] = True
+        answer = service.process({"cmd": "undo"})
+
+        self.assertEqual(answer["kind"], "info")
+        self.assertTrue(bridge.state[(1, "mute")])
+        self.assertEqual(bridge.track_count, 4)
+        self.assertFalse(any("--api-call" in call and "undo" in call for call in bridge.calls))
+
+    def test_note_transform_undo_refuses_without_receipt(self) -> None:
+        import daemon as daemon_module
+
+        bridge = StatefulLive()
+        service = LiveJevService(bridge=bridge, snapshot=sample_snapshot(), key="x", requester=lambda *_: self.fail("Jev called"))
+        self.assertEqual(service.process({"text": "mute Bass"})["kind"], "result")
+        self.assertEqual(service.process({"cmd": "undo"})["kind"], "result")
+        with mock.patch.object(daemon_module.plugin_script, "ping", return_value=True), \
+             mock.patch.object(daemon_module.plugin_script, "clip_notes", return_value={"ok": True, "track": "Bass"}):
+            self.assertEqual(service.process({"text": "quantize Bass"})["kind"], "result")
+
+        calls_before_undo = len(bridge.calls)
+        self.assertEqual(service.process({"cmd": "undo"})["kind"], "info")
+        self.assertFalse(any("--api-call" in call and "undo" in call for call in bridge.calls[calls_before_undo:]))
 
     def test_replaced_track_is_not_written_during_undo(self) -> None:
         from tests.support import StatefulLive
@@ -954,6 +1820,41 @@ class JevClientTests(unittest.TestCase):
         self.assertEqual(result, {"answers": {}})
         self.assertEqual(factory.call_count, 2)
         broken.close.assert_called_once()
+
+    def test_max_tokens_exceeded_is_not_retried(self) -> None:
+        response_400 = mock.Mock(status=400)
+        response_400.read.return_value = b'{"detail":{"error_type":"max_tokens_exceeded"}}'
+        connection = mock.Mock()
+        connection.getresponse.return_value = response_400
+        with mock.patch("daemon.http.client.HTTPSConnection", return_value=connection):
+            requester = JevClient()
+            service = LiveJevService(
+                bridge=NoWriteBridge(),
+                snapshot=sample_snapshot(),
+                key="x",
+                requester=requester,
+            )
+            answer = service.process({"text": "いい感じにして"})
+        self.assertEqual(answer["line"], "Jevに送る情報が多すぎて処理できませんでした。変更はしていません。")
+        self.assertEqual(connection.request.call_count, 1)
+
+    def test_other_400_responses_keep_generic_failure(self) -> None:
+        for raw in (b'{"detail":{"error_type":"other"}}', b'not json'):
+            with self.subTest(raw=raw):
+                response_400 = mock.Mock(status=400)
+                response_400.read.return_value = raw
+                connection = mock.Mock()
+                connection.getresponse.return_value = response_400
+                with mock.patch("daemon.http.client.HTTPSConnection", return_value=connection):
+                    service = LiveJevService(
+                        bridge=NoWriteBridge(),
+                        snapshot=sample_snapshot(),
+                        key="x",
+                        requester=JevClient(),
+                    )
+                    answer = service.process({"text": "いい感じにして"})
+                self.assertEqual(answer["line"], "Jevに繋がりません。少し待ってから試してください")
+                self.assertEqual(connection.request.call_count, 2)
 
 
 if __name__ == "__main__":

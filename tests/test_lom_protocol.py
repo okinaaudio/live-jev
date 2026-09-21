@@ -62,6 +62,19 @@ class LomProtocolTests(unittest.TestCase):
             with self.subTest(path=path), self.assertRaises(LomPathError):
                 resolve_lom_path(song, path)
 
+    def test_rejects_index_tokens_longer_than_six_digits(self) -> None:
+        with self.assertRaises(LomPathError):
+            resolve_lom_path(_song(), "live_set tracks 1000000")
+
+    def test_runtime_error_while_resolving_is_path_not_found(self) -> None:
+        class RuntimeProperty:
+            @property
+            def tracks(self):
+                raise RuntimeError("unsupported track property")
+
+        with self.assertRaisesRegex(LomPathError, "path_not_found"):
+            resolve_lom_path(RuntimeProperty(), "live_set tracks 0")
+
     def test_permission_table_matches_the_python_boundary(self) -> None:
         self.assertTrue(allow_get("live_set", "tempo"))
         self.assertTrue(allow_get("live_set tracks 0", "name"))
@@ -71,9 +84,14 @@ class LomProtocolTests(unittest.TestCase):
         self.assertTrue(allow_call("live_set master_track mixer_device volume", "str_for_value"))
         self.assertTrue(allow_param_set("live_set tracks 0 devices 0 parameters 0"))
         self.assertFalse(allow_get("live_set tracks 0", "color"))
-        self.assertFalse(allow_set("live_set tracks 0", "name"))
+        self.assertTrue(allow_set("live_set tracks 0", "name"))
+        self.assertTrue(allow_set("live_set return_tracks 0", "name"))
+        self.assertTrue(allow_set("live_set master_track", "name"))
         self.assertFalse(allow_call("live_set", "delete_track"))
-        self.assertFalse(allow_param_set("live_set return_tracks 0 mixer_device volume"))
+        self.assertTrue(allow_param_set("live_set return_tracks 0 mixer_device volume"))
+        self.assertTrue(allow_param_set("live_set return_tracks 0 mixer_device panning"))
+        self.assertTrue(allow_set("live_set return_tracks 0", "mute"))
+        self.assertFalse(allow_set("live_set return_tracks 0", "arm"))
         self.assertEqual(path_kind("live_set tracks 0 mixer_device panning"), "track_panning")
 
 

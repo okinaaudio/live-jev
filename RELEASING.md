@@ -11,7 +11,7 @@ The release script downloads the pinned CPython 3.12 archive from python-build-s
 Run this command from the repository root:
 
 ```sh
-scripts/release.sh --version 1.00
+scripts/release.sh --version 1.02
 ```
 
 The script selects the first Developer ID Application identity. Pass `--identity "Developer ID Application: ..."` to select one explicitly. Use `--skip-notarize` only for a local packaging test.

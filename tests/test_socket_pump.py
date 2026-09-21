@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import deque
+import json
 import socket
 import unittest
 
@@ -193,6 +194,133 @@ class SocketPumpTests(unittest.TestCase):
 
         self.assertEqual(len(attempts), 2)
         self.assertEqual(self.read_available(client), b"ready\n")
+
+    def test_strict_json_closes_http_request_without_running_buffered_body(self):
+        client, server = self.pair()
+        handled = []
+        pump = SocketPump(
+            lambda: FakeListener([server]),
+            lambda line: handled.append(line) or "{}",
+            require_json_objects=True,
+        )
+        self.pumps.append(pump)
+        client.sendall(
+            b"POST / HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 19\r\n\r\n"
+            b'{"action":"ping"}\n'
+        )
+
+        pump.poll()
+
+        self.assertEqual(handled, [])
+        self.assertEqual(self.read_available(client), b"")
+        self.assertEqual(client.recv(1), b"")
+
+    def test_strict_json_runs_valid_object_commands_in_one_read(self):
+        client, server = self.pair()
+        handled = []
+
+        def handle(line):
+            handled.append(json.loads(line)["action"])
+            return json.dumps({"ok": True})
+
+        pump = SocketPump(
+            lambda: FakeListener([server]),
+            handle,
+            require_json_objects=True,
+        )
+        self.pumps.append(pump)
+        client.sendall(b'{"action":"ping"}\n{"action":"snapshot"}\n')
+
+        pump.poll()
+
+        self.assertEqual(handled, ["ping", "snapshot"])
+        self.assertEqual(
+            self.read_available(client),
+            b'{"ok": true}\n{"ok": true}\n',
+        )
+
+    def test_strict_json_dispatches_object_containing_http_looking_text(self):
+        client, server = self.pair()
+        handled = []
+
+        def handle(line):
+            handled.append(json.loads(line))
+            return json.dumps({"ok": True})
+
+        pump = SocketPump(
+            lambda: FakeListener([server]),
+            handle,
+            require_json_objects=True,
+        )
+        self.pumps.append(pump)
+        client.sendall(b'{"action":"ping","note":"proxy said HTTP/1.1"}\n')
+
+        pump.poll()
+
+        self.assertEqual(handled, [{"action": "ping", "note": "proxy said HTTP/1.1"}])
+        self.assertEqual(self.read_available(client), b'{"ok": true}\n')
+
+    def test_strict_json_closes_on_non_object_or_invalid_utf8(self):
+        for payload in (b'[]\n', b'"text"\n', b'\xff\n'):
+            with self.subTest(payload=payload):
+                client, server = self.pair()
+                handled = []
+                pump = SocketPump(
+                    lambda server=server: FakeListener([server]),
+                    lambda line: handled.append(line) or "{}",
+                    require_json_objects=True,
+                )
+                self.pumps.append(pump)
+                client.sendall(payload)
+
+                pump.poll()
+
+                self.assertEqual(handled, [])
+                self.assertEqual(self.read_available(client), b"")
+                self.assertEqual(client.recv(1), b"")
+
+    def test_rejects_a_ninth_simultaneous_connection(self):
+        pairs = [self.pair() for _ in range(9)]
+        pump = self.pump(FakeListener([server for _client, server in pairs]))
+
+        pump.poll()
+
+        for client, _server in pairs[:8]:
+            client.sendall(b"ok\n")
+        self.assertEqual(pairs[8][0].recv(1), b"")
+
+    def test_closes_connection_when_queued_output_exceeds_limit(self):
+        client, server = self.pair()
+        listener = FakeListener([server])
+        pump = SocketPump(lambda: listener, lambda _line: "x" * 32, max_output=16)
+        self.pumps.append(pump)
+        client.sendall(b"request\n")
+
+        pump.poll()
+
+        self.assertEqual(self.read_available(client), b"")
+        self.assertEqual(client.recv(1), b"")
+
+    def test_listener_creation_backs_off_after_five_failures(self):
+        now = [0.0]
+        attempts = []
+
+        def create_listener():
+            attempts.append(now[0])
+            raise OSError("busy")
+
+        pump = SocketPump(create_listener, lambda line: line, clock=lambda: now[0])
+        self.pumps.append(pump)
+        for _ in range(6):
+            pump.poll()
+        self.assertEqual(len(attempts), 5)
+
+        now[0] = 4.9
+        pump.poll()
+        self.assertEqual(len(attempts), 5)
+        now[0] = 5.0
+        pump.poll()
+        self.assertEqual(len(attempts), 6)
 
 
 if __name__ == "__main__":

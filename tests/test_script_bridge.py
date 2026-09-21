@@ -28,6 +28,48 @@ class TranslationTests(unittest.TestCase):
         with mock.patch.object(client, "_request", side_effect=TimeoutError("slow")):
             self.assertFalse(client.ping())
 
+    def test_ping_records_remote_script_version(self) -> None:
+        client = ScriptBridgeClient()
+        with mock.patch.object(client, "_request", return_value={"ok": True, "version": "0.18"}):
+            self.assertTrue(client.ping())
+        self.assertEqual(client.script_version, "0.18")
+
+    def test_ping_without_version_records_incompatible_missing_version(self) -> None:
+        client = ScriptBridgeClient()
+        with mock.patch.object(client, "_request", return_value={"ok": True}):
+            self.assertTrue(client.ping())
+        self.assertIsNone(client.script_version)
+
+    def test_reconnect_refreshes_version_before_the_requested_read(self) -> None:
+        client = ScriptBridgeClient()
+        client._socket = object()
+        client._pinged = True
+        client.script_version = "0.18"
+
+        def discard_closed():
+            client._socket = None
+
+        def connect():
+            client._socket = object()
+
+        responses = {
+            "ping": {"ok": True, "version": "0.18"},
+            "snapshot": {"ok": True, "snapshot": {}},
+        }
+        with mock.patch.object(client, "_discard_if_closed", side_effect=discard_closed), mock.patch.object(
+            client, "_connect", side_effect=connect
+        ), mock.patch.object(
+            client, "_request_on_connection", side_effect=lambda payload: responses[payload["action"]]
+        ) as request:
+            response = client._request({"action": "snapshot"})
+
+        self.assertEqual(response, responses["snapshot"])
+        self.assertEqual(client.script_version, "0.18")
+        self.assertEqual(
+            [call.args[0]["action"] for call in request.call_args_list],
+            ["ping", "snapshot"],
+        )
+
     def test_translates_allowed_arguments_and_keeps_ack_metadata_local(self) -> None:
         commands = translate_arguments([
             "--api-get", "live_set tracks 1", "mute", "get-1",

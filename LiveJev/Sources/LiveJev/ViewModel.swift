@@ -9,6 +9,7 @@ struct ResultItem {
     let requestID: String?
     let line: String
     let options: [String]
+    let via: String?
     let confirmationID: String?
     let totalMilliseconds: Int?
     let decision: Decision?
@@ -162,24 +163,25 @@ final class ViewModel {
                 kind: .result,
                 requestID: message.id,
                 line: message.line,
+                via: message.via,
                 milliseconds: message.ms?.total,
                 decision: message.decision,
                 llmMilliseconds: message.ms?.llm
             )
         case let .ask(message):
-            addResult(kind: .ask, requestID: message.id, line: message.line, options: message.options)
+            addResult(kind: .ask, requestID: message.id, line: message.line, options: message.options, via: message.via)
         case let .confirm(message):
-            addResult(kind: .confirm, requestID: message.id, line: message.line, confirmationID: message.id)
+            addResult(kind: .confirm, requestID: message.id, line: message.line, via: message.via, confirmationID: message.id)
         case let .info(message):
             if finishPendingUndo(id: message.id) {
                 canUndoLastSuccess = false
             }
-            addResult(kind: .info, requestID: message.id, line: message.line, milliseconds: message.ms?.total)
+            addResult(kind: .info, requestID: message.id, line: message.line, via: message.via, milliseconds: message.ms?.total)
         case let .error(message):
             // Setup polling failures belong in Setup, not in the pill's command history.
             if message.id?.hasPrefix("setup-") == true { return }
             _ = finishPendingUndo(id: message.id)
-            addResult(kind: .error, requestID: message.id, line: message.line, milliseconds: message.ms?.total)
+            addResult(kind: .error, requestID: message.id, line: message.line, via: message.via, milliseconds: message.ms?.total)
         }
         onChange?()
     }
@@ -195,6 +197,7 @@ final class ViewModel {
         requestID: String? = nil,
         line: String,
         options: [String] = [],
+        via: String? = nil,
         confirmationID: String? = nil,
         milliseconds: Int? = nil,
         decision: Decision? = nil,
@@ -206,6 +209,7 @@ final class ViewModel {
                 requestID: requestID,
                 line: line,
                 options: options,
+                via: via,
                 confirmationID: confirmationID,
                 totalMilliseconds: milliseconds,
                 decision: decision,

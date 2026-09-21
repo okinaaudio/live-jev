@@ -20,7 +20,7 @@ class IntentAndActionsTests(unittest.TestCase):
         self.snapshot = sample_snapshot()
 
     def test_request_contains_all_speculative_questions_in_one_payload(self) -> None:
-        payload = build_request(self.snapshot, "パッドを少し下げて")
+        payload = build_request(self.snapshot, "パッドを少し下げて", 0)
         self.assertEqual(payload["model"], "jev-latest")
         self.assertIn("param_t0", payload["questions"])
         self.assertIn("action", payload["questions"])
@@ -116,7 +116,7 @@ class IntentAndActionsTests(unittest.TestCase):
         ]
         for utterance, mocked, expected_action, expected_arguments in cases:
             with self.subTest(utterance=utterance):
-                result = interpret_response(self.snapshot, utterance, mocked)
+                result = interpret_response(self.snapshot, utterance, mocked, (0,))
                 self.assertIs(result.intent.action, expected_action)
                 if utterance == "マスター-3dB":
                     self.assertEqual(result.intent.number.value, -3.0)
@@ -165,7 +165,8 @@ class IntentAndActionsTests(unittest.TestCase):
                     bridge = NoBridge()
                     service = LiveJevService(bridge=bridge, snapshot=self.snapshot, key="x", requester=lambda _p, _k: mocked)
                     self.assertEqual(service.process({"text": utterance})["kind"], "info")
-                    self.assertEqual(bridge.calls, expected_arguments)
+                    self.assertEqual(len(bridge.calls), 1)
+                    self.assertEqual(bridge.calls[0][0], "--api-session-context")
                     continue
                 with mock.patch("actions.request_id", side_effect=lambda kind: kind):
                     self.assertEqual(ACTIONS[expected_action].apply(self.snapshot, result.intent), expected_arguments)
@@ -198,7 +199,7 @@ class IntentAndActionsTests(unittest.TestCase):
     def test_pan_live_units_and_explicit_percent_use_different_scales(self) -> None:
         for utterance, expected in (("左20", -0.4), ("右20", 0.4), ("20L", -0.4), ("L20", -0.4), ("左20%", -0.2)):
             with self.subTest(utterance=utterance):
-                intent = interpret_response(self.snapshot, utterance, response("pan", "t0", "set")).intent
+                intent = interpret_response(self.snapshot, utterance, response("pan", "t0", "set"), ()).intent
                 with mock.patch("actions.request_id", side_effect=lambda kind: kind):
                     arguments = ACTIONS[Action.PAN].apply(self.snapshot, intent)
                 self.assertEqual(float(arguments[0][3]), expected)
@@ -226,7 +227,7 @@ class IntentAndActionsTests(unittest.TestCase):
 
         params = tuple(Param(i, str(i), 0, 0, 1, "0", f"p{i}") for i in range(300))
         track = replace(self.snapshot.tracks[0], devices=(Device(0, "Huge", params, "d"),))
-        payload = build_request(replace(self.snapshot, tracks=(track,)), "つまみ")
+        payload = build_request(replace(self.snapshot, tracks=(track,)), "つまみ", 0)
         self.assertEqual(len(payload["questions"]["param_t0"]["criteria"]), 251)
         self.assertEqual(len(candidate_params(replace(self.snapshot, tracks=(track,)))[0]), 250)
 
@@ -235,7 +236,7 @@ class IntentAndActionsTests(unittest.TestCase):
 
         named = replace(self.snapshot.tracks[0], name="808")
         snapshot = replace(self.snapshot, tracks=(named, *self.snapshot.tracks[1:]))
-        result = interpret_response(snapshot, "808を下げて", response("volume", "t0", "down_small"))
+        result = interpret_response(snapshot, "808を下げて", response("volume", "t0", "down_small"), ())
         self.assertIsNone(result.intent.number)
 
     def test_local_parser_resolves_numbered_tracks_to_zero_based_index(self) -> None:
@@ -274,7 +275,7 @@ class IntentAndActionsTests(unittest.TestCase):
 
     def test_parameter_answer_can_select_the_track(self) -> None:
         mocked = response("param", "none", "up_small", param="d0p0", track_conf=0.2)
-        result = interpret_response(self.snapshot, "リバーブのDryWet上げて", mocked)
+        result = interpret_response(self.snapshot, "リバーブのDryWet上げて", mocked, (0,))
         self.assertEqual(result.intent.track, 0)
         self.assertEqual(result.intent.param.name, "Dry/Wet")
 
@@ -290,12 +291,20 @@ class IntentAndActionsTests(unittest.TestCase):
         mocked["answers"]["param_t1"] = {
             "type": "choice", "choice": "d0p0", "confidence": 0.9, "probabilities": {"d0p0": 0.9, "none": 0.1},
         }
-        result = interpret_response(snapshot, "リバーブのDryWet上げて", mocked)
+        result = interpret_response(snapshot, "リバーブのDryWet上げて", mocked, (0, 1))
         self.assertEqual(result.intent.track, 1)
         self.assertEqual(result.intent.param.path, second_param.path)
 
     def test_registry_covers_every_action(self) -> None:
-        self.assertEqual(set(ACTIONS), set(Action))
+        # Undo and redo are dispatched by the service, not executed through ACTIONS.
+        dispatched = {Action.UNDO, Action.REDO}
+        self.assertEqual(set(ACTIONS), set(Action) - dispatched)
+        for action in dispatched:
+            with self.subTest(action=action), self.assertRaisesRegex(
+                RuntimeError,
+                rf"dispatch-only action '{action.value}' reached the execution registry",
+            ):
+                ACTIONS[action]
 
     def test_literal_track_names_win_over_multi_track_syntax(self) -> None:
         names = ("Pad", "Bass", "Bass以外", "Bass only", "All Drums", "1 to 3", "Everything But The Girl")
@@ -317,8 +326,8 @@ class IntentAndActionsTests(unittest.TestCase):
                 self.assertEqual(intent.tracks, ())
 
     def test_get_that_build_commands_would_send_first_is_a_separate_call(self) -> None:
-        mute = interpret_response(self.snapshot, "ドラムをミュート", response("mute", "t2")).intent
-        tempo = interpret_response(self.snapshot, "テンポ90", response("tempo", step="set")).intent
+        mute = interpret_response(self.snapshot, "ドラムをミュート", response("mute", "t2"), ()).intent
+        tempo = interpret_response(self.snapshot, "テンポ90", response("tempo", step="set"), ()).intent
         mute_calls = ACTIONS[Action.MUTE].apply(self.snapshot, mute)
         tempo_calls = ACTIONS[Action.TEMPO].apply(self.snapshot, tempo)
         self.assertEqual(len(mute_calls), 2)

@@ -3,10 +3,12 @@
 # Usage: build-app.sh [--no-install]   (--no-install only builds and signs the app)
 set -euo pipefail
 
+[[ "$TMPDIR" == /var/* ]] && export TMPDIR="/private$TMPDIR"
+
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SAY_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 PKG_DIR="$SAY_DIR/LiveJev"
-BUILD_DIR="$HOME/dev/live-jev-build"
+BUILD_DIR="${LIVE_JEV_BUILD_DIR:-$HOME/dev/live-jev-build}"
 APP_NAME="Live Jev.app"
 OLD_APP_NAME="LiveSay.app"  # Previous name. Move any copy left in ~/Applications aside.
 # Spotlight and Launchpad skip folders whose name ends in .noindex, so the staged copy and the previous version
@@ -15,8 +17,18 @@ STAGE_DIR="$BUILD_DIR/stage.noindex"
 APP_DIR="$STAGE_DIR/$APP_NAME"
 PYTHON="/opt/homebrew/bin/python3.13"
 INSTALL_DIR="$HOME/Applications"
+SWIFT_FLAGS=()
 INSTALL=1
 [[ "${1:-}" == "--no-install" ]] && INSTALL=0
+if [[ -n "${CODEX_SANDBOX:-}" ]]; then
+  BUILD_DIR="${LIVE_JEV_BUILD_DIR:-${TMPDIR:-/tmp}/live-jev-build-${CODEX_SESSION_ID:-session}}"
+  STAGE_DIR="$BUILD_DIR/stage.noindex"
+  APP_DIR="$STAGE_DIR/$APP_NAME"
+  INSTALL_DIR="${TMPDIR:-/tmp}/Applications"
+  SWIFT_FLAGS+=(--disable-sandbox)
+  export CLANG_MODULE_CACHE_PATH="$BUILD_DIR/clang-module-cache"
+  export SWIFTPM_MODULECACHE_OVERRIDE="$BUILD_DIR/swift-module-cache"
+fi
 
 say() { printf '%s\n' "$*"; }
 fail() { printf '[FAILED] %s\n' "$*" >&2; exit 1; }
@@ -25,7 +37,7 @@ command -v swift >/dev/null || fail "swift was not found (install Xcode)"
 [[ -x "$PYTHON" ]] || fail "$PYTHON was not found"
 
 say "1/5 Building the app"
-(cd "$PKG_DIR" && swift build -c release --scratch-path "$BUILD_DIR" >/dev/null) || fail "swift build failed"
+(cd "$PKG_DIR" && swift build ${SWIFT_FLAGS[@]+"${SWIFT_FLAGS[@]}"} -c release --scratch-path "$BUILD_DIR" >/dev/null) || fail "swift build failed"
 BIN="$BUILD_DIR/release/LiveJev"
 [[ -x "$BIN" ]] || fail "Executable not found: $BIN"
 
@@ -38,7 +50,13 @@ for px in 16 32 128 256 512; do
   dbl=$((px * 2))
   sips -z "$dbl" "$dbl" "$BUILD_DIR/icon-1024.png" --out "$ICONSET/icon_${px}x${px}@2x.png" >/dev/null
 done
-iconutil -c icns "$ICONSET" -o "$BUILD_DIR/AppIcon.icns" || fail "iconutil failed"
+if ! iconutil -c icns "$ICONSET" -o "$BUILD_DIR/AppIcon.icns"; then
+  if [[ -n "${CODEX_SANDBOX:-}" ]]; then
+    cp "/System/Library/CoreServices/CoreTypes.bundle/Contents/Resources/GenericApplicationIcon.icns" "$BUILD_DIR/AppIcon.icns"
+  else
+    fail "iconutil failed"
+  fi
+fi
 
 say "3/5 Assembling the .app"
 rm -rf "$APP_DIR"

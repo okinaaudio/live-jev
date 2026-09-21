@@ -101,7 +101,7 @@ def translate_arguments(arguments: Sequence[str]) -> tuple[ScriptCommand, ...]:
             command = ScriptCommand({"op": "device_parameters", "path": path}, "api_device_parameters", request_id, path)
         elif flag == "--api-mixer-status":
             target, request_id = values
-            path = "live_set master_track" if target == "master" else "live_set tracks " + target
+            path = "live_set master_track" if target == "master" else target if target.startswith("live_set ") else "live_set tracks " + target
             command = ScriptCommand({"op": "mixer_status", "target": target}, "api_mixer_status", request_id, path)
         elif flag == "--api-insert-device":
             path, name, insertion, request_id = values
@@ -157,6 +157,8 @@ class ScriptBridgeClient:
         self.timeout = timeout
         self.verbose = verbose
         self.startup_error: str | None = None
+        self.script_version: str | None = None
+        self._pinged = False
         self._socket: socket.socket | None = None
         self._buffer = b""
         self._lock = threading.Lock()
@@ -172,10 +174,16 @@ class ScriptBridgeClient:
                 response = self._request({"action": "ping"})
             except (BridgeError, TimeoutError):
                 return False
+        self._record_version(response)
         if self.verbose:
             elapsed = round((time.perf_counter() - started) * 1000)
             print(f"[bridge] script ping ms={elapsed}", file=sys.stderr)
         return response.get("ok") is True
+
+    def _record_version(self, response: Mapping[str, Any]) -> None:
+        self._pinged = True
+        version = response.get("version")
+        self.script_version = version if isinstance(version, str) and version else None
 
     def run(self, arguments: Sequence[str]) -> BridgeResult:
         validate_arguments(arguments)
@@ -256,8 +264,14 @@ class ScriptBridgeClient:
 
     def _request(self, payload: Mapping[str, Any]) -> Mapping[str, Any]:
         self._discard_if_closed()
+        connected = self._socket is None
         if self._socket is None:
             self._connect()
+        if connected and self._pinged and payload.get("action") != "ping":
+            self._record_version(self._request_on_connection({"action": "ping"}))
+        return self._request_on_connection(payload)
+
+    def _request_on_connection(self, payload: Mapping[str, Any]) -> Mapping[str, Any]:
         assert self._socket is not None
         encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8") + b"\n"
         try:

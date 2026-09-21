@@ -2,18 +2,23 @@ import Foundation
 import Security
 
 enum Keychain {
-    private static var query: [String: Any] {
+    enum Account: String {
+        case typeSafe = "TYPESAFE_API_KEY"
+        case gemini = "GEMINI_API_KEY"
+    }
+
+    private static func query(_ account: Account) -> [String: Any] {
         [kSecClass as String: kSecClassGenericPassword,
          kSecAttrService as String: "com.okinaaudio.livejev",
-         kSecAttrAccount as String: "TYPESAFE_API_KEY"]
+         kSecAttrAccount as String: account.rawValue]
     }
 
     struct Failure: Error {
         let status: OSStatus
     }
 
-    static func read() throws -> String? {
-        var request = query
+    static func read(_ account: Account = .typeSafe) throws -> String? {
+        var request = query(account)
         request[kSecReturnData as String] = true
         request[kSecMatchLimit as String] = kSecMatchLimitOne
         var result: CFTypeRef?
@@ -24,19 +29,20 @@ enum Keychain {
         return key
     }
 
-    static func save(_ key: String) throws {
+    static func save(_ key: String, account: Account = .typeSafe) throws {
         let attributes = [kSecValueData as String: Data(key.utf8)]
-        var status = SecItemUpdate(query as CFDictionary, attributes as CFDictionary)
+        let accountQuery = query(account)
+        var status = SecItemUpdate(accountQuery as CFDictionary, attributes as CFDictionary)
         if status == errSecItemNotFound {
-            var item = query
+            var item = accountQuery
             item.merge(attributes) { _, new in new }
             status = SecItemAdd(item as CFDictionary, nil)
         }
         guard status == errSecSuccess else { throw Failure(status: status) }
     }
 
-    static func delete() throws {
-        let status = SecItemDelete(query as CFDictionary)
+    static func delete(_ account: Account = .typeSafe) throws {
+        let status = SecItemDelete(query(account) as CFDictionary)
         guard status == errSecSuccess || status == errSecItemNotFound else { throw Failure(status: status) }
     }
 }

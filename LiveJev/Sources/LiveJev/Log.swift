@@ -65,7 +65,7 @@ final class Log: @unchecked Sendable {
         var output = message
         let patterns = [
             #"(?i)Bearer\s+[^\s\"']+"#,
-            #"(?i)(TYPESAFE_API_KEY\s*[=:]\s*)[^\s\"']+"#
+            #"(?i)((?:TYPESAFE|GEMINI)_API_KEY\s*[=:]\s*)[^\s\"']+"#
         ]
         for pattern in patterns {
             guard let regex = try? NSRegularExpression(pattern: pattern) else { continue }

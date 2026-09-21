@@ -276,7 +276,7 @@ class EnglishOutputTests(unittest.TestCase):
             confirmation = service.process({"id": "2", "text": "record"})
         self.assertEqual(confirmation["options"], ["Yes", "Cancel"])
         self.assertFalse(contains_japanese(confirmation["line"]))
-        guidance = service.process({"id": "3", "text": "slap reverb on Bass"})
+        guidance = service.process({"id": "3", "text": "slap eq on Bass"})
         self.assertEqual(guidance["kind"], "info")
         self.assertFalse(contains_japanese(guidance["line"]))
 
